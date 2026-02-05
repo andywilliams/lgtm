@@ -1,6 +1,8 @@
 import { execSync } from 'child_process';
 import type { Harshness, ReviewResult, ReviewComment, Severity } from './types.js';
 
+export type AIProvider = 'claude' | 'codex';
+
 const HARSHNESS_PROMPTS: Record<Harshness, string> = {
   chill: `Only flag issues that are:
 - Definite bugs that will cause runtime errors
@@ -58,13 +60,36 @@ export function checkClaudeCli(): boolean {
 }
 
 /**
- * Review a PR diff using Claude CLI
+ * Check if Codex CLI is available
+ */
+export function checkCodexCli(): boolean {
+  try {
+    execSync('codex --version', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check which AI providers are available
+ */
+export function getAvailableProviders(): AIProvider[] {
+  const providers: AIProvider[] = [];
+  if (checkClaudeCli()) providers.push('claude');
+  if (checkCodexCli()) providers.push('codex');
+  return providers;
+}
+
+/**
+ * Review a PR diff using specified AI CLI
  */
 export async function reviewPR(
   diff: string,
   prTitle: string,
   prBody: string,
-  harshness: Harshness
+  harshness: Harshness,
+  ai: AIProvider = 'claude'
 ): Promise<ReviewResult> {
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
@@ -105,47 +130,29 @@ If no issues found, respond with:
   fs.writeFileSync(tempFile, fullPrompt);
 
   try {
-    // Use claude CLI with --print flag to get output directly
-    const output = execSync(`claude --print < "${tempFile}"`, {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large responses
-    });
+    let output: string;
+    
+    if (ai === 'codex') {
+      // Use codex CLI with quiet flag to get output directly
+      output = execSync(`codex -q "${fullPrompt.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    } else {
+      // Use claude CLI with --print flag to get output directly
+      output = execSync(`claude --print < "${tempFile}"`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    }
 
     // Clean up temp file
     fs.unlinkSync(tempFile);
 
-    // Parse JSON from response (handle various output formats)
-    let jsonStr = output.trim();
-
-    // First, try to extract from markdown code blocks
-    const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1].trim();
-    }
-
-    // Try to find a JSON object that starts with {"summary" which is our expected format
-    const summaryMatch = jsonStr.match(/\{"summary"[\s\S]*\}/);
-    if (summaryMatch) {
-      jsonStr = summaryMatch[0];
-    } else {
-      // Fallback: try to find any JSON object
-      const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
-      if (jsonObjectMatch) {
-        jsonStr = jsonObjectMatch[0];
-      }
-    }
-
-    try {
-      const result = JSON.parse(jsonStr.trim()) as ReviewResult;
-      // Validate and normalize comments
-      result.comments = (result.comments || []).map(normalizeComment);
-      return result;
-    } catch (parseError) {
-      console.error('Failed to parse AI response as JSON');
-      console.error('Raw response:', output.slice(0, 500));
-      throw new Error('Failed to parse review response from AI');
-    }
+    // Parse JSON from response
+    return parseAIResponse(output);
   } catch (error: any) {
     // Clean up temp file on error
     try {
@@ -154,9 +161,49 @@ If no issues found, respond with:
     } catch {}
 
     if (error.message?.includes('not found') || error.code === 'ENOENT') {
-      throw new Error('Claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code');
+      const cliName = ai === 'codex' ? 'Codex' : 'Claude';
+      const installCmd = ai === 'codex' 
+        ? 'npm install -g @openai/codex' 
+        : 'npm install -g @anthropic-ai/claude-code';
+      throw new Error(`${cliName} CLI not found. Install it: ${installCmd}`);
     }
     throw error;
+  }
+}
+
+/**
+ * Parse AI response into ReviewResult
+ */
+function parseAIResponse(output: string): ReviewResult {
+  let jsonStr = output.trim();
+
+  // First, try to extract from markdown code blocks
+  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) {
+    jsonStr = jsonMatch[1].trim();
+  }
+
+  // Try to find a JSON object that starts with {"summary" which is our expected format
+  const summaryMatch = jsonStr.match(/\{"summary"[\s\S]*\}/);
+  if (summaryMatch) {
+    jsonStr = summaryMatch[0];
+  } else {
+    // Fallback: try to find any JSON object
+    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonObjectMatch) {
+      jsonStr = jsonObjectMatch[0];
+    }
+  }
+
+  try {
+    const result = JSON.parse(jsonStr.trim()) as ReviewResult;
+    // Validate and normalize comments
+    result.comments = (result.comments || []).map(normalizeComment);
+    return result;
+  } catch (parseError) {
+    console.error('Failed to parse AI response as JSON');
+    console.error('Raw response:', output.slice(0, 500));
+    throw new Error('Failed to parse review response from AI');
   }
 }
 

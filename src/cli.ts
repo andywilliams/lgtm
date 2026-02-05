@@ -4,7 +4,7 @@ import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, submitReview } from './github.js';
-import { reviewPR, checkClaudeCli } from './review.js';
+import { reviewPR, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import type { Harshness, ReviewComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -30,6 +30,7 @@ program
   .command('review <pr-number>')
   .description('Review a pull request')
   .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
@@ -46,12 +47,39 @@ program
       process.exit(1);
     }
 
-    // Check prerequisites
-    if (!checkClaudeCli()) {
-      console.error(chalk.red('\n⚠ Claude CLI not found.'));
-      console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
-      console.log(chalk.dim('Then run: claude login'));
-      process.exit(1);
+    // Determine AI provider
+    let ai: AIProvider;
+    if (options.ai) {
+      if (!['claude', 'codex'].includes(options.ai)) {
+        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
+        process.exit(1);
+      }
+      ai = options.ai as AIProvider;
+      
+      // Check if specified provider is available
+      if (ai === 'claude' && !checkClaudeCli()) {
+        console.error(chalk.red('\n⚠ Claude CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
+        console.log(chalk.dim('Then run: claude login'));
+        process.exit(1);
+      }
+      if (ai === 'codex' && !checkCodexCli()) {
+        console.error(chalk.red('\n⚠ Codex CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
+        process.exit(1);
+      }
+    } else {
+      // Auto-detect available provider
+      const available = getAvailableProviders();
+      if (available.length === 0) {
+        console.error(chalk.red('\n⚠ No AI CLI found.'));
+        console.log(chalk.dim('Install one of:'));
+        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
+        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
+        process.exit(1);
+      }
+      // Prefer claude, fall back to codex
+      ai = available.includes('claude') ? 'claude' : 'codex';
     }
 
     try {
@@ -61,6 +89,7 @@ program
         harshness,
         dryRun: options.dryRun,
         batch: options.batch,
+        ai,
       });
     } catch (error: any) {
       console.error(chalk.red(`Error: ${error.message}`));
@@ -74,10 +103,11 @@ interface RunOptions {
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
+  ai: AIProvider;
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch } = options;
+  const { prNumber, repo, harshness, dryRun, batch, ai } = options;
 
   // Fetch PR details
   console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
@@ -96,8 +126,9 @@ async function runReview(options: RunOptions): Promise<void> {
     : diff;
 
   // Review with AI
-  console.log(chalk.blue(`\n🤖 Reviewing with Claude (${harshness} mode)...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness);
+  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
+  console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${harshness} mode)...`));
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai);
 
   console.log(chalk.gray(`\n${result.summary}\n`));
 
