@@ -87,6 +87,8 @@ This enables the AI to:
 
 Trade-off: Slower and uses more tokens, but catches more subtle issues.
 
+**Real example:** On a PR adding a new toggle to a React component, `--full-context` caught a missing useEffect dependency that Cursor's Bugbot missed. Bugbot found the toggle wasn't being *saved* to preferences; lgtm found it also wasn't properly listed in the *loading* effect's dependency array.
+
 ## Harshness Levels
 
 ### `chill`
