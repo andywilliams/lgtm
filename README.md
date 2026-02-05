@@ -18,11 +18,20 @@ npm link   # makes `lgtm` available globally
 
 - **Node.js 18+**
 - **GitHub CLI (`gh`)** — installed and authenticated ([install](https://cli.github.com/))
-- **Claude Code CLI (`claude`)** — installed and logged in
+- **One of the following AI CLIs:**
+
+  **Claude Code CLI** (recommended)
   ```bash
   npm install -g @anthropic-ai/claude-code
   claude login
   ```
+
+  **Codex CLI** (alternative)
+  ```bash
+  npm install -g @openai/codex
+  ```
+
+LGTM auto-detects which CLI is available. If both are installed, it prefers Claude.
 
 ## Usage
 
@@ -36,12 +45,27 @@ lgtm review 86 --repo owner/repo
 # Set harshness level
 lgtm review 86 --harshness pedantic
 
+# Choose AI provider (auto-detects by default)
+lgtm review 86 --ai claude
+lgtm review 86 --ai codex
+
 # Dry run (preview without posting)
 lgtm review 86 --dry-run
 
 # Batch mode (post all without prompting)
 lgtm review 86 --batch
 ```
+
+## AI Providers
+
+LGTM supports multiple AI backends:
+
+| Provider | CLI | Notes |
+|----------|-----|-------|
+| `claude` | `@anthropic-ai/claude-code` | Default if available. Uses `claude --print`. |
+| `codex` | `@openai/codex` | Fallback. Uses `codex exec`. |
+
+Use `--ai <provider>` to force a specific backend, or let LGTM auto-detect.
 
 ## Harshness Levels
 
