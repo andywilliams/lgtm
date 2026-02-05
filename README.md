@@ -54,6 +54,9 @@ lgtm review 86 --dry-run
 
 # Batch mode (post all without prompting)
 lgtm review 86 --batch
+
+# Full context mode (include entire modified files for pattern analysis)
+lgtm review 86 --full-context
 ```
 
 ## AI Providers
@@ -66,6 +69,23 @@ LGTM supports multiple AI backends:
 | `codex` | `@openai/codex` | Fallback. Uses `codex exec`. |
 
 Use `--ai <provider>` to force a specific backend, or let LGTM auto-detect.
+
+## Full Context Mode
+
+By default, LGTM only sends the PR diff to the AI. This is fast but can miss pattern violations — cases where new code doesn't follow established patterns in the file.
+
+Use `--full-context` to include the entire contents of modified files:
+
+```bash
+lgtm review 86 --full-context
+```
+
+This enables the AI to:
+- Detect missing integrations (e.g., new state not synced with existing preference system)
+- Flag inconsistencies with existing code patterns
+- Catch registration omissions (new items not added to arrays/maps where similar items are registered)
+
+Trade-off: Slower and uses more tokens, but catches more subtle issues.
 
 ## Harshness Levels
 
