@@ -30,16 +30,7 @@ export interface PRDetails {
 export interface ReviewOptions {
   prNumber: number;
   repo?: string;
-  model: string;
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
-}
-
-export interface Config {
-  defaults: {
-    model: string;
-    harshness: Harshness;
-  };
-  anthropicApiKey?: string;
 }

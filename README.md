@@ -7,19 +7,22 @@ LGTM uses Claude to review your pull requests, but unlike automated bots, *you* 
 ## Installation
 
 ```bash
-npm install -g lgtm-review
-```
-
-Or run directly with npx:
-
-```bash
-npx lgtm-review review 86
+git clone https://github.com/andywilliams/lgtm.git
+cd lgtm
+npm install
+npm run build
+npm link   # makes `lgtm` available globally
 ```
 
 ## Prerequisites
 
-- [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
-- `ANTHROPIC_API_KEY` environment variable set
+- **Node.js 18+**
+- **GitHub CLI (`gh`)** — installed and authenticated ([install](https://cli.github.com/))
+- **Claude Code CLI (`claude`)** — installed and logged in
+  ```bash
+  npm install -g @anthropic-ai/claude-code
+  claude login
+  ```
 
 ## Usage
 
@@ -113,20 +116,13 @@ Summary: 1 to post, 1 skipped
 ✓ Posted 1 comment(s)
 ```
 
-## Configuration
-
-Set your Anthropic API key:
-
-```bash
-export ANTHROPIC_API_KEY=sk-...
-```
-
 ## Why LGTM?
 
 - **You're the gatekeeper** — AI suggests, you decide
 - **Configurable harshness** — match the review depth to the PR importance  
 - **Interactive** — review each suggestion before posting
 - **Uses `gh` CLI** — works with your existing GitHub auth
+- **Uses `claude` CLI** — works with your existing Claude login, no API key config needed
 - **Transparent** — you see exactly what will be posted
 
 ## License

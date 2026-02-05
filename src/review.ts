@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import { execSync } from 'child_process';
 import type { Harshness, ReviewResult, ReviewComment, Severity } from './types.js';
 
 const HARSHNESS_PROMPTS: Record<Harshness, string> = {
@@ -65,17 +65,27 @@ If there are no issues to report, return:
   "comments": []
 }`;
 
+/**
+ * Check if Claude CLI is available
+ */
+export function checkClaudeCli(): boolean {
+  try {
+    execSync('claude --version', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Review a PR diff using Claude CLI
+ */
 export async function reviewPR(
   diff: string,
   prTitle: string,
   prBody: string,
-  harshness: Harshness,
-  apiKey?: string
+  harshness: Harshness
 ): Promise<ReviewResult> {
-  const client = new Anthropic({
-    apiKey: apiKey || process.env.ANTHROPIC_API_KEY,
-  });
-
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
 ## PR Title
@@ -91,36 +101,61 @@ ${diff}
 
 Review this PR and respond with JSON only.`;
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 4096,
-    messages: [
-      { role: 'user', content: userPrompt }
-    ],
-    system: SYSTEM_PROMPT,
-  });
+  const fullPrompt = `${SYSTEM_PROMPT}\n\n${userPrompt}`;
 
-  // Extract text from response
-  const text = response.content
-    .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-    .map(block => block.text)
-    .join('');
-
-  // Parse JSON from response (handle markdown code blocks)
-  let jsonStr = text;
-  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1];
-  }
+  // Write prompt to temp file to avoid shell escaping issues
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+  
+  const tempFile = path.join(os.tmpdir(), `lgtm-prompt-${Date.now()}.txt`);
+  fs.writeFileSync(tempFile, fullPrompt);
 
   try {
-    const result = JSON.parse(jsonStr.trim()) as ReviewResult;
-    // Validate and normalize comments
-    result.comments = (result.comments || []).map(normalizeComment);
-    return result;
-  } catch (error) {
-    console.error('Failed to parse AI response:', text);
-    throw new Error('Failed to parse review response from AI');
+    // Use claude CLI with --print flag to get output directly
+    const output = execSync(`claude --print < "${tempFile}"`, {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large responses
+    });
+
+    // Clean up temp file
+    fs.unlinkSync(tempFile);
+
+    // Parse JSON from response (handle markdown code blocks)
+    let jsonStr = output;
+    const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) {
+      jsonStr = jsonMatch[1];
+    }
+
+    // Try to find JSON object in the response
+    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonObjectMatch) {
+      jsonStr = jsonObjectMatch[0];
+    }
+
+    try {
+      const result = JSON.parse(jsonStr.trim()) as ReviewResult;
+      // Validate and normalize comments
+      result.comments = (result.comments || []).map(normalizeComment);
+      return result;
+    } catch (parseError) {
+      console.error('Failed to parse AI response as JSON');
+      console.error('Raw response:', output.slice(0, 500));
+      throw new Error('Failed to parse review response from AI');
+    }
+  } catch (error: any) {
+    // Clean up temp file on error
+    try {
+      const fs = await import('fs');
+      fs.unlinkSync(tempFile);
+    } catch {}
+
+    if (error.message?.includes('not found') || error.code === 'ENOENT') {
+      throw new Error('Claude CLI not found. Install it: npm install -g @anthropic-ai/claude-code');
+    }
+    throw error;
   }
 }
 

@@ -4,7 +4,7 @@ import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, submitReview } from './github.js';
-import { reviewPR } from './review.js';
+import { reviewPR, checkClaudeCli } from './review.js';
 import type { Harshness, ReviewComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -23,14 +23,13 @@ const SEVERITY_ICONS: Record<string, string> = {
 
 program
   .name('lgtm')
-  .description('AI-powered PR review CLI')
+  .description('AI-powered PR review CLI — you stay in control')
   .version('0.1.0');
 
 program
   .command('review <pr-number>')
   .description('Review a pull request')
   .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
-  .option('-m, --model <model>', 'AI model to use', 'claude-sonnet')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
@@ -44,6 +43,14 @@ program
     const harshness = options.harshness as Harshness;
     if (!['chill', 'medium', 'pedantic'].includes(harshness)) {
       console.error(chalk.red('Invalid harshness level. Use: chill, medium, pedantic'));
+      process.exit(1);
+    }
+
+    // Check prerequisites
+    if (!checkClaudeCli()) {
+      console.error(chalk.red('\n⚠ Claude CLI not found.'));
+      console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
+      console.log(chalk.dim('Then run: claude login'));
       process.exit(1);
     }
 
