@@ -3,7 +3,7 @@
 import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { getPRDetails, getPRDiff, submitReview } from './github.js';
+import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview } from './github.js';
 import { reviewPR, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import type { Harshness, ReviewComment } from './types.js';
 
@@ -34,6 +34,7 @@ program
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
+  .option('--full-context', 'Include full file contents for pattern analysis', false)
   .action(async (prNumberStr: string, options) => {
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
@@ -89,6 +90,7 @@ program
         harshness,
         dryRun: options.dryRun,
         batch: options.batch,
+        fullContext: options.fullContext,
         ai,
       });
     } catch (error: any) {
@@ -103,11 +105,12 @@ interface RunOptions {
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
+  fullContext: boolean;
   ai: AIProvider;
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, fullContext, ai } = options;
 
   // Fetch PR details
   console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
@@ -125,10 +128,34 @@ async function runReview(options: RunOptions): Promise<void> {
     ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)'
     : diff;
 
+  // Fetch full file contents if requested
+  let fileContents: Record<string, string> | undefined;
+  if (fullContext) {
+    console.log(chalk.blue(`\n📁 Fetching full file contents...`));
+    const changedFiles = getChangedFiles(prNumber, repo);
+    fileContents = {};
+    for (const file of changedFiles) {
+      // Skip very large files and non-code files
+      if (file.endsWith('.lock') || file.endsWith('.json') && file.includes('package-lock')) {
+        continue;
+      }
+      const content = getFileContent(prNumber, file, repo);
+      if (content) {
+        if (content.length > 300000) { // Skip files > 300KB
+          console.log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
+        } else {
+          fileContents[file] = content;
+          console.log(chalk.gray(`   ✓ ${file} (${Math.round(content.length / 1024)}KB)`));
+        }
+      }
+    }
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
-  console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${harshness} mode)...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai);
+  const modeLabel = fullContext ? `${harshness} mode + full context` : `${harshness} mode`;
+  console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents);
 
   console.log(chalk.gray(`\n${result.summary}\n`));
 

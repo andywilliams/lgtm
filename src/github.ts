@@ -121,6 +121,31 @@ export function submitReview(
 }
 
 /**
+ * Fetch the content of a file from a PR branch
+ */
+export function getFileContent(prNumber: number, filePath: string, repo?: string): string | null {
+  try {
+    const repoPath = repo || getRepoFromGit();
+    const [owner, repoName] = repoPath.split('/');
+    
+    // Get the head ref of the PR
+    const prJson = gh(`pr view ${prNumber} --json headRefName`, repo);
+    const { headRefName } = JSON.parse(prJson);
+    
+    // Fetch file content from that branch
+    const content = execSync(
+      `gh api repos/${owner}/${repoName}/contents/${encodeURIComponent(filePath)}?ref=${headRefName} --jq '.content'`,
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+    
+    // Content is base64 encoded
+    return Buffer.from(content, 'base64').toString('utf-8');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Get repo from current git directory
  */
 function getRepoFromGit(): string {

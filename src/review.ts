@@ -89,8 +89,23 @@ export async function reviewPR(
   prTitle: string,
   prBody: string,
   harshness: Harshness,
-  ai: AIProvider = 'claude'
+  ai: AIProvider = 'claude',
+  fileContents?: Record<string, string>
 ): Promise<ReviewResult> {
+  // Build file context section if provided
+  let fileContextSection = '';
+  if (fileContents && Object.keys(fileContents).length > 0) {
+    fileContextSection = `\n## Full File Contents (for pattern analysis)
+Look at how similar code is structured in these files. If the PR adds new code that doesn't follow existing patterns (e.g., missing integration with existing systems, missing registration in arrays/maps where similar items are registered), flag it.
+
+${Object.entries(fileContents).map(([path, content]) => 
+  `### ${path}\n\`\`\`\n${content}\n\`\`\``
+).join('\n\n')}
+
+IMPORTANT: Compare the PR changes against the existing patterns in the full files above. Flag any inconsistencies where new code doesn't follow established patterns.
+`;
+  }
+
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
 ## PR Title
@@ -103,7 +118,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-
+${fileContextSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
