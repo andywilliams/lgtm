@@ -57,6 +57,12 @@ lgtm review 86 --batch
 
 # Full context mode (include entire modified files for pattern analysis)
 lgtm review 86 --full-context
+
+# Usage context mode (include files that use changed symbols)
+lgtm review 86 --usage-context
+
+# Combine both for maximum context
+lgtm review 86 --full-context --usage-context
 ```
 
 ## AI Providers
@@ -88,6 +94,35 @@ This enables the AI to:
 Trade-off: Slower and uses more tokens, but catches more subtle issues.
 
 **Real example:** On a PR adding a new toggle to a React component, `--full-context` caught a missing useEffect dependency that Cursor's Bugbot missed. Bugbot found the toggle wasn't being *saved* to preferences; lgtm found it also wasn't properly listed in the *loading* effect's dependency array.
+
+## Usage Context Mode
+
+By default, the AI only sees the files being changed. But what about code that *uses* the changed code? A function signature change might break callers in other files.
+
+Use `--usage-context` to find and include usages of changed symbols:
+
+```bash
+lgtm review 86 --usage-context
+```
+
+This:
+1. **Parses the diff** for changed symbols (functions, classes, exports)
+2. **Searches the codebase** with ripgrep for usages
+3. **Includes snippets** (~3 lines of context around each usage)
+4. **Limits scope** to 5 usages per symbol to avoid token explosion
+
+The AI then checks if the PR changes might break any of these usages:
+- Breaking changes to function signatures
+- Type changes that affect callers
+- Missing updates to consumers of changed APIs
+
+**Combine with `--full-context`** for maximum visibility:
+
+```bash
+lgtm review 86 --full-context --usage-context
+```
+
+This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
 
 ## Harshness Levels
 
