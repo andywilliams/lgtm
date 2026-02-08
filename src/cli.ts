@@ -5,6 +5,7 @@ import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview } from './github.js';
 import { reviewPR, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import type { Harshness, ReviewComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -35,6 +36,7 @@ program
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
+  .option('--usage-context', 'Include files that use changed symbols', false)
   .action(async (prNumberStr: string, options) => {
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
@@ -91,6 +93,7 @@ program
         dryRun: options.dryRun,
         batch: options.batch,
         fullContext: options.fullContext,
+        usageContext: options.usageContext,
         ai,
       });
     } catch (error: any) {
@@ -106,11 +109,12 @@ interface RunOptions {
   dryRun: boolean;
   batch: boolean;
   fullContext: boolean;
+  usageContext: boolean;
   ai: AIProvider;
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, fullContext, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, fullContext, usageContext, ai } = options;
 
   // Fetch PR details
   console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
@@ -151,11 +155,37 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
+  // Extract usage context if requested
+  let usageContextStr = '';
+  if (usageContext) {
+    console.log(chalk.blue(`\n🔗 Finding symbol usages...`));
+    const symbols = extractChangedSymbols(diff);
+    console.log(chalk.gray(`   Found ${symbols.length} changed symbol(s): ${symbols.map(s => s.name).join(', ') || '(none)'}`));
+    
+    if (symbols.length > 0) {
+      const repoRoot = getRepoRoot();
+      const usages = findUsages(symbols, repoRoot, {
+        maxUsagesPerSymbol: 5,
+        contextLines: 3
+      });
+      
+      if (usages.length > 0) {
+        console.log(chalk.gray(`   Found ${usages.length} usage(s) across ${new Set(usages.map(u => u.file)).size} file(s)`));
+        usageContextStr = formatUsageContext(usages);
+      } else {
+        console.log(chalk.gray(`   No external usages found`));
+      }
+    }
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
-  const modeLabel = fullContext ? `${harshness} mode + full context` : `${harshness} mode`;
+  const contextModes = [harshness + ' mode'];
+  if (fullContext) contextModes.push('full context');
+  if (usageContext && usageContextStr) contextModes.push('usage context');
+  const modeLabel = contextModes.join(' + ');
   console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents);
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr);
 
   console.log(chalk.gray(`\n${result.summary}\n`));
 
