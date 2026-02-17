@@ -206,6 +206,10 @@ Summary: 1 to post, 1 skipped
 - **Uses `claude` CLI** — works with your existing Claude login, no API key config needed
 - **Transparent** — you see exactly what will be posted
 
+## Updates
+
+- 2026-02-16 — Update made from tix-kanban
+
 ## License
 
 MIT
