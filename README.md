@@ -206,6 +206,10 @@ Summary: 1 to post, 1 skipped
 - **Uses `claude` CLI** — works with your existing Claude login, no API key config needed
 - **Transparent** — you see exactly what will be posted
 
+## Greetings
+
+Hello to the transactions team from tix-kanban developer!
+
 ## License
 
 MIT
