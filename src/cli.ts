@@ -502,7 +502,8 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
 
   // Summary
   console.log(chalk.white('═'.repeat(60)));
-  console.log(chalk.white(`Summary: ${stillValid.length} still valid, ${toResolve.length} to resolve, ${result.results.length - stillValid.length - toResolve.length} kept`));
+  const kept = comments.length - stillValid.length - toResolve.length;
+  console.log(chalk.white(`Summary: ${stillValid.length} still valid, ${toResolve.length} to resolve, ${kept} kept`));
   console.log(chalk.white('═'.repeat(60)));
 
   if (toResolve.length === 0) {

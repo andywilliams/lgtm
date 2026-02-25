@@ -316,10 +316,7 @@ Include a result for every comment listed above.`;
     fs.unlinkSync(tempFile);
     return parseRecheckResponse(output, comments);
   } catch (error: any) {
-    try {
-      const fs = await import('fs');
-      fs.unlinkSync(tempFile);
-    } catch {}
+    try { fs.unlinkSync(tempFile); } catch {}
     throw error;
   }
 }
