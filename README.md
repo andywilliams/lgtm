@@ -63,6 +63,12 @@ lgtm review 86 --usage-context
 
 # Combine both for maximum context
 lgtm review 86 --full-context --usage-context
+
+# Recheck if existing comments are still valid after new commits
+lgtm recheck 86
+
+# Recheck and auto-resolve outdated comments
+lgtm recheck 86 --batch
 ```
 
 ## AI Providers
@@ -123,6 +129,81 @@ lgtm review 86 --full-context --usage-context
 ```
 
 This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
+
+## Rechecking Existing Comments
+
+After a PR author pushes new commits, previous review comments may no longer apply. Use `recheck` to evaluate whether existing comments are still valid:
+
+```bash
+# Recheck all review comments on a PR (interactive mode)
+lgtm recheck 86
+
+# Only recheck comments from a specific author
+lgtm recheck 86 --author my-bot-username
+
+# Dry run (see results without resolving anything)
+lgtm recheck 86 --dry-run
+
+# Batch mode (auto-resolve all outdated/resolved comments)
+lgtm recheck 86 --batch
+
+# Specify repo or AI provider
+lgtm recheck 86 --repo owner/repo --ai claude
+```
+
+The AI evaluates each comment against the current diff and classifies it as:
+
+| Status | Meaning |
+|--------|---------|
+| **still valid** | The issue raised by the comment is still present |
+| **resolved** | The code was updated to address the concern |
+| **outdated** | The code the comment refers to no longer exists |
+
+In interactive mode, you're prompted to **Resolve**, **Keep**, or **Quit** for each resolved/outdated comment. Resolving a comment minimizes (collapses) it on GitHub — it's not deleted, just hidden behind a "Show resolved" toggle.
+
+### Example
+
+```
+$ lgtm recheck 86
+
+🔍 Fetching PR #86...
+   "fix: handle edge case in parser" by andywilliams
+
+💬 Fetching review comments...
+   Found 3 review comment(s)
+
+📄 Fetching current diff...
+
+🤖 Rechecking comments with Claude...
+
+2 of 3 comments appear resolved.
+
+────────────────────────────────────────────────────────────
+[1/3] ⚠ STILL VALID | src/parser.ts:42
+────────────────────────────────────────────────────────────
+Missing null check for input parameter...
+
+Reason: The null check is still missing on line 42.
+
+────────────────────────────────────────────────────────────
+[2/3] ✓ RESOLVED | src/parser.ts:87
+────────────────────────────────────────────────────────────
+Consider extracting magic number...
+
+Reason: The magic number 1024 has been replaced with MAX_BUFFER_SIZE constant.
+
+? Action › Resolve (minimize comment) / Keep / Quit
+✓ Queued for resolution
+
+════════════════════════════════════════════════════════════
+Summary: 1 still valid, 1 to resolve, 1 kept
+════════════════════════════════════════════════════════════
+
+? Resolve (minimize) 1 comment(s) on PR #86? › Yes
+
+📤 Resolving comments...
+✓ Resolved 1 comment(s)
+```
 
 ## Harshness Levels
 
@@ -205,6 +286,7 @@ Summary: 1 to post, 1 skipped
 - **Uses `gh` CLI** — works with your existing GitHub auth
 - **Uses `claude` CLI** — works with your existing Claude login, no API key config needed
 - **Transparent** — you see exactly what will be posted
+- **Recheck** — verify old comments are still relevant after new commits
 
 ## Greetings
 

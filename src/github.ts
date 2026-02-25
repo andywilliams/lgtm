@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { PRDetails } from './types.js';
+import type { PRDetails, ExistingComment } from './types.js';
 
 /**
  * Execute a gh CLI command and return the output
@@ -143,6 +143,52 @@ export function getFileContent(prNumber: number, filePath: string, repo?: string
   } catch {
     return null;
   }
+}
+
+/**
+ * Fetch existing review comments on a PR
+ */
+export function getPRComments(prNumber: number, repo?: string): ExistingComment[] {
+  const repoPath = repo || getRepoFromGit();
+  const [owner, repoName] = repoPath.split('/');
+
+  // Fetch all review comments (paginated, up to 100)
+  const json = execSync(
+    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate`,
+    { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
+  );
+
+  const comments = JSON.parse(json);
+  return comments.map((c: any) => ({
+    id: c.id,
+    nodeId: c.node_id,
+    file: c.path,
+    line: c.line ?? c.original_line ?? null,
+    body: c.body,
+    author: c.user?.login || 'unknown',
+    createdAt: c.created_at,
+    url: c.html_url,
+  }));
+}
+
+/**
+ * Resolve (minimize/hide) a review comment on a PR
+ * Uses the GraphQL API to minimize the comment as "RESOLVED"
+ */
+export function resolveComment(nodeId: string): void {
+  const query = JSON.stringify({
+    query: `mutation {
+      minimizeComment(input: {subjectId: "${nodeId}", classifier: RESOLVED}) {
+        minimizedComment { isMinimized }
+      }
+    }`
+  });
+
+  execSync(`gh api graphql --input -`, {
+    input: query,
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
 }
 
 /**

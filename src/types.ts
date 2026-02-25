@@ -34,3 +34,27 @@ export interface ReviewOptions {
   dryRun: boolean;
   batch: boolean;
 }
+
+export interface ExistingComment {
+  id: number;
+  nodeId: string;
+  file: string;
+  line: number | null;
+  body: string;
+  author: string;
+  createdAt: string;
+  url: string;
+}
+
+export type CommentStatus = 'still_valid' | 'resolved' | 'outdated';
+
+export interface RecheckResult {
+  commentId: number;
+  status: CommentStatus;
+  reason: string;
+}
+
+export interface RecheckResponse {
+  summary: string;
+  results: RecheckResult[];
+}
