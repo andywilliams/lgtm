@@ -328,16 +328,22 @@ program
       ai = options.ai as AIProvider;
       if (ai === 'claude' && !checkClaudeCli()) {
         console.error(chalk.red('\n⚠ Claude CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
+        console.log(chalk.dim('Then run: claude login'));
         process.exit(1);
       }
       if (ai === 'codex' && !checkCodexCli()) {
         console.error(chalk.red('\n⚠ Codex CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
         process.exit(1);
       }
     } else {
       const available = getAvailableProviders();
       if (available.length === 0) {
         console.error(chalk.red('\n⚠ No AI CLI found.'));
+        console.log(chalk.dim('Install one of:'));
+        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
+        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
         process.exit(1);
       }
       ai = available.includes('claude') ? 'claude' : 'codex';

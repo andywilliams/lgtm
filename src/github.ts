@@ -65,7 +65,9 @@ export function postReviewComment(
   // Use gh api to post a review comment
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
-  
+
+  validateRepoComponents(owner, repoName);
+
   // First we need the commit SHA of the PR head
   const prJson = gh(`pr view ${prNumber} --json headRefOid`, repo);
   const { headRefOid } = JSON.parse(prJson);
@@ -96,7 +98,9 @@ export function submitReview(
 ): void {
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
-  
+
+  validateRepoComponents(owner, repoName);
+
   // Get commit SHA
   const prJson = gh(`pr view ${prNumber} --json headRefOid`, repo);
   const { headRefOid } = JSON.parse(prJson);
@@ -127,7 +131,9 @@ export function getFileContent(prNumber: number, filePath: string, repo?: string
   try {
     const repoPath = repo || getRepoFromGit();
     const [owner, repoName] = repoPath.split('/');
-    
+
+    validateRepoComponents(owner, repoName);
+
     // Get the head ref of the PR
     const prJson = gh(`pr view ${prNumber} --json headRefName`, repo);
     const { headRefName } = JSON.parse(prJson);
@@ -152,6 +158,8 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
 
+  validateRepoComponents(owner, repoName);
+
   // Fetch all review comments (paginated)
   // --paginate with --jq outputs one JSON array per page; merge them
   const json = execSync(
@@ -159,8 +167,13 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
     { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
   );
 
+  if (!json.trim()) {
+    return [];
+  }
+
   const comments = json.trim().split('\n').reduce((acc: any[], line) => {
-    try { return acc.concat(JSON.parse(line)); } catch { return acc; }
+    const parsed = JSON.parse(line);
+    return acc.concat(parsed);
   }, []);
   return comments.map((c: any) => ({
     id: c.id,
@@ -188,11 +201,26 @@ export function resolveComment(nodeId: string): void {
     variables: { id: nodeId }
   });
 
-  execSync(`gh api graphql --input -`, {
+  const result = execSync(`gh api graphql --input -`, {
     input: query,
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+
+  const response = JSON.parse(result);
+  if (response.errors?.length) {
+    throw new Error(`GraphQL error: ${response.errors[0].message}`);
+  }
+}
+
+/**
+ * Validate owner and repo name components to prevent shell injection
+ */
+function validateRepoComponents(owner: string, repoName: string): void {
+  const valid = /^[a-zA-Z0-9._-]+$/;
+  if (!valid.test(owner) || !valid.test(repoName)) {
+    throw new Error(`Invalid repository format: ${owner}/${repoName}`);
+  }
 }
 
 /**
