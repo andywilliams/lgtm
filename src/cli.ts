@@ -481,7 +481,7 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
       ],
     });
 
-    if (response.action === 'quit') {
+    if (response.action === 'quit' || !response.action) {
       console.log(chalk.yellow('\nQuitting recheck.'));
       break;
     }

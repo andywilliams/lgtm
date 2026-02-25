@@ -152,13 +152,16 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
 
-  // Fetch all review comments (paginated, up to 100)
+  // Fetch all review comments (paginated)
+  // --paginate with --jq outputs one JSON array per page; merge them
   const json = execSync(
-    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate`,
+    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate --jq '[.[] | {id, node_id, path, line, original_line, body, user: .user, created_at, html_url}]'`,
     { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
   );
 
-  const comments = JSON.parse(json);
+  const comments = json.trim().split('\n').reduce((acc: any[], line) => {
+    try { return acc.concat(JSON.parse(line)); } catch { return acc; }
+  }, []);
   return comments.map((c: any) => ({
     id: c.id,
     nodeId: c.node_id,
@@ -177,11 +180,12 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
  */
 export function resolveComment(nodeId: string): void {
   const query = JSON.stringify({
-    query: `mutation {
-      minimizeComment(input: {subjectId: "${nodeId}", classifier: RESOLVED}) {
+    query: `mutation($id: ID!) {
+      minimizeComment(input: {subjectId: $id, classifier: RESOLVED}) {
         minimizedComment { isMinimized }
       }
-    }`
+    }`,
+    variables: { id: nodeId }
   });
 
   execSync(`gh api graphql --input -`, {
