@@ -3,10 +3,10 @@
 import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview } from './github.js';
-import { reviewPR, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, getPRComments, resolveComment } from './github.js';
+import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
-import type { Harshness, ReviewComment } from './types.js';
+import type { Harshness, ReviewComment, ExistingComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
   BUG: chalk.red,
@@ -301,6 +301,248 @@ async function runReview(options: RunOptions): Promise<void> {
   submitReview(prNumber, formattedComments, repo);
   
   console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
+}
+
+program
+  .command('recheck <pr-number>')
+  .description('Check if existing review comments are still valid')
+  .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .option('--batch', 'Resolve all outdated/resolved comments without prompting', false)
+  .option('--dry-run', 'Show results without resolving any comments', false)
+  .option('--author <login>', 'Only recheck comments from a specific author')
+  .action(async (prNumberStr: string, options) => {
+    const prNumber = parseInt(prNumberStr, 10);
+    if (isNaN(prNumber)) {
+      console.error(chalk.red('Invalid PR number'));
+      process.exit(1);
+    }
+
+    // Determine AI provider (same logic as review)
+    let ai: AIProvider;
+    if (options.ai) {
+      if (!['claude', 'codex'].includes(options.ai)) {
+        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
+        process.exit(1);
+      }
+      ai = options.ai as AIProvider;
+      if (ai === 'claude' && !checkClaudeCli()) {
+        console.error(chalk.red('\n⚠ Claude CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
+        console.log(chalk.dim('Then run: claude login'));
+        process.exit(1);
+      }
+      if (ai === 'codex' && !checkCodexCli()) {
+        console.error(chalk.red('\n⚠ Codex CLI not found.'));
+        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
+        process.exit(1);
+      }
+    } else {
+      const available = getAvailableProviders();
+      if (available.length === 0) {
+        console.error(chalk.red('\n⚠ No AI CLI found.'));
+        console.log(chalk.dim('Install one of:'));
+        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
+        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
+        process.exit(1);
+      }
+      ai = available.includes('claude') ? 'claude' : 'codex';
+    }
+
+    try {
+      await runRecheck({
+        prNumber,
+        repo: options.repo,
+        ai,
+        batch: options.batch,
+        dryRun: options.dryRun,
+        author: options.author,
+      });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error.message}`));
+      process.exit(1);
+    }
+  });
+
+interface RecheckOptions {
+  prNumber: number;
+  repo?: string;
+  ai: AIProvider;
+  batch: boolean;
+  dryRun: boolean;
+  author?: string;
+}
+
+const STATUS_COLORS: Record<string, (s: string) => string> = {
+  still_valid: chalk.yellow,
+  resolved: chalk.green,
+  outdated: chalk.gray,
+};
+
+const STATUS_ICONS: Record<string, string> = {
+  still_valid: '⚠',
+  resolved: '✓',
+  outdated: '♻',
+};
+
+async function runRecheck(options: RecheckOptions): Promise<void> {
+  const { prNumber, repo, ai, batch, dryRun, author } = options;
+
+  // Fetch PR details
+  console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
+  const pr = getPRDetails(prNumber, repo);
+  console.log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+
+  // Fetch existing comments
+  console.log(chalk.blue(`\n💬 Fetching review comments...`));
+  let comments = getPRComments(prNumber, repo);
+
+  if (author) {
+    comments = comments.filter(c => c.author === author);
+    console.log(chalk.gray(`   Filtered to comments by ${author}`));
+  }
+
+  if (comments.length === 0) {
+    console.log(chalk.green('\n✓ No review comments found on this PR.'));
+    return;
+  }
+
+  console.log(chalk.white(`   Found ${comments.length} review comment(s)`));
+
+  // Fetch current diff
+  console.log(chalk.blue(`\n📄 Fetching current diff...`));
+  const diff = getPRDiff(prNumber, repo);
+  const maxDiffLength = 50000;
+  const truncatedDiff = diff.length > maxDiffLength
+    ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)'
+    : diff;
+
+  // Run AI recheck
+  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
+  console.log(chalk.blue(`\n🤖 Rechecking comments with ${aiLabel}...`));
+  const result = await recheckComments(truncatedDiff, pr.title, comments, ai);
+
+  console.log(chalk.gray(`\n${result.summary}\n`));
+
+  // Build a lookup from comment ID to the original comment
+  const commentMap = new Map<number, ExistingComment>();
+  for (const c of comments) {
+    commentMap.set(c.id, c);
+  }
+
+  // Display results and collect comments to resolve
+  const toResolve: ExistingComment[] = [];
+  const stillValid: number[] = [];
+
+  for (let i = 0; i < result.results.length; i++) {
+    const r = result.results[i];
+    const comment = commentMap.get(r.commentId);
+    if (!comment) continue;
+
+    const statusColor = STATUS_COLORS[r.status] || chalk.white;
+    const statusIcon = STATUS_ICONS[r.status] || '•';
+
+    console.log(chalk.white('─'.repeat(60)));
+    console.log(
+      chalk.white(`[${i + 1}/${result.results.length}] `) +
+      statusIcon + ' ' +
+      statusColor(r.status.replaceAll('_', ' ').toUpperCase()) +
+      chalk.gray(` | ${comment.file}${comment.line ? ':' + comment.line : ''}`)
+    );
+    console.log(chalk.white('─'.repeat(60)));
+    // Show a truncated version of the comment body
+    const bodyPreview = comment.body.length > 200
+      ? comment.body.slice(0, 200) + '...'
+      : comment.body;
+    console.log(chalk.dim(bodyPreview));
+    console.log(chalk.white(`\nReason: ${r.reason}`));
+    console.log();
+
+    if (r.status === 'still_valid') {
+      stillValid.push(r.commentId);
+      continue;
+    }
+
+    // For resolved/outdated comments, offer to resolve them
+    if (dryRun) {
+      console.log(chalk.gray('(dry-run mode — not resolving)\n'));
+      continue;
+    }
+
+    if (batch) {
+      toResolve.push(comment);
+      console.log(chalk.green('✓ Queued for resolution\n'));
+      continue;
+    }
+
+    // Interactive mode
+    const response = await prompts({
+      type: 'select',
+      name: 'action',
+      message: 'Action',
+      choices: [
+        { title: 'Resolve (minimize comment)', value: 'resolve' },
+        { title: 'Keep', value: 'keep' },
+        { title: 'Quit', value: 'quit' },
+      ],
+    });
+
+    if (response.action === 'quit' || !response.action) {
+      console.log(chalk.yellow('\nQuitting recheck.'));
+      break;
+    }
+
+    if (response.action === 'resolve') {
+      toResolve.push(comment);
+      console.log(chalk.green('✓ Queued for resolution\n'));
+    } else {
+      console.log(chalk.gray('⊘ Kept\n'));
+    }
+  }
+
+  // Summary
+  console.log(chalk.white('═'.repeat(60)));
+  const kept = comments.length - stillValid.length - toResolve.length;
+  console.log(chalk.white(`Summary: ${stillValid.length} still valid, ${toResolve.length} to resolve, ${kept} kept`));
+  console.log(chalk.white('═'.repeat(60)));
+
+  if (toResolve.length === 0) {
+    console.log(chalk.gray('\nNo comments to resolve.'));
+    return;
+  }
+
+  if (dryRun) {
+    console.log(chalk.yellow('\n(dry-run mode — skipping resolution)'));
+    return;
+  }
+
+  if (!batch) {
+    // Confirm before resolving (skip in batch mode for non-interactive use)
+    const confirm = await prompts({
+      type: 'confirm',
+      name: 'value',
+      message: `Resolve (minimize) ${toResolve.length} comment(s) on PR #${prNumber}?`,
+      initial: true,
+    });
+
+    if (!confirm.value) {
+      console.log(chalk.yellow('Cancelled.'));
+      return;
+    }
+  }
+
+  console.log(chalk.blue('\n📤 Resolving comments...'));
+  let resolved = 0;
+  for (const comment of toResolve) {
+    try {
+      resolveComment(comment.nodeId);
+      resolved++;
+    } catch (error: any) {
+      console.error(chalk.red(`   Failed to resolve comment ${comment.id}: ${error.message}`));
+    }
+  }
+
+  console.log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
 }
 
 program.parse();

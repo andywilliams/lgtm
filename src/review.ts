@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { Harshness, ReviewResult, ReviewComment, Severity } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus } from './types.js';
 
 export type AIProvider = 'claude' | 'codex';
 
@@ -157,13 +157,16 @@ If no issues found, respond with:
     if (ai === 'codex') {
       // Use codex exec with stdin input (-), output last message to temp file
       const outputFile = tempFile + '.out';
-      execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      output = fs.readFileSync(outputFile, 'utf-8');
-      fs.unlinkSync(outputFile);
+      try {
+        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = fs.readFileSync(outputFile, 'utf-8');
+      } finally {
+        try { fs.unlinkSync(outputFile); } catch {}
+      }
     } else {
       // Use claude CLI with --print flag to get output directly
       output = execSync(`claude --print < "${tempFile}"`, {
@@ -229,6 +232,134 @@ function parseAIResponse(output: string): ReviewResult {
     console.error('Failed to parse AI response as JSON');
     console.error('Raw response:', output.slice(0, 500));
     throw new Error('Failed to parse review response from AI');
+  }
+}
+
+/**
+ * Re-check existing PR comments against the current diff to see if they're still valid
+ */
+export async function recheckComments(
+  diff: string,
+  prTitle: string,
+  comments: ExistingComment[],
+  ai: AIProvider = 'claude'
+): Promise<RecheckResponse> {
+  const commentsSection = comments.map((c, i) =>
+    `### Comment ${c.id}
+- **File:** ${c.file}${c.line ? `:${c.line}` : ''}
+- **Author:** ${c.author}
+- **Body:** ${c.body}`
+  ).join('\n\n');
+
+  const prompt = `You are a code review assistant. Your job is to check whether existing review comments on a pull request are still relevant given the current state of the diff.
+
+For each comment, determine if:
+- "still_valid": The issue the comment raises is still present in the current diff
+- "resolved": The code has been updated and the comment's concern has been addressed
+- "outdated": The code the comment refers to no longer exists or has changed so much the comment no longer applies
+
+## PR Title
+${prTitle}
+
+## Current Diff
+\`\`\`diff
+${diff}
+\`\`\`
+
+## Existing Review Comments
+${commentsSection}
+
+OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
+{
+  "summary": "Brief summary of the recheck results",
+  "results": [
+    {
+      "commentId": <the comment id number>,
+      "status": "still_valid" | "resolved" | "outdated",
+      "reason": "Brief explanation of why this status was assigned"
+    }
+  ]
+}
+
+Include a result for every comment listed above.`;
+
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+
+  const tempFile = path.join(os.tmpdir(), `lgtm-recheck-${Date.now()}.txt`);
+  fs.writeFileSync(tempFile, prompt);
+
+  try {
+    let output: string;
+
+    if (ai === 'codex') {
+      const outputFile = tempFile + '.out';
+      try {
+        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = fs.readFileSync(outputFile, 'utf-8');
+      } finally {
+        try { fs.unlinkSync(outputFile); } catch {}
+      }
+    } else {
+      output = execSync(`claude --print < "${tempFile}"`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    }
+
+    fs.unlinkSync(tempFile);
+    return parseRecheckResponse(output, comments);
+  } catch (error: any) {
+    try { fs.unlinkSync(tempFile); } catch {}
+    throw error;
+  }
+}
+
+/**
+ * Parse AI response for recheck results
+ */
+function parseRecheckResponse(output: string, comments: ExistingComment[]): RecheckResponse {
+  let jsonStr = output.trim();
+
+  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) {
+    jsonStr = jsonMatch[1].trim();
+  }
+
+  const summaryMatch = jsonStr.match(/\{"summary"[\s\S]*\}/);
+  if (summaryMatch) {
+    jsonStr = summaryMatch[0];
+  } else {
+    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonObjectMatch) {
+      jsonStr = jsonObjectMatch[0];
+    }
+  }
+
+  try {
+    const result = JSON.parse(jsonStr.trim()) as RecheckResponse;
+    const validStatuses: CommentStatus[] = ['still_valid', 'resolved', 'outdated'];
+    const commentIds = new Set(comments.map(c => c.id));
+
+    result.results = (result.results || [])
+      .filter((r: RecheckResult) => commentIds.has(r.commentId))
+      .map((r: RecheckResult) => ({
+        commentId: r.commentId,
+        status: validStatuses.includes(r.status) ? r.status : 'still_valid',
+        reason: String(r.reason || ''),
+      }));
+
+    return result;
+  } catch {
+    console.error('Failed to parse recheck response');
+    console.error('Raw response:', output.slice(0, 500));
+    throw new Error('Failed to parse recheck response from AI');
   }
 }
 

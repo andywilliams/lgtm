@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { PRDetails } from './types.js';
+import type { PRDetails, ExistingComment } from './types.js';
 
 /**
  * Execute a gh CLI command and return the output
@@ -65,7 +65,9 @@ export function postReviewComment(
   // Use gh api to post a review comment
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
-  
+
+  validateRepoComponents(owner, repoName);
+
   // First we need the commit SHA of the PR head
   const prJson = gh(`pr view ${prNumber} --json headRefOid`, repo);
   const { headRefOid } = JSON.parse(prJson);
@@ -96,7 +98,9 @@ export function submitReview(
 ): void {
   const repoPath = repo || getRepoFromGit();
   const [owner, repoName] = repoPath.split('/');
-  
+
+  validateRepoComponents(owner, repoName);
+
   // Get commit SHA
   const prJson = gh(`pr view ${prNumber} --json headRefOid`, repo);
   const { headRefOid } = JSON.parse(prJson);
@@ -127,7 +131,9 @@ export function getFileContent(prNumber: number, filePath: string, repo?: string
   try {
     const repoPath = repo || getRepoFromGit();
     const [owner, repoName] = repoPath.split('/');
-    
+
+    validateRepoComponents(owner, repoName);
+
     // Get the head ref of the PR
     const prJson = gh(`pr view ${prNumber} --json headRefName`, repo);
     const { headRefName } = JSON.parse(prJson);
@@ -142,6 +148,86 @@ export function getFileContent(prNumber: number, filePath: string, repo?: string
     return Buffer.from(content, 'base64').toString('utf-8');
   } catch {
     return null;
+  }
+}
+
+/**
+ * Fetch existing review comments on a PR
+ */
+export function getPRComments(prNumber: number, repo?: string): ExistingComment[] {
+  const repoPath = repo || getRepoFromGit();
+  const [owner, repoName] = repoPath.split('/');
+
+  validateRepoComponents(owner, repoName);
+
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid PR number: ${prNumber}`);
+  }
+
+  // Fetch all review comments (paginated)
+  // --paginate with --jq outputs one JSON array per page; merge them
+  const json = execSync(
+    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate --jq '[.[] | {id, node_id, path, line, original_line, body, user: .user.login, created_at, html_url}]'`,
+    { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
+  );
+
+  if (!json.trim()) {
+    return [];
+  }
+
+  const comments = json.trim().split('\n').reduce((acc: any[], line) => {
+    if (!line.trim()) return acc;
+    try {
+      return acc.concat(JSON.parse(line));
+    } catch {
+      throw new Error(`Failed to parse PR comments response. Raw line: ${line.slice(0, 200)}`);
+    }
+  }, []);
+  return comments.map((c: any) => ({
+    id: c.id,
+    nodeId: c.node_id,
+    file: c.path,
+    line: c.line ?? c.original_line ?? null,
+    body: c.body,
+    author: c.user || 'unknown',
+    createdAt: c.created_at,
+    url: c.html_url,
+  }));
+}
+
+/**
+ * Resolve (minimize/hide) a review comment on a PR
+ * Uses the GraphQL API to minimize the comment as "RESOLVED"
+ */
+export function resolveComment(nodeId: string): void {
+  const query = JSON.stringify({
+    query: `mutation($id: ID!) {
+      minimizeComment(input: {subjectId: $id, classifier: RESOLVED}) {
+        minimizedComment { isMinimized }
+      }
+    }`,
+    variables: { id: nodeId }
+  });
+
+  const result = execSync(`gh api graphql --input -`, {
+    input: query,
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  const response = JSON.parse(result);
+  if (response.errors?.length) {
+    throw new Error(`GraphQL error: ${response.errors[0].message}`);
+  }
+}
+
+/**
+ * Validate owner and repo name components to prevent shell injection
+ */
+function validateRepoComponents(owner: string, repoName: string): void {
+  const valid = /^[a-zA-Z0-9._-]+$/;
+  if (!valid.test(owner) || !valid.test(repoName)) {
+    throw new Error(`Invalid repository format: ${owner}/${repoName}`);
   }
 }
 
