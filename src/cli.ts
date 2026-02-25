@@ -446,7 +446,7 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
     console.log(
       chalk.white(`[${i + 1}/${result.results.length}] `) +
       statusIcon + ' ' +
-      statusColor(r.status.replace('_', ' ').toUpperCase()) +
+      statusColor(r.status.replaceAll('_', ' ').toUpperCase()) +
       chalk.gray(` | ${comment.file}${comment.line ? ':' + comment.line : ''}`)
     );
     console.log(chalk.white('─'.repeat(60)));
@@ -515,17 +515,19 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
     return;
   }
 
-  // Confirm and resolve
-  const confirm = await prompts({
-    type: 'confirm',
-    name: 'value',
-    message: `Resolve (minimize) ${toResolve.length} comment(s) on PR #${prNumber}?`,
-    initial: true,
-  });
+  if (!batch) {
+    // Confirm before resolving (skip in batch mode for non-interactive use)
+    const confirm = await prompts({
+      type: 'confirm',
+      name: 'value',
+      message: `Resolve (minimize) ${toResolve.length} comment(s) on PR #${prNumber}?`,
+      initial: true,
+    });
 
-  if (!confirm.value) {
-    console.log(chalk.yellow('Cancelled.'));
-    return;
+    if (!confirm.value) {
+      console.log(chalk.yellow('Cancelled.'));
+      return;
+    }
   }
 
   console.log(chalk.blue('\n📤 Resolving comments...'));

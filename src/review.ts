@@ -157,13 +157,16 @@ If no issues found, respond with:
     if (ai === 'codex') {
       // Use codex exec with stdin input (-), output last message to temp file
       const outputFile = tempFile + '.out';
-      execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      output = fs.readFileSync(outputFile, 'utf-8');
-      fs.unlinkSync(outputFile);
+      try {
+        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = fs.readFileSync(outputFile, 'utf-8');
+      } finally {
+        try { fs.unlinkSync(outputFile); } catch {}
+      }
     } else {
       // Use claude CLI with --print flag to get output directly
       output = execSync(`claude --print < "${tempFile}"`, {
@@ -292,13 +295,16 @@ Include a result for every comment listed above.`;
 
     if (ai === 'codex') {
       const outputFile = tempFile + '.out';
-      execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-      output = fs.readFileSync(outputFile, 'utf-8');
-      fs.unlinkSync(outputFile);
+      try {
+        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = fs.readFileSync(outputFile, 'utf-8');
+      } finally {
+        try { fs.unlinkSync(outputFile); } catch {}
+      }
     } else {
       output = execSync(`claude --print < "${tempFile}"`, {
         encoding: 'utf-8',
