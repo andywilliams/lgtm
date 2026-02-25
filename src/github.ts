@@ -160,10 +160,14 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
 
   validateRepoComponents(owner, repoName);
 
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid PR number: ${prNumber}`);
+  }
+
   // Fetch all review comments (paginated)
   // --paginate with --jq outputs one JSON array per page; merge them
   const json = execSync(
-    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate --jq '[.[] | {id, node_id, path, line, original_line, body, user: .user, created_at, html_url}]'`,
+    `gh api repos/${owner}/${repoName}/pulls/${prNumber}/comments --paginate --jq '[.[] | {id, node_id, path, line, original_line, body, user: .user.login, created_at, html_url}]'`,
     { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 }
   );
 
@@ -172,8 +176,12 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
   }
 
   const comments = json.trim().split('\n').reduce((acc: any[], line) => {
-    const parsed = JSON.parse(line);
-    return acc.concat(parsed);
+    if (!line.trim()) return acc;
+    try {
+      return acc.concat(JSON.parse(line));
+    } catch {
+      throw new Error(`Failed to parse PR comments response. Raw line: ${line.slice(0, 200)}`);
+    }
   }, []);
   return comments.map((c: any) => ({
     id: c.id,
@@ -181,7 +189,7 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
     file: c.path,
     line: c.line ?? c.original_line ?? null,
     body: c.body,
-    author: c.user?.login || 'unknown',
+    author: c.user || 'unknown',
     createdAt: c.created_at,
     url: c.html_url,
   }));
