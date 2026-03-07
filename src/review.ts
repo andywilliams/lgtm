@@ -91,7 +91,8 @@ export async function reviewPR(
   harshness: Harshness,
   ai: AIProvider = 'claude',
   fileContents?: Record<string, string>,
-  usageContext?: string
+  usageContext?: string,
+  expandedContext?: string
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -113,6 +114,12 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
     usageContextSection = usageContext;
   }
 
+  // Add expanded context if provided
+  let expandedContextSection = '';
+  if (expandedContext) {
+    expandedContextSection = expandedContext;
+  }
+
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
 ## PR Title
@@ -125,7 +132,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${fileContextSection}${usageContextSection}
+${fileContextSection}${usageContextSection}${expandedContextSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
