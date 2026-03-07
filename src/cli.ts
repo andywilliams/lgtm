@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, getPRComments, resolveComment } from './github.js';
 import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
+import { expandContext } from './contextExpander.js';
 import type { Harshness, ReviewComment, ExistingComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -37,6 +38,7 @@ program
   .option('--batch', 'Post all comments without prompting', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
   .option('--usage-context', 'Include files that use changed symbols', false)
+  .option('--context', 'Auto-expand context using static analysis', false)
   .action(async (prNumberStr: string, options) => {
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
@@ -94,6 +96,7 @@ program
         batch: options.batch,
         fullContext: options.fullContext,
         usageContext: options.usageContext,
+        context: options.context,
         ai,
       });
     } catch (error: any) {
@@ -110,11 +113,12 @@ interface RunOptions {
   batch: boolean;
   fullContext: boolean;
   usageContext: boolean;
+  context: boolean;
   ai: AIProvider;
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, fullContext, usageContext, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, fullContext, usageContext, context, ai } = options;
 
   // Fetch PR details
   console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
@@ -178,14 +182,44 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
+  // Auto-expand context if requested
+  let expandedContextStr = '';
+  if (context) {
+    console.log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
+    const changedFiles = getChangedFiles(prNumber, repo);
+    const repoRoot = getRepoRoot();
+    const expanded = await expandContext(changedFiles, repoRoot, {
+      maxFiles: 20,
+      importDepth: 3,
+    });
+    
+    if (expanded.length > 0) {
+      console.log(chalk.gray(`   Found ${expanded.length} context file(s):`));
+      let tokenEstimate = 0;
+      expandedContextStr = `\n## Expanded Context (Auto-discovered)\n`;
+      expandedContextStr += `The following files were automatically discovered as relevant context:\n\n`;
+      for (const file of expanded) {
+        console.log(chalk.gray(`   • ${file.path} (${file.reason})`));
+        expandedContextStr += `### ${file.path}\n`;
+        expandedContextStr += `_Reason: ${file.reason}_\n\n`;
+        expandedContextStr += `\`\`\`\n${file.content}\n\`\`\`\n\n`;
+        tokenEstimate += Math.ceil(file.content.length / 4);
+      }
+      console.log(chalk.gray(`   Estimated tokens: ~${tokenEstimate}`));
+    } else {
+      console.log(chalk.gray(`   No additional context found`));
+    }
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
   const contextModes = [harshness + ' mode'];
   if (fullContext) contextModes.push('full context');
   if (usageContext && usageContextStr) contextModes.push('usage context');
+  if (context && expandedContextStr) contextModes.push('expanded context');
   const modeLabel = contextModes.join(' + ');
   console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr);
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr);
 
   console.log(chalk.gray(`\n${result.summary}\n`));
 
