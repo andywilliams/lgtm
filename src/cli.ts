@@ -7,7 +7,6 @@ import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview,
 import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
-import { logReview } from './db.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ExistingComment } from './types.js';
 
@@ -355,32 +354,6 @@ async function runReview(options: RunOptions): Promise<void> {
     process.exit(1);
   }
 
-  // Log review metadata for metrics
-  const repoName = repo || getRepoRoot();
-  const changedFiles = getChangedFiles(prNumber, repo);
-  const contextFilesAdded = expanded?.length || 0;
-  const contextReasons = expanded ? JSON.stringify(expanded.map(f => f.reason)) : '[]';
-  
-  // Estimate token count (rough estimate: ~4 chars per token)
-  let tokenEstimate = Math.ceil(diff.length / 4);
-  if (expanded) {
-    for (const file of expanded) {
-      tokenEstimate += Math.ceil(file.content.length / 4);
-    }
-  }
-  
-  logReview({
-    repo: repoName,
-    prNumber,
-    reviewedAt: new Date().toISOString(),
-    filesReviewed: changedFiles.length,
-    contextFilesAdded,
-    contextReasons,
-    tokenCount: tokenEstimate,
-    model: ai,
-    usedContextExpansion: context && expanded && expanded.length > 0,
-    falseNegative: false
-  });
 }
 
 program
@@ -625,25 +598,6 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
   console.log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
 }
 
-// Tag command: mark a PR as false negative
-program
-  .command('tag <repo> <pr>')
-  .description('Tag a reviewed PR as a false negative (bug slipped through)')
-  .action(async (repo: string, pr: string) => {
-    const { tagFalseNegative } = await import('./db.js');
-    const prNumber = parseInt(pr, 10);
-    if (isNaN(prNumber)) {
-      console.error(chalk.red('Invalid PR number'));
-      process.exit(1);
-    }
-    const success = tagFalseNegative(repo, prNumber);
-    if (success) {
-      console.log(chalk.yellow(`Tagged ${repo}#${pr} as false negative`));
-    } else {
-      console.log(chalk.red(`No review found for ${repo}#${pr}`));
-    }
-  });
-
 // Retry command: re-upload cached comments after a failed upload
 program
   .command('retry [pr-number]')
@@ -716,24 +670,4 @@ program
     }
   });
 
-// Report command: generate monthly review metrics
-program
-  .command('report [month] [year]')
-  .description('Generate monthly review metrics report')
-  .action(async (monthStr?: string, yearStr?: string) => {
-    const { getMonthlyStats } = await import('./db.js');
-    const now = new Date();
-    const month = monthStr ? parseInt(monthStr, 10) : now.getMonth() + 1;
-    const year = yearStr ? parseInt(yearStr, 10) : now.getFullYear();
-    
-    const stats = getMonthlyStats(year, month);
-    const falseNegativeRate = stats.total > 0 ? ((stats.falseNegatives / stats.total) * 100).toFixed(1) : '0.0';
-    const contextCoverage = stats.total > 0 ? ((stats.withContextExpansion / stats.total) * 100).toFixed(1) : '0.0';
-    
-    console.log(chalk.bold(`\nlgtm Review Metrics — ${month}/${year}\n`));
-    console.log(`PRs Reviewed:           ${stats.total}`);
-    console.log(`False Negatives:        ${stats.falseNegatives}`);
-    console.log(`False Negative Rate:    ${falseNegativeRate}%`);
-    console.log(`Context Expansion Used: ${contextCoverage}%\n`);
-  });
 program.parse();

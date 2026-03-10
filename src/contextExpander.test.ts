@@ -47,7 +47,7 @@ describe("findImports", () => {
     fs.writeFileSync(path.join(testDir, "b.js"), `const c = require("./c");`);
     fs.writeFileSync(path.join(testDir, "c.js"), `module.exports = {};`);
     
-    const visited = new Set();
+    const visited = new Set<string>();
     const results = findImports(path.join(testDir, "a.js"), testDir, 3, visited);
     
     // Should find b.js and c.js
