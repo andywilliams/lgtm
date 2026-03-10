@@ -7,6 +7,8 @@ import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview,
 import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
+import { logReview } from './db.js';
+import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ExistingComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -332,9 +334,53 @@ async function runReview(options: RunOptions): Promise<void> {
     };
   });
 
-  submitReview(prNumber, formattedComments, repo);
+  // Save to local cache before attempting upload — so we can retry if it fails
+  const repoForCache = repo || 'unknown';
+  savePendingReview({
+    prNumber,
+    repo: repoForCache,
+    createdAt: new Date().toISOString(),
+    comments: formattedComments,
+  });
+
+  try {
+    submitReview(prNumber, formattedComments, repo);
+    // Upload succeeded — clean up the cache
+    deletePendingReview(prNumber, repoForCache);
+    console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
+  } catch (uploadError: any) {
+    console.error(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
+    console.log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
+    console.log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
+    process.exit(1);
+  }
+
+  // Log review metadata for metrics
+  const repoName = repo || getRepoRoot();
+  const changedFiles = getChangedFiles(prNumber, repo);
+  const contextFilesAdded = expanded?.length || 0;
+  const contextReasons = expanded ? JSON.stringify(expanded.map(f => f.reason)) : '[]';
   
-  console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
+  // Estimate token count (rough estimate: ~4 chars per token)
+  let tokenEstimate = Math.ceil(diff.length / 4);
+  if (expanded) {
+    for (const file of expanded) {
+      tokenEstimate += Math.ceil(file.content.length / 4);
+    }
+  }
+  
+  logReview({
+    repo: repoName,
+    prNumber,
+    reviewedAt: new Date().toISOString(),
+    filesReviewed: changedFiles.length,
+    contextFilesAdded,
+    contextReasons,
+    tokenCount: tokenEstimate,
+    model: ai,
+    usedContextExpansion: context && expanded && expanded.length > 0,
+    falseNegative: false
+  });
 }
 
 program
@@ -579,4 +625,115 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
   console.log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
 }
 
+// Tag command: mark a PR as false negative
+program
+  .command('tag <repo> <pr>')
+  .description('Tag a reviewed PR as a false negative (bug slipped through)')
+  .action(async (repo: string, pr: string) => {
+    const { tagFalseNegative } = await import('./db.js');
+    const prNumber = parseInt(pr, 10);
+    if (isNaN(prNumber)) {
+      console.error(chalk.red('Invalid PR number'));
+      process.exit(1);
+    }
+    const success = tagFalseNegative(repo, prNumber);
+    if (success) {
+      console.log(chalk.yellow(`Tagged ${repo}#${pr} as false negative`));
+    } else {
+      console.log(chalk.red(`No review found for ${repo}#${pr}`));
+    }
+  });
+
+// Retry command: re-upload cached comments after a failed upload
+program
+  .command('retry [pr-number]')
+  .description('Retry a previously failed comment upload')
+  .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .action(async (prNumberStr?: string, options?: { repo?: string }) => {
+    const repo = options?.repo || 'unknown';
+
+    // No PR number — list all pending
+    if (!prNumberStr) {
+      const pending = listPendingReviews();
+      if (pending.length === 0) {
+        console.log(chalk.green('✓ No pending reviews to retry.'));
+        return;
+      }
+      console.log(chalk.yellow(`\n💾 Pending reviews (${pending.length}):\n`));
+      for (const r of pending) {
+        const age = Math.round((Date.now() - new Date(r.createdAt).getTime()) / 60000);
+        console.log(
+          chalk.white(`  PR #${r.prNumber}`) +
+          chalk.gray(` — ${r.repo} — ${r.comments.length} comment(s) — ${age}m ago`)
+        );
+        console.log(chalk.dim(`    lgtm retry ${r.prNumber} -r ${r.repo}`));
+      }
+      return;
+    }
+
+    const prNumber = parseInt(prNumberStr, 10);
+    if (isNaN(prNumber)) {
+      console.error(chalk.red('Invalid PR number'));
+      process.exit(1);
+    }
+
+    const pending = loadPendingReview(prNumber, repo);
+    if (!pending) {
+      console.error(chalk.red(`No pending review found for PR #${prNumber} (${repo})`));
+      console.log(chalk.dim('Run `lgtm retry` with no arguments to list all pending reviews.'));
+      process.exit(1);
+    }
+
+    const age = Math.round((Date.now() - new Date(pending.createdAt).getTime()) / 60000);
+    console.log(chalk.blue(`\n🔄 Retrying upload for PR #${prNumber} (${repo})`));
+    console.log(chalk.gray(`   ${pending.comments.length} comment(s) saved ${age} minute(s) ago\n`));
+
+    for (const c of pending.comments) {
+      console.log(chalk.gray(`  • ${c.file}:${c.line}`));
+    }
+
+    const confirm = await prompts({
+      type: 'confirm',
+      name: 'value',
+      message: `Re-upload ${pending.comments.length} comment(s) to PR #${prNumber}?`,
+      initial: true,
+    });
+
+    if (!confirm.value) {
+      console.log(chalk.yellow('Cancelled. Cache kept for future retry.'));
+      return;
+    }
+
+    console.log(chalk.blue('\n📤 Uploading...'));
+    try {
+      submitReview(prNumber, pending.comments, repo === 'unknown' ? undefined : repo);
+      deletePendingReview(prNumber, repo);
+      console.log(chalk.green(`\n✓ Posted ${pending.comments.length} comment(s)`));
+    } catch (error: any) {
+      console.error(chalk.red(`\n✗ Upload failed again: ${error.message}`));
+      console.log(chalk.yellow('Cache kept — try again later with `lgtm retry`'));
+      process.exit(1);
+    }
+  });
+
+// Report command: generate monthly review metrics
+program
+  .command('report [month] [year]')
+  .description('Generate monthly review metrics report')
+  .action(async (monthStr?: string, yearStr?: string) => {
+    const { getMonthlyStats } = await import('./db.js');
+    const now = new Date();
+    const month = monthStr ? parseInt(monthStr, 10) : now.getMonth() + 1;
+    const year = yearStr ? parseInt(yearStr, 10) : now.getFullYear();
+    
+    const stats = getMonthlyStats(year, month);
+    const falseNegativeRate = stats.total > 0 ? ((stats.falseNegatives / stats.total) * 100).toFixed(1) : '0.0';
+    const contextCoverage = stats.total > 0 ? ((stats.withContextExpansion / stats.total) * 100).toFixed(1) : '0.0';
+    
+    console.log(chalk.bold(`\nlgtm Review Metrics — ${month}/${year}\n`));
+    console.log(`PRs Reviewed:           ${stats.total}`);
+    console.log(`False Negatives:        ${stats.falseNegatives}`);
+    console.log(`False Negative Rate:    ${falseNegativeRate}%`);
+    console.log(`Context Expansion Used: ${contextCoverage}%\n`);
+  });
 program.parse();
