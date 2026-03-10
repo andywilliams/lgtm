@@ -130,6 +130,23 @@ lgtm review 86 --full-context --usage-context
 
 This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
 
+## Retrying Failed Uploads
+
+If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:
+
+```bash
+# List all pending (unsent) reviews
+lgtm retry
+
+# Retry a specific PR (uses current repo)
+lgtm retry 220
+
+# Retry with explicit repo
+lgtm retry 220 -r owner/repo
+```
+
+The cache lives at `~/.lgtm/pending/`. On a successful upload it's automatically deleted. If the retry also fails, the cache is kept so you can try again later.
+
 ## Rechecking Existing Comments
 
 After a PR author pushes new commits, previous review comments may no longer apply. Use `recheck` to evaluate whether existing comments are still valid:
