@@ -46,6 +46,12 @@ export interface ExistingComment {
   url: string;
 }
 
+export interface ExistingReviewComment {
+  path: string;
+  line: number | null;
+  body: string;
+}
+
 export type CommentStatus = 'still_valid' | 'resolved' | 'outdated';
 
 export interface RecheckResult {
