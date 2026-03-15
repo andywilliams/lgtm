@@ -3,13 +3,13 @@
 import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, getPRComments, resolveComment } from './github.js';
+import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
 import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment } from './types.js';
+import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
   BUG: chalk.red,
@@ -117,6 +117,31 @@ interface RunOptions {
   usageContext: boolean;
   context: boolean;
   ai: AIProvider;
+}
+
+function formatReviewCommentBody(comment: ReviewComment): string {
+  let body = `**${comment.title}**\n\n${comment.body}`;
+  if (comment.suggestion) {
+    body += `\n\n**Suggested fix:**\n\`\`\`suggestion\n${comment.suggestion}\n\`\`\``;
+  }
+  return body;
+}
+
+function normalizeFingerprintText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewComment[]): boolean {
+  const candidateKey = `${candidate.file}:${candidate.line}`;
+  const fingerprint = normalizeFingerprintText(formatReviewCommentBody(candidate)).slice(0, 50);
+  if (!fingerprint) return false;
+
+  return existing.some((comment) => {
+    if (comment.line == null) return false;
+    const existingKey = `${comment.path}:${comment.line}`;
+    if (existingKey !== candidateKey) return false;
+    return normalizeFingerprintText(comment.body).includes(fingerprint);
+  });
 }
 
 async function runReview(options: RunOptions): Promise<void> {
@@ -231,19 +256,33 @@ async function runReview(options: RunOptions): Promise<void> {
     return;
   }
 
-  console.log(chalk.white(`Found ${result.comments.length} potential comment(s):\n`));
+  console.log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
+  const existingComments = getExistingReviewComments(prNumber, repo);
+  const commentsToReview = result.comments.filter((comment) => !isDuplicateComment(comment, existingComments));
+  const duplicateCount = result.comments.length - commentsToReview.length;
+
+  if (duplicateCount > 0) {
+    console.log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
+  }
+
+  if (commentsToReview.length === 0) {
+    console.log(chalk.green('✓ All detected issues were already commented on'));
+    return;
+  }
+
+  console.log(chalk.white(`Found ${commentsToReview.length} potential comment(s):\n`));
 
   // Interactive selection
   const selectedComments: ReviewComment[] = [];
 
-  for (let i = 0; i < result.comments.length; i++) {
-    const comment = result.comments[i];
+  for (let i = 0; i < commentsToReview.length; i++) {
+    const comment = commentsToReview[i];
     const severityColor = SEVERITY_COLORS[comment.severity] || chalk.white;
     const severityIcon = SEVERITY_ICONS[comment.severity] || '•';
 
     console.log(chalk.white('─'.repeat(60)));
     console.log(
-      chalk.white(`[${i + 1}/${result.comments.length}] `) +
+      chalk.white(`[${i + 1}/${commentsToReview.length}] `) +
       severityIcon + ' ' +
       severityColor(comment.severity) +
       chalk.gray(` | ${comment.file}:${comment.line}`)
@@ -294,7 +333,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   // Summary
   console.log(chalk.white('═'.repeat(60)));
-  console.log(chalk.white(`Summary: ${selectedComments.length} to post, ${result.comments.length - selectedComments.length} skipped`));
+  console.log(chalk.white(`Summary: ${selectedComments.length} to post, ${commentsToReview.length - selectedComments.length} skipped`));
   console.log(chalk.white('═'.repeat(60)));
 
   if (selectedComments.length === 0) {
@@ -307,31 +346,29 @@ async function runReview(options: RunOptions): Promise<void> {
     return;
   }
 
-  // Confirm and post
-  const confirm = await prompts({
-    type: 'confirm',
-    name: 'value',
-    message: `Post ${selectedComments.length} comment(s) to PR #${prNumber}?`,
-    initial: true,
-  });
+  if (!batch) {
+    // Confirm in interactive mode (skip in --batch mode for CI/non-interactive use)
+    const confirm = await prompts({
+      type: 'confirm',
+      name: 'value',
+      message: `Post ${selectedComments.length} comment(s) to PR #${prNumber}?`,
+      initial: true,
+    });
 
-  if (!confirm.value) {
-    console.log(chalk.yellow('Cancelled.'));
-    return;
+    if (!confirm.value) {
+      console.log(chalk.yellow('Cancelled.'));
+      return;
+    }
   }
 
-  // Post as a review
+  // Post comments
   console.log(chalk.blue('\n📤 Posting review...'));
   
   const formattedComments = selectedComments.map(c => {
-    let body = `**${c.title}**\n\n${c.body}`;
-    if (c.suggestion) {
-      body += `\n\n**Suggested fix:**\n\`\`\`suggestion\n${c.suggestion}\n\`\`\``;
-    }
     return {
-      file: c.file,
+      path: c.file,
       line: c.line,
-      body,
+      body: formatReviewCommentBody(c),
     };
   });
 
@@ -341,11 +378,17 @@ async function runReview(options: RunOptions): Promise<void> {
     prNumber,
     repo: repoForCache,
     createdAt: new Date().toISOString(),
-    comments: formattedComments,
+    comments: formattedComments.map((c) => ({ file: c.path, line: c.line, body: c.body })),
   });
 
   try {
-    submitReview(prNumber, formattedComments, repo);
+    if (batch) {
+      postBatchReview(prNumber, formattedComments, repo);
+    } else {
+      for (const comment of formattedComments) {
+        postReviewComment(prNumber, comment.path, comment.line, comment.body, repo);
+      }
+    }
     // Upload succeeded — clean up the cache
     deletePendingReview(prNumber, repoForCache);
     console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));

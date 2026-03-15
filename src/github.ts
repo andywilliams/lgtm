@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { PRDetails, ExistingComment } from './types.js';
+import type { PRDetails, ExistingComment, ExistingReviewComment } from './types.js';
 
 /**
  * Execute a gh CLI command and return the output
@@ -89,11 +89,11 @@ export function postReviewComment(
 }
 
 /**
- * Post multiple comments as a single review
+ * Post multiple comments as a single review (batch)
  */
-export function submitReview(
+export function postBatchReview(
   prNumber: number,
-  comments: Array<{ file: string; line: number; body: string }>,
+  comments: Array<{ path: string; line: number; body: string }>,
   repo?: string
 ): void {
   const repoPath = repo || getRepoFromGit();
@@ -109,10 +109,9 @@ export function submitReview(
     commit_id: headRefOid,
     event: 'COMMENT',
     comments: comments.map(c => ({
-      path: c.file,
+      path: c.path,
       line: c.line,
       body: c.body,
-      side: 'RIGHT',
     })),
   });
   
@@ -122,6 +121,21 @@ export function submitReview(
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+}
+
+/**
+ * Backward-compatible alias for old submit API
+ */
+export function submitReview(
+  prNumber: number,
+  comments: Array<{ file: string; line: number; body: string }>,
+  repo?: string
+): void {
+  postBatchReview(
+    prNumber,
+    comments.map((c) => ({ path: c.file, line: c.line, body: c.body })),
+    repo
+  );
 }
 
 /**
@@ -196,6 +210,17 @@ export function getPRComments(prNumber: number, repo?: string): ExistingComment[
 }
 
 /**
+ * Fetch existing PR review comments for deduplication
+ */
+export function getExistingReviewComments(prNumber: number, repo?: string): ExistingReviewComment[] {
+  return getPRComments(prNumber, repo).map((comment) => ({
+    path: comment.file,
+    line: comment.line,
+    body: comment.body,
+  }));
+}
+
+/**
  * Resolve (minimize/hide) a review comment on a PR
  * Uses the GraphQL API to minimize the comment as "RESOLVED"
  */
@@ -235,6 +260,13 @@ function validateRepoComponents(owner: string, repoName: string): void {
  * Get repo from current git directory
  */
 function getRepoFromGit(): string {
+  const envOwner = process.env.GITHUB_OWNER?.trim();
+  const envRepo = process.env.GITHUB_REPO?.trim();
+  if (envOwner && envRepo) {
+    validateRepoComponents(envOwner, envRepo);
+    return `${envOwner}/${envRepo}`;
+  }
+
   try {
     const remote = execSync('git remote get-url origin', { encoding: 'utf-8' }).trim();
     // Parse github.com:owner/repo.git or https://github.com/owner/repo.git
