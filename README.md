@@ -33,7 +33,80 @@ npm link   # makes `lgtm` available globally
 
 LGTM auto-detects which CLI is available. If both are installed, it prefers Claude.
 
-## Usage
+## GitHub Actions Mode
+
+LGTM can run automatically as a GitHub Action, posting review comments on every PR push. This replaces tools like Cursor Bugbot with a fully automated review workflow.
+
+### Setup
+
+1. **Add the workflow file** to your repository at `.github/workflows/lgtm-review.yml`:
+
+```yaml
+name: lgtm PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Run lgtm review
+        run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+2. **Add your Anthropic API key** as a repository secret:
+   - Go to Settings → Secrets and variables → Actions
+   - Add `ANTHROPIC_API_KEY` with your key from https://console.anthropic.com/
+
+3. **Grant workflow permissions** (if not already enabled):
+   - Go to Settings → Actions → General
+   - Under "Workflow permissions", select "Read and write permissions"
+
+### Features
+
+- **Automatic reviews** — Runs on every PR open/update
+- **Inline review threads** — Comments are grouped in a single review
+- **Context expansion** — Auto-discovers related files (imports, infra, config)
+- **Deduplication** — Won't re-post the same comment twice
+- **Batch mode** — Posts all findings without human approval (CI-friendly)
+
+### Customization
+
+**Adjust harshness level:**
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --harshness pedantic
+```
+
+**Disable context expansion** (faster, uses fewer tokens):
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch
+```
+
+**Add usage context** (finds code that calls changed functions):
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --usage-context
+```
+
+## CLI Usage
 
 ```bash
 # Review a PR (interactive mode)
