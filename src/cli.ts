@@ -43,54 +43,53 @@ program
   .option('--usage-context', 'Include files that use changed symbols', false)
   .option('--context', 'Auto-expand context using static analysis', false)
   .action(async (prNumberStr: string, options) => {
+    const auto = options.auto;
+
+    // Helper for validation errors: emit JSON in auto mode, plain text otherwise
+    function exitWithError(message: string): never {
+      if (auto) {
+        console.log(formatAutoResult({ success: false, error: message, dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+      } else {
+        console.error(chalk.red(message));
+      }
+      process.exit(1);
+    }
+
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
-      console.error(chalk.red('Invalid PR number'));
-      process.exit(1);
+      exitWithError('Invalid PR number');
     }
 
     const harshness = options.harshness as Harshness;
     if (!['chill', 'medium', 'pedantic'].includes(harshness)) {
-      console.error(chalk.red('Invalid harshness level. Use: chill, medium, pedantic'));
-      process.exit(1);
+      exitWithError('Invalid harshness level. Use: chill, medium, pedantic');
     }
 
     // Determine AI provider
     let ai: AIProvider;
     if (options.ai) {
       if (!['claude', 'codex'].includes(options.ai)) {
-        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
-        process.exit(1);
+        exitWithError('Invalid AI provider. Use: claude, codex');
       }
       ai = options.ai as AIProvider;
-      
+
       // Check if specified provider is available
       if (ai === 'claude' && !checkClaudeCli()) {
-        console.error(chalk.red('\n⚠ Claude CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
-        console.log(chalk.dim('Then run: claude login'));
-        process.exit(1);
+        exitWithError('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
       }
       if (ai === 'codex' && !checkCodexCli()) {
-        console.error(chalk.red('\n⚠ Codex CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('Codex CLI not found. Install: npm install -g @openai/codex');
       }
     } else {
       // Auto-detect available provider
       const available = getAvailableProviders();
       if (available.length === 0) {
-        console.error(chalk.red('\n⚠ No AI CLI found.'));
-        console.log(chalk.dim('Install one of:'));
-        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
-        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('No AI CLI found. Install claude or codex.');
       }
       // Prefer claude, fall back to codex
       ai = available.includes('claude') ? 'claude' : 'codex';
     }
 
-    const auto = options.auto;
     const batch = auto || options.batch;
 
     try {
@@ -108,6 +107,9 @@ program
       });
     } catch (error: any) {
       if (auto) {
+        // Auto-mode error contract: JSON with success:false goes to stdout so consumers
+        // can parse it via $(lgtm review ... --auto). Note: subprocess stderr (e.g. from
+        // gh CLI) may still leak to stderr — consumers should use 2>/dev/null if needed.
         try {
           console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
         } catch {
@@ -182,7 +184,9 @@ function formatAutoResult(options: {
 async function runReview(options: RunOptions): Promise<void> {
   const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, context, ai } = options;
 
-  // In auto mode, suppress decorative output — only JSON goes to stdout
+  // In auto mode, suppress decorative output — only JSON goes to stdout.
+  // Note: these wrappers suppress our own output but cannot capture stderr from
+  // subprocesses (e.g. gh CLI). Consumers should use 2>/dev/null if needed.
   const log = auto ? (..._args: any[]) => {} : console.log;
   const logErr = auto ? (..._args: any[]) => {} : console.error;
 
