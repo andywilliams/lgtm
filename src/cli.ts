@@ -535,7 +535,7 @@ program
 
     function exitWithError(message: string): never {
       if (auto) {
-        console.log(JSON.stringify({ success: false, error: message, summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
+        console.log(formatRecheckResult({ success: false, error: message, summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
       } else {
         console.error(chalk.red(message));
       }
@@ -582,7 +582,7 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        console.log(JSON.stringify({ success: false, error: error?.message ?? String(error), summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
+        console.log(formatRecheckResult({ success: false, error: error?.message ?? String(error), summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
       } else {
         console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
       }
@@ -612,32 +612,34 @@ const STATUS_ICONS: Record<string, string> = {
   outdated: '♻',
 };
 
+function formatRecheckResult(opts: {
+  success: boolean;
+  summary: string;
+  dryRun?: boolean;
+  stillValid: number;
+  resolved: number;
+  failed?: number;
+  results: { commentId: number; file: string; line: number | null; status: string; reason: string }[];
+  error?: string;
+}): string {
+  return JSON.stringify({
+    success: opts.success,
+    summary: opts.summary,
+    dryRun: opts.dryRun ?? false,
+    stillValid: opts.stillValid,
+    resolved: opts.resolved,
+    ...(opts.failed ? { failed: opts.failed } : {}),
+    results: opts.results,
+    ...(opts.error ? { error: opts.error } : {}),
+  });
+}
+
 async function runRecheck(options: RecheckOptions): Promise<void> {
   const { prNumber, repo, ai, batch, auto, dryRun, author } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   const log = auto ? (..._args: any[]) => {} : console.log;
   const logErr = auto ? (..._args: any[]) => {} : console.error;
-
-  function formatRecheckResult(opts: {
-    success: boolean;
-    summary: string;
-    dryRun?: boolean;
-    stillValid: number;
-    resolved: number;
-    results: { commentId: number; file: string; line: number | null; status: string; reason: string }[];
-    error?: string;
-  }): string {
-    return JSON.stringify({
-      success: opts.success,
-      summary: opts.summary,
-      dryRun: opts.dryRun ?? false,
-      stillValid: opts.stillValid,
-      resolved: opts.resolved,
-      results: opts.results,
-      ...(opts.error ? { error: opts.error } : {}),
-    });
-  }
 
   // Fetch PR details
   log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
@@ -799,19 +801,33 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
 
   log(chalk.blue('\n📤 Resolving comments...'));
   let resolved = 0;
+  let failed = 0;
   for (const comment of toResolve) {
     try {
       resolveComment(comment.nodeId);
       resolved++;
     } catch (error: any) {
+      failed++;
       logErr(chalk.red(`   Failed to resolve comment ${comment.id}: ${error?.message ?? String(error)}`));
     }
   }
 
   if (auto) {
-    console.log(formatRecheckResult({ success: true, dryRun, summary: result.summary, stillValid: stillValidIds.length, resolved, results: recheckResults }));
+    console.log(formatRecheckResult({
+      success: failed === 0,
+      dryRun,
+      summary: result.summary,
+      stillValid: stillValidIds.length,
+      resolved,
+      failed: failed > 0 ? failed : undefined,
+      results: recheckResults,
+      error: failed > 0 ? `Failed to resolve ${failed} of ${toResolve.length} comment(s)` : undefined,
+    }));
   } else {
     log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
+    if (failed > 0) {
+      logErr(chalk.yellow(`   ⚠ ${failed} comment(s) failed to resolve`));
+    }
   }
 }
 
