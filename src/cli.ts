@@ -108,8 +108,7 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        const result = { success: false, error: error.message };
-        console.log(JSON.stringify(result));
+        console.log(JSON.stringify({ success: false, error: error.message, summary: '', dryRun: false, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
         console.error(chalk.red(`Error: ${error.message}`));
       }
@@ -152,6 +151,26 @@ function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewCo
     const existingKey = `${comment.path}:${comment.line}`;
     if (existingKey !== candidateKey) return false;
     return normalizeFingerprintText(comment.body).includes(fingerprint);
+  });
+}
+
+function formatAutoResult(options: {
+  success: boolean;
+  summary: string;
+  commentsPosted: number;
+  duplicatesSkipped?: number;
+  dryRun?: boolean;
+  comments: ReviewComment[];
+  error?: string;
+}): string {
+  return JSON.stringify({
+    success: options.success,
+    summary: options.summary,
+    dryRun: options.dryRun ?? false,
+    commentsPosted: options.commentsPosted,
+    duplicatesSkipped: options.duplicatesSkipped ?? 0,
+    comments: options.comments.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+    ...(options.error ? { error: options.error } : {}),
   });
 }
 
@@ -268,7 +287,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (result.comments.length === 0) {
     if (auto) {
-      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
+      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
     } else {
       log(chalk.green('✓ LGTM — no issues found'));
     }
@@ -286,7 +305,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (commentsToReview.length === 0) {
     if (auto) {
-      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       log(chalk.green('✓ All detected issues were already commented on'));
     }
@@ -320,6 +339,9 @@ async function runReview(options: RunOptions): Promise<void> {
     log();
 
     if (dryRun) {
+      if (batch) {
+        selectedComments.push(comment);
+      }
       log(chalk.gray('(dry-run mode — not posting)\n'));
       continue;
     }
@@ -361,7 +383,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (selectedComments.length === 0) {
     if (auto) {
-      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
+      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       log(chalk.gray('\nNo comments to post.'));
     }
@@ -370,12 +392,13 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (dryRun) {
     if (auto) {
-      console.log(JSON.stringify({
+      console.log(formatAutoResult({
         success: true,
         dryRun: true,
         summary: result.summary,
         commentsPosted: 0,
-        comments: commentsToReview.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+        duplicatesSkipped: duplicateCount,
+        comments: selectedComments,
       }));
     } else {
       log(chalk.yellow('\n(dry-run mode — skipping post)'));
@@ -429,19 +452,19 @@ async function runReview(options: RunOptions): Promise<void> {
     // Upload succeeded — clean up the cache
     deletePendingReview(prNumber, repoForCache);
     if (auto) {
-      console.log(JSON.stringify({
+      console.log(formatAutoResult({
         success: true,
         summary: result.summary,
         commentsPosted: selectedComments.length,
         duplicatesSkipped: duplicateCount,
-        comments: selectedComments.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+        comments: selectedComments,
       }));
     } else {
       log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
     }
   } catch (uploadError: any) {
     if (auto) {
-      console.log(JSON.stringify({ success: false, error: uploadError.message, commentsPosted: 0 }));
+      console.log(formatAutoResult({ success: false, error: uploadError.message, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       logErr(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
