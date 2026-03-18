@@ -110,7 +110,7 @@ program
       if (auto) {
         console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
-        console.error(chalk.red(`Error: ${error.message}`));
+        console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
       }
       process.exit(1);
     }
@@ -454,6 +454,7 @@ async function runReview(options: RunOptions): Promise<void> {
     if (auto) {
       console.log(formatAutoResult({
         success: true,
+        dryRun,
         summary: result.summary,
         commentsPosted: selectedComments.length,
         duplicatesSkipped: duplicateCount,
@@ -466,7 +467,7 @@ async function runReview(options: RunOptions): Promise<void> {
     if (auto) {
       console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
-      logErr(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
+      logErr(chalk.red(`\n✗ Upload failed: ${uploadError?.message ?? String(uploadError)}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
       log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
     }
