@@ -128,6 +128,9 @@ lgtm review 86 --dry-run
 # Batch mode (post all without prompting)
 lgtm review 86 --batch
 
+# Auto mode (non-interactive, JSON output — designed for agents/scripts)
+lgtm review 86 --auto
+
 # Full context mode (include entire modified files for pattern analysis)
 lgtm review 86 --full-context
 
@@ -293,6 +296,88 @@ Summary: 1 still valid, 1 to resolve, 1 kept
 
 📤 Resolving comments...
 ✓ Resolved 1 comment(s)
+```
+
+## Auto Mode (Non-Interactive)
+
+Use `--auto` for fully non-interactive operation, designed for agents, scripts, and CI pipelines that need to parse the output programmatically.
+
+```bash
+# Run a review and get JSON output
+lgtm review 86 --auto
+
+# Combine with other flags
+lgtm review 86 --auto --harshness pedantic --context
+lgtm review 86 --auto --repo owner/repo
+
+# Dry run in auto mode (review without posting, still get JSON)
+lgtm review 86 --auto --dry-run
+```
+
+### Behavior
+
+- **Implies `--batch`** — all comments are posted without prompting
+- **JSON output** — a single JSON object is printed to stdout (no decorative output)
+- **Machine-friendly exit codes** — `0` on success, `1` on error
+
+### JSON Output Format
+
+On success:
+```json
+{
+  "success": true,
+  "summary": "Found 2 issues: 1 bug, 1 suggestion",
+  "dryRun": false,
+  "commentsPosted": 2,
+  "duplicatesSkipped": 0,
+  "comments": [
+    {
+      "file": "src/parser.ts",
+      "line": 42,
+      "severity": "BUG",
+      "title": "Missing null check",
+      "body": "The input parameter could be undefined...",
+      "suggestion": "if (!input) return null;"
+    }
+  ]
+}
+```
+
+On error:
+```json
+{
+  "success": false,
+  "summary": "",
+  "dryRun": false,
+  "commentsPosted": 0,
+  "duplicatesSkipped": 0,
+  "comments": [],
+  "error": "GitHub CLI error: ..."
+}
+```
+
+When no issues are found:
+```json
+{
+  "success": true,
+  "summary": "LGTM — no issues found",
+  "dryRun": false,
+  "commentsPosted": 0,
+  "duplicatesSkipped": 0,
+  "comments": []
+}
+```
+
+### Agent Integration Example
+
+```bash
+# Use in a script that processes the output
+result=$(lgtm review 86 --auto --repo owner/repo 2>/dev/null)
+posted=$(echo "$result" | jq '.commentsPosted')
+echo "Posted $posted comments"
+
+# Use with dry-run to inspect without posting
+lgtm review 86 --auto --dry-run | jq '.comments[] | {file, line, severity, title}'
 ```
 
 ## Harshness Levels

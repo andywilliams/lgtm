@@ -38,56 +38,59 @@ program
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
+  .option('--auto', 'Non-interactive mode for agents: implies --batch, outputs JSON to stdout', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
   .option('--usage-context', 'Include files that use changed symbols', false)
   .option('--context', 'Auto-expand context using static analysis', false)
   .action(async (prNumberStr: string, options) => {
+    const auto = options.auto;
+
+    // Helper for validation errors: emit JSON in auto mode, plain text otherwise
+    function exitWithError(message: string): never {
+      if (auto) {
+        console.log(formatAutoResult({ success: false, error: message, dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+      } else {
+        console.error(chalk.red(message));
+      }
+      process.exit(1);
+    }
+
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
-      console.error(chalk.red('Invalid PR number'));
-      process.exit(1);
+      exitWithError('Invalid PR number');
     }
 
     const harshness = options.harshness as Harshness;
     if (!['chill', 'medium', 'pedantic'].includes(harshness)) {
-      console.error(chalk.red('Invalid harshness level. Use: chill, medium, pedantic'));
-      process.exit(1);
+      exitWithError('Invalid harshness level. Use: chill, medium, pedantic');
     }
 
     // Determine AI provider
     let ai: AIProvider;
     if (options.ai) {
       if (!['claude', 'codex'].includes(options.ai)) {
-        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
-        process.exit(1);
+        exitWithError('Invalid AI provider. Use: claude, codex');
       }
       ai = options.ai as AIProvider;
-      
+
       // Check if specified provider is available
       if (ai === 'claude' && !checkClaudeCli()) {
-        console.error(chalk.red('\n⚠ Claude CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
-        console.log(chalk.dim('Then run: claude login'));
-        process.exit(1);
+        exitWithError('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
       }
       if (ai === 'codex' && !checkCodexCli()) {
-        console.error(chalk.red('\n⚠ Codex CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('Codex CLI not found. Install: npm install -g @openai/codex');
       }
     } else {
       // Auto-detect available provider
       const available = getAvailableProviders();
       if (available.length === 0) {
-        console.error(chalk.red('\n⚠ No AI CLI found.'));
-        console.log(chalk.dim('Install one of:'));
-        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
-        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('No AI CLI found. Install claude or codex.');
       }
       // Prefer claude, fall back to codex
       ai = available.includes('claude') ? 'claude' : 'codex';
     }
+
+    const batch = auto || options.batch;
 
     try {
       await runReview({
@@ -95,14 +98,27 @@ program
         repo: options.repo,
         harshness,
         dryRun: options.dryRun,
-        batch: options.batch,
+        batch,
+        auto,
         fullContext: options.fullContext,
         usageContext: options.usageContext,
         context: options.context,
         ai,
       });
     } catch (error: any) {
-      console.error(chalk.red(`Error: ${error.message}`));
+      if (auto) {
+        // Auto-mode error contract: JSON with success:false goes to stdout so consumers
+        // can parse it via $(lgtm review ... --auto). Note: subprocess stderr (e.g. from
+        // gh CLI) may still leak to stderr — consumers should use 2>/dev/null if needed.
+        try {
+          console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        } catch {
+          // Fallback if formatAutoResult itself throws (e.g., unexpected error shape)
+          console.log(JSON.stringify({ success: false, error: String(error), dryRun: false, commentsPosted: 0, duplicatesSkipped: 0, summary: '', comments: [] }));
+        }
+      } else {
+        console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      }
       process.exit(1);
     }
   });
@@ -113,6 +129,7 @@ interface RunOptions {
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
+  auto: boolean;
   fullContext: boolean;
   usageContext: boolean;
   context: boolean;
@@ -144,29 +161,55 @@ function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewCo
   });
 }
 
+function formatAutoResult(options: {
+  success: boolean;
+  summary: string;
+  commentsPosted: number;
+  duplicatesSkipped?: number;
+  dryRun?: boolean;
+  comments: ReviewComment[];
+  error?: string;
+}): string {
+  return JSON.stringify({
+    success: options.success,
+    summary: options.summary,
+    dryRun: options.dryRun ?? false,
+    commentsPosted: options.commentsPosted,
+    duplicatesSkipped: options.duplicatesSkipped ?? 0,
+    comments: options.comments.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+    ...(options.error ? { error: options.error } : {}),
+  });
+}
+
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, fullContext, usageContext, context, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, context, ai } = options;
+
+  // In auto mode, suppress decorative output — only JSON goes to stdout.
+  // Note: these wrappers suppress our own output but cannot capture stderr from
+  // subprocesses (e.g. gh CLI). Consumers should use 2>/dev/null if needed.
+  const log = auto ? (..._args: any[]) => {} : console.log;
+  const logErr = auto ? (..._args: any[]) => {} : console.error;
 
   // Fetch PR details
-  console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
+  log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
   const pr = getPRDetails(prNumber, repo);
-  console.log(chalk.white(`   "${pr.title}" by ${pr.author}`));
-  console.log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
+  log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+  log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
 
   // Fetch diff
-  console.log(chalk.blue(`\n📄 Fetching diff...`));
+  log(chalk.blue(`\n📄 Fetching diff...`));
   const diff = getPRDiff(prNumber, repo);
-  
+
   // Truncate very large diffs
   const maxDiffLength = 50000;
-  const truncatedDiff = diff.length > maxDiffLength 
+  const truncatedDiff = diff.length > maxDiffLength
     ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)'
     : diff;
 
   // Fetch full file contents if requested
   let fileContents: Record<string, string> | undefined;
   if (fullContext) {
-    console.log(chalk.blue(`\n📁 Fetching full file contents...`));
+    log(chalk.blue(`\n📁 Fetching full file contents...`));
     const changedFiles = getChangedFiles(prNumber, repo);
     fileContents = {};
     for (const file of changedFiles) {
@@ -177,10 +220,10 @@ async function runReview(options: RunOptions): Promise<void> {
       const content = getFileContent(prNumber, file, repo);
       if (content) {
         if (content.length > 300000) { // Skip files > 300KB
-          console.log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
+          log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
         } else {
           fileContents[file] = content;
-          console.log(chalk.gray(`   ✓ ${file} (${Math.round(content.length / 1024)}KB)`));
+          log(chalk.gray(`   ✓ ${file} (${Math.round(content.length / 1024)}KB)`));
         }
       }
     }
@@ -189,22 +232,22 @@ async function runReview(options: RunOptions): Promise<void> {
   // Extract usage context if requested
   let usageContextStr = '';
   if (usageContext) {
-    console.log(chalk.blue(`\n🔗 Finding symbol usages...`));
+    log(chalk.blue(`\n🔗 Finding symbol usages...`));
     const symbols = extractChangedSymbols(diff);
-    console.log(chalk.gray(`   Found ${symbols.length} changed symbol(s): ${symbols.map(s => s.name).join(', ') || '(none)'}`));
-    
+    log(chalk.gray(`   Found ${symbols.length} changed symbol(s): ${symbols.map(s => s.name).join(', ') || '(none)'}`));
+
     if (symbols.length > 0) {
       const repoRoot = getRepoRoot();
       const usages = findUsages(symbols, repoRoot, {
         maxUsagesPerSymbol: 5,
         contextLines: 3
       });
-      
+
       if (usages.length > 0) {
-        console.log(chalk.gray(`   Found ${usages.length} usage(s) across ${new Set(usages.map(u => u.file)).size} file(s)`));
+        log(chalk.gray(`   Found ${usages.length} usage(s) across ${new Set(usages.map(u => u.file)).size} file(s)`));
         usageContextStr = formatUsageContext(usages);
       } else {
-        console.log(chalk.gray(`   No external usages found`));
+        log(chalk.gray(`   No external usages found`));
       }
     }
   }
@@ -213,29 +256,29 @@ async function runReview(options: RunOptions): Promise<void> {
   let expandedContextStr = '';
   let expanded: { path: string; reason: string; content: string }[] = [];
   if (context) {
-    console.log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
+    log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
     const changedFiles = getChangedFiles(prNumber, repo);
     const repoRoot = getRepoRoot();
     expanded = await expandContext(changedFiles, repoRoot, {
       maxFiles: 20,
       importDepth: 3,
     });
-    
+
     if (expanded.length > 0) {
-      console.log(chalk.gray(`   Found ${expanded.length} context file(s):`));
+      log(chalk.gray(`   Found ${expanded.length} context file(s):`));
       let tokenEstimate = 0;
       expandedContextStr = `\n## Expanded Context (Auto-discovered)\n`;
       expandedContextStr += `The following files were automatically discovered as relevant context:\n\n`;
       for (const file of expanded) {
-        console.log(chalk.gray(`   • ${file.path} (${file.reason})`));
+        log(chalk.gray(`   • ${file.path} (${file.reason})`));
         expandedContextStr += `### ${file.path}\n`;
         expandedContextStr += `_Reason: ${file.reason}_\n\n`;
         expandedContextStr += `\`\`\`\n${file.content}\n\`\`\`\n\n`;
         tokenEstimate += Math.ceil(file.content.length / 4);
       }
-      console.log(chalk.gray(`   Estimated tokens: ~${tokenEstimate}`));
+      log(chalk.gray(`   Estimated tokens: ~${tokenEstimate}`));
     } else {
-      console.log(chalk.gray(`   No additional context found`));
+      log(chalk.gray(`   No additional context found`));
     }
   }
 
@@ -246,31 +289,39 @@ async function runReview(options: RunOptions): Promise<void> {
   if (usageContext && usageContextStr) contextModes.push('usage context');
   if (context && expandedContextStr) contextModes.push('expanded context');
   const modeLabel = contextModes.join(' + ');
-  console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
+  log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
   const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr);
 
-  console.log(chalk.gray(`\n${result.summary}\n`));
+  log(chalk.gray(`\n${result.summary}\n`));
 
   if (result.comments.length === 0) {
-    console.log(chalk.green('✓ LGTM — no issues found'));
+    if (auto) {
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+    } else {
+      log(chalk.green('✓ LGTM — no issues found'));
+    }
     return;
   }
 
-  console.log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
+  log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
   const existingComments = getExistingReviewComments(prNumber, repo);
   const commentsToReview = result.comments.filter((comment) => !isDuplicateComment(comment, existingComments));
   const duplicateCount = result.comments.length - commentsToReview.length;
 
   if (duplicateCount > 0) {
-    console.log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
+    log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
   }
 
   if (commentsToReview.length === 0) {
-    console.log(chalk.green('✓ All detected issues were already commented on'));
+    if (auto) {
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+    } else {
+      log(chalk.green('✓ All detected issues were already commented on'));
+    }
     return;
   }
 
-  console.log(chalk.white(`Found ${commentsToReview.length} potential comment(s):\n`));
+  log(chalk.white(`Found ${commentsToReview.length} potential comment(s):\n`));
 
   // Interactive selection
   const selectedComments: ReviewComment[] = [];
@@ -280,30 +331,36 @@ async function runReview(options: RunOptions): Promise<void> {
     const severityColor = SEVERITY_COLORS[comment.severity] || chalk.white;
     const severityIcon = SEVERITY_ICONS[comment.severity] || '•';
 
-    console.log(chalk.white('─'.repeat(60)));
-    console.log(
+    log(chalk.white('─'.repeat(60)));
+    log(
       chalk.white(`[${i + 1}/${commentsToReview.length}] `) +
       severityIcon + ' ' +
       severityColor(comment.severity) +
       chalk.gray(` | ${comment.file}:${comment.line}`)
     );
-    console.log(chalk.white('─'.repeat(60)));
-    console.log(chalk.bold(comment.title));
-    console.log(chalk.white(comment.body));
+    log(chalk.white('─'.repeat(60)));
+    log(chalk.bold(comment.title));
+    log(chalk.white(comment.body));
     if (comment.suggestion) {
-      console.log(chalk.green('\nSuggested fix:'));
-      console.log(chalk.gray(comment.suggestion));
+      log(chalk.green('\nSuggested fix:'));
+      log(chalk.gray(comment.suggestion));
     }
-    console.log();
+    log();
 
     if (dryRun) {
-      console.log(chalk.gray('(dry-run mode — not posting)\n'));
+      // In auto dry-run mode, collect comments into selectedComments so they appear in the JSON output.
+      // In non-auto dry-run, we skip collection — the later "no comments" early return is fine
+      // because interactive dry-run just prints each comment inline above.
+      if (auto) {
+        selectedComments.push(comment);
+      }
+      log(chalk.gray('(dry-run mode — not posting)\n'));
       continue;
     }
 
     if (batch) {
       selectedComments.push(comment);
-      console.log(chalk.green('✓ Queued\n'));
+      log(chalk.green('✓ Queued\n'));
       continue;
     }
 
@@ -319,30 +376,45 @@ async function runReview(options: RunOptions): Promise<void> {
     });
 
     if (response.action === 'quit') {
-      console.log(chalk.yellow('\nQuitting review.'));
+      log(chalk.yellow('\nQuitting review.'));
       break;
     }
 
     if (response.action === 'add') {
       selectedComments.push(comment);
-      console.log(chalk.green('✓ Queued\n'));
+      log(chalk.green('✓ Queued\n'));
     } else {
-      console.log(chalk.gray('⊘ Skipped\n'));
+      log(chalk.gray('⊘ Skipped\n'));
     }
   }
 
   // Summary
-  console.log(chalk.white('═'.repeat(60)));
-  console.log(chalk.white(`Summary: ${selectedComments.length} to post, ${commentsToReview.length - selectedComments.length} skipped`));
-  console.log(chalk.white('═'.repeat(60)));
+  log(chalk.white('═'.repeat(60)));
+  log(chalk.white(`Summary: ${selectedComments.length} to post, ${commentsToReview.length - selectedComments.length} skipped`));
+  log(chalk.white('═'.repeat(60)));
 
   if (selectedComments.length === 0) {
-    console.log(chalk.gray('\nNo comments to post.'));
+    if (auto) {
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+    } else {
+      log(chalk.gray('\nNo comments to post.'));
+    }
     return;
   }
 
   if (dryRun) {
-    console.log(chalk.yellow('\n(dry-run mode — skipping post)'));
+    if (auto) {
+      console.log(formatAutoResult({
+        success: true,
+        dryRun: true,
+        summary: result.summary,
+        commentsPosted: 0,
+        duplicatesSkipped: duplicateCount,
+        comments: selectedComments,
+      }));
+    } else {
+      log(chalk.yellow('\n(dry-run mode — skipping post)'));
+    }
     return;
   }
 
@@ -356,14 +428,14 @@ async function runReview(options: RunOptions): Promise<void> {
     });
 
     if (!confirm.value) {
-      console.log(chalk.yellow('Cancelled.'));
+      log(chalk.yellow('Cancelled.'));
       return;
     }
   }
 
   // Post comments
-  console.log(chalk.blue('\n📤 Posting review...'));
-  
+  log(chalk.blue('\n📤 Posting review...'));
+
   const formattedComments = selectedComments.map(c => {
     return {
       path: c.file,
@@ -381,22 +453,42 @@ async function runReview(options: RunOptions): Promise<void> {
     comments: formattedComments.map((c) => ({ file: c.path, line: c.line, body: c.body })),
   });
 
+  let commentsPostedCount = 0;
   try {
     if (batch) {
       postBatchReview(prNumber, formattedComments, repo);
+      commentsPostedCount = formattedComments.length;
     } else {
       for (const comment of formattedComments) {
         postReviewComment(prNumber, comment.path, comment.line, comment.body, repo);
+        commentsPostedCount++;
       }
     }
-    // Upload succeeded — clean up the cache
-    deletePendingReview(prNumber, repoForCache);
-    console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
   } catch (uploadError: any) {
-    console.error(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
-    console.log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
-    console.log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
+    if (auto) {
+      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: selectedComments.slice(0, commentsPostedCount) }));
+    } else {
+      logErr(chalk.red(`\n✗ Upload failed: ${uploadError?.message ?? String(uploadError)}`));
+      log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
+      log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
+    }
     process.exit(1);
+  }
+
+  // Upload succeeded — clean up the cache (non-critical)
+  try { deletePendingReview(prNumber, repoForCache); } catch { /* ignore */ }
+
+  if (auto) {
+    console.log(formatAutoResult({
+      success: true,
+      dryRun,
+      summary: result.summary,
+      commentsPosted: commentsPostedCount,
+      duplicatesSkipped: duplicateCount,
+      comments: selectedComments,
+    }));
+  } else {
+    log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
   }
 
   // Log review metadata for metrics
@@ -404,7 +496,7 @@ async function runReview(options: RunOptions): Promise<void> {
   const changedFiles = getChangedFiles(prNumber, repo);
   const contextFilesAdded = expanded?.length || 0;
   const contextReasons = expanded ? JSON.stringify(expanded.map(f => f.reason)) : '[]';
-  
+
   // Estimate token count (rough estimate: ~4 chars per token)
   let tokenEstimate = Math.ceil(diff.length / 4);
   if (expanded) {
@@ -412,19 +504,27 @@ async function runReview(options: RunOptions): Promise<void> {
       tokenEstimate += Math.ceil(file.content.length / 4);
     }
   }
-  
-  logReview({
-    repo: repoName,
-    prNumber,
-    reviewedAt: new Date().toISOString(),
-    filesReviewed: changedFiles.length,
-    contextFilesAdded,
-    contextReasons,
-    tokenCount: tokenEstimate,
-    model: ai,
-    usedContextExpansion: context && expanded && expanded.length > 0,
-    falseNegative: false
-  });
+
+  try {
+  } catch (e) {
+    // Metrics logging is non-critical — don't fail the review
+    logErr(`Warning: metrics logging failed: ${e}`);
+  }
+      repo: repoName,
+      prNumber,
+      reviewedAt: new Date().toISOString(),
+      filesReviewed: changedFiles.length,
+      contextFilesAdded,
+      contextReasons,
+      tokenCount: tokenEstimate,
+      model: ai,
+      usedContextExpansion: context && expanded && expanded.length > 0,
+      falseNegative: false
+    });
+  } catch (e) {
+    // Metrics logging is non-critical — don't fail the review
+    process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
+  }
 }
 
 program
@@ -434,56 +534,64 @@ program
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('--batch', 'Resolve all outdated/resolved comments without prompting', false)
   .option('--dry-run', 'Show results without resolving any comments', false)
+  .option('--auto', 'Non-interactive mode for agents: implies --batch, outputs JSON to stdout', false)
   .option('--author <login>', 'Only recheck comments from a specific author')
   .action(async (prNumberStr: string, options) => {
+    const auto = options.auto;
+
+    function exitWithError(message: string): never {
+      if (auto) {
+        console.log(formatRecheckResult({ success: false, error: message, summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
+      } else {
+        console.error(chalk.red(message));
+      }
+      process.exit(1);
+    }
+
     const prNumber = parseInt(prNumberStr, 10);
     if (isNaN(prNumber)) {
-      console.error(chalk.red('Invalid PR number'));
-      process.exit(1);
+      exitWithError('Invalid PR number');
     }
 
     // Determine AI provider (same logic as review)
     let ai: AIProvider;
     if (options.ai) {
       if (!['claude', 'codex'].includes(options.ai)) {
-        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
-        process.exit(1);
+        exitWithError('Invalid AI provider. Use: claude, codex');
       }
       ai = options.ai as AIProvider;
       if (ai === 'claude' && !checkClaudeCli()) {
-        console.error(chalk.red('\n⚠ Claude CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @anthropic-ai/claude-code'));
-        console.log(chalk.dim('Then run: claude login'));
-        process.exit(1);
+        exitWithError('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
       }
       if (ai === 'codex' && !checkCodexCli()) {
-        console.error(chalk.red('\n⚠ Codex CLI not found.'));
-        console.log(chalk.dim('Install it: npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('Codex CLI not found. Install: npm install -g @openai/codex');
       }
     } else {
       const available = getAvailableProviders();
       if (available.length === 0) {
-        console.error(chalk.red('\n⚠ No AI CLI found.'));
-        console.log(chalk.dim('Install one of:'));
-        console.log(chalk.dim('  Claude: npm install -g @anthropic-ai/claude-code && claude login'));
-        console.log(chalk.dim('  Codex:  npm install -g @openai/codex'));
-        process.exit(1);
+        exitWithError('No AI CLI found. Install claude or codex.');
       }
       ai = available.includes('claude') ? 'claude' : 'codex';
     }
+
+    const batch = auto || options.batch;
 
     try {
       await runRecheck({
         prNumber,
         repo: options.repo,
         ai,
-        batch: options.batch,
+        batch,
+        auto,
         dryRun: options.dryRun,
         author: options.author,
       });
     } catch (error: any) {
-      console.error(chalk.red(`Error: ${error.message}`));
+      if (auto) {
+        console.log(formatRecheckResult({ success: false, error: error?.message ?? String(error), summary: '', dryRun: options.dryRun ?? false, stillValid: 0, resolved: 0, results: [] }));
+      } else {
+        console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      }
       process.exit(1);
     }
   });
@@ -493,6 +601,7 @@ interface RecheckOptions {
   repo?: string;
   ai: AIProvider;
   batch: boolean;
+  auto: boolean;
   dryRun: boolean;
   author?: string;
 }
@@ -509,32 +618,62 @@ const STATUS_ICONS: Record<string, string> = {
   outdated: '♻',
 };
 
+function formatRecheckResult(opts: {
+  success: boolean;
+  summary: string;
+  dryRun?: boolean;
+  stillValid: number;
+  resolved: number;
+  failed?: number;
+  results: { commentId: number; file: string; line: number | null; status: string; reason: string }[];
+  error?: string;
+}): string {
+  return JSON.stringify({
+    success: opts.success,
+    summary: opts.summary,
+    dryRun: opts.dryRun ?? false,
+    stillValid: opts.stillValid,
+    resolved: opts.resolved,
+    failed: opts.failed ?? 0,
+    results: opts.results,
+    ...(opts.error ? { error: opts.error } : {}),
+  });
+}
+
 async function runRecheck(options: RecheckOptions): Promise<void> {
-  const { prNumber, repo, ai, batch, dryRun, author } = options;
+  const { prNumber, repo, ai, batch, auto, dryRun, author } = options;
+
+  // In auto mode, suppress decorative output — only JSON goes to stdout.
+  const log = auto ? (..._args: any[]) => {} : console.log;
+  const logErr = auto ? (..._args: any[]) => {} : console.error;
 
   // Fetch PR details
-  console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
+  log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
   const pr = getPRDetails(prNumber, repo);
-  console.log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+  log(chalk.white(`   "${pr.title}" by ${pr.author}`));
 
   // Fetch existing comments
-  console.log(chalk.blue(`\n💬 Fetching review comments...`));
+  log(chalk.blue(`\n💬 Fetching review comments...`));
   let comments = getPRComments(prNumber, repo);
 
   if (author) {
     comments = comments.filter(c => c.author === author);
-    console.log(chalk.gray(`   Filtered to comments by ${author}`));
+    log(chalk.gray(`   Filtered to comments by ${author}`));
   }
 
   if (comments.length === 0) {
-    console.log(chalk.green('\n✓ No review comments found on this PR.'));
+    if (auto) {
+      console.log(formatRecheckResult({ success: true, summary: 'No review comments found', dryRun, stillValid: 0, resolved: 0, results: [] }));
+    } else {
+      log(chalk.green('\n✓ No review comments found on this PR.'));
+    }
     return;
   }
 
-  console.log(chalk.white(`   Found ${comments.length} review comment(s)`));
+  log(chalk.white(`   Found ${comments.length} review comment(s)`));
 
   // Fetch current diff
-  console.log(chalk.blue(`\n📄 Fetching current diff...`));
+  log(chalk.blue(`\n📄 Fetching current diff...`));
   const diff = getPRDiff(prNumber, repo);
   const maxDiffLength = 50000;
   const truncatedDiff = diff.length > maxDiffLength
@@ -543,10 +682,10 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
 
   // Run AI recheck
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
-  console.log(chalk.blue(`\n🤖 Rechecking comments with ${aiLabel}...`));
+  log(chalk.blue(`\n🤖 Rechecking comments with ${aiLabel}...`));
   const result = await recheckComments(truncatedDiff, pr.title, comments, ai);
 
-  console.log(chalk.gray(`\n${result.summary}\n`));
+  log(chalk.gray(`\n${result.summary}\n`));
 
   // Build a lookup from comment ID to the original comment
   const commentMap = new Map<number, ExistingComment>();
@@ -556,46 +695,49 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
 
   // Display results and collect comments to resolve
   const toResolve: ExistingComment[] = [];
-  const stillValid: number[] = [];
+  const stillValidIds: number[] = [];
+  const recheckResults: { commentId: number; file: string; line: number | null; status: string; reason: string }[] = [];
 
   for (let i = 0; i < result.results.length; i++) {
     const r = result.results[i];
     const comment = commentMap.get(r.commentId);
     if (!comment) continue;
 
+    recheckResults.push({ commentId: r.commentId, file: comment.file, line: comment.line, status: r.status, reason: r.reason });
+
     const statusColor = STATUS_COLORS[r.status] || chalk.white;
     const statusIcon = STATUS_ICONS[r.status] || '•';
 
-    console.log(chalk.white('─'.repeat(60)));
-    console.log(
+    log(chalk.white('─'.repeat(60)));
+    log(
       chalk.white(`[${i + 1}/${result.results.length}] `) +
       statusIcon + ' ' +
       statusColor(r.status.replaceAll('_', ' ').toUpperCase()) +
       chalk.gray(` | ${comment.file}${comment.line ? ':' + comment.line : ''}`)
     );
-    console.log(chalk.white('─'.repeat(60)));
+    log(chalk.white('─'.repeat(60)));
     // Show a truncated version of the comment body
     const bodyPreview = comment.body.length > 200
       ? comment.body.slice(0, 200) + '...'
       : comment.body;
-    console.log(chalk.dim(bodyPreview));
-    console.log(chalk.white(`\nReason: ${r.reason}`));
-    console.log();
+    log(chalk.dim(bodyPreview));
+    log(chalk.white(`\nReason: ${r.reason}`));
+    log();
 
     if (r.status === 'still_valid') {
-      stillValid.push(r.commentId);
+      stillValidIds.push(r.commentId);
       continue;
     }
 
     // For resolved/outdated comments, offer to resolve them
     if (dryRun) {
-      console.log(chalk.gray('(dry-run mode — not resolving)\n'));
+      log(chalk.gray('(dry-run mode — not resolving)\n'));
       continue;
     }
 
     if (batch) {
       toResolve.push(comment);
-      console.log(chalk.green('✓ Queued for resolution\n'));
+      log(chalk.green('✓ Queued for resolution\n'));
       continue;
     }
 
@@ -612,31 +754,39 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
     });
 
     if (response.action === 'quit' || !response.action) {
-      console.log(chalk.yellow('\nQuitting recheck.'));
+      log(chalk.yellow('\nQuitting recheck.'));
       break;
     }
 
     if (response.action === 'resolve') {
       toResolve.push(comment);
-      console.log(chalk.green('✓ Queued for resolution\n'));
+      log(chalk.green('✓ Queued for resolution\n'));
     } else {
-      console.log(chalk.gray('⊘ Kept\n'));
+      log(chalk.gray('⊘ Kept\n'));
     }
   }
 
   // Summary
-  console.log(chalk.white('═'.repeat(60)));
-  const kept = comments.length - stillValid.length - toResolve.length;
-  console.log(chalk.white(`Summary: ${stillValid.length} still valid, ${toResolve.length} to resolve, ${kept} kept`));
-  console.log(chalk.white('═'.repeat(60)));
+  log(chalk.white('═'.repeat(60)));
+  const kept = comments.length - stillValidIds.length - toResolve.length;
+  log(chalk.white(`Summary: ${stillValidIds.length} still valid, ${toResolve.length} to resolve, ${kept} kept`));
+  log(chalk.white('═'.repeat(60)));
 
   if (toResolve.length === 0) {
-    console.log(chalk.gray('\nNo comments to resolve.'));
+    if (auto) {
+      console.log(formatRecheckResult({ success: true, dryRun, summary: result.summary, stillValid: stillValidIds.length, resolved: 0, results: recheckResults }));
+    } else {
+      log(chalk.gray('\nNo comments to resolve.'));
+    }
     return;
   }
 
   if (dryRun) {
-    console.log(chalk.yellow('\n(dry-run mode — skipping resolution)'));
+    if (auto) {
+      console.log(formatRecheckResult({ success: true, dryRun: true, summary: result.summary, stillValid: stillValidIds.length, resolved: 0, results: recheckResults }));
+    } else {
+      log(chalk.yellow('\n(dry-run mode — skipping resolution)'));
+    }
     return;
   }
 
@@ -650,23 +800,41 @@ async function runRecheck(options: RecheckOptions): Promise<void> {
     });
 
     if (!confirm.value) {
-      console.log(chalk.yellow('Cancelled.'));
+      log(chalk.yellow('Cancelled.'));
       return;
     }
   }
 
-  console.log(chalk.blue('\n📤 Resolving comments...'));
+  log(chalk.blue('\n📤 Resolving comments...'));
   let resolved = 0;
+  let failed = 0;
   for (const comment of toResolve) {
     try {
       resolveComment(comment.nodeId);
       resolved++;
     } catch (error: any) {
-      console.error(chalk.red(`   Failed to resolve comment ${comment.id}: ${error.message}`));
+      failed++;
+      logErr(chalk.red(`   Failed to resolve comment ${comment.id}: ${error?.message ?? String(error)}`));
     }
   }
 
-  console.log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
+  if (auto) {
+    console.log(formatRecheckResult({
+      success: failed === 0,
+      dryRun,
+      summary: result.summary,
+      stillValid: stillValidIds.length,
+      resolved,
+      failed: failed > 0 ? failed : undefined,
+      results: recheckResults,
+      error: failed > 0 ? `Failed to resolve ${failed} of ${toResolve.length} comment(s)` : undefined,
+    }));
+  } else {
+    log(chalk.green(`\n✓ Resolved ${resolved} comment(s)`));
+    if (failed > 0) {
+      logErr(chalk.yellow(`   ⚠ ${failed} comment(s) failed to resolve`));
+    }
+  }
 }
 
 // Tag command: mark a PR as false negative
