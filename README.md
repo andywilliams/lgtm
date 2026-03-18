@@ -463,6 +463,14 @@ Summary: 1 to post, 1 skipped
 - **Transparent** — you see exactly what will be posted
 - **Recheck** — verify old comments are still relevant after new commits
 
+## A Code Review Joke
+
+> A junior developer mass-approved 100 pull requests without reading any of them.
+>
+> When asked why, they said: "The button said LGTM, so I thought the tool already checked!"
+
+That's why we built this tool — so _someone_ actually reads the code. Even if that someone is an AI. 😄
+
 ## License
 
 MIT
