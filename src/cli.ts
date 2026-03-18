@@ -108,7 +108,12 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        try {
+          console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        } catch {
+          // Fallback if formatAutoResult itself throws (e.g., unexpected error shape)
+          console.log(JSON.stringify({ success: false, error: String(error), dryRun: false, commentsPosted: 0, duplicatesSkipped: 0, summary: '', comments: [] }));
+        }
       } else {
         console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
       }
@@ -339,6 +344,9 @@ async function runReview(options: RunOptions): Promise<void> {
     log();
 
     if (dryRun) {
+      // In auto dry-run mode, collect comments into selectedComments so they appear in the JSON output.
+      // In non-auto dry-run, we skip collection — the later "no comments" early return is fine
+      // because interactive dry-run just prints each comment inline above.
       if (auto) {
         selectedComments.push(comment);
       }
