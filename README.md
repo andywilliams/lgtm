@@ -327,6 +327,7 @@ On success:
 {
   "success": true,
   "summary": "Found 2 issues: 1 bug, 1 suggestion",
+  "dryRun": false,
   "commentsPosted": 2,
   "duplicatesSkipped": 0,
   "comments": [
@@ -346,6 +347,11 @@ On error:
 ```json
 {
   "success": false,
+  "summary": "",
+  "dryRun": false,
+  "commentsPosted": 0,
+  "duplicatesSkipped": 0,
+  "comments": [],
   "error": "GitHub CLI error: ..."
 }
 ```
@@ -355,7 +361,9 @@ When no issues are found:
 {
   "success": true,
   "summary": "LGTM — no issues found",
+  "dryRun": false,
   "commentsPosted": 0,
+  "duplicatesSkipped": 0,
   "comments": []
 }
 ```

@@ -108,7 +108,7 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        console.log(formatAutoResult({ success: false, error: error.message, dryRun: options.dryRun, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        console.log(formatAutoResult({ success: false, error: error?.message ?? String(error), dryRun: options.dryRun, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
         console.error(chalk.red(`Error: ${error.message}`));
       }
@@ -464,7 +464,7 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   } catch (uploadError: any) {
     if (auto) {
-      console.log(formatAutoResult({ success: false, error: uploadError.message, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       logErr(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
