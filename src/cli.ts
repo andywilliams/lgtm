@@ -108,7 +108,7 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        console.log(JSON.stringify({ success: false, error: error.message, summary: '', dryRun: false, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        console.log(formatAutoResult({ success: false, error: error.message, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
         console.error(chalk.red(`Error: ${error.message}`));
       }
@@ -287,7 +287,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (result.comments.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, comments: [] }));
     } else {
       log(chalk.green('✓ LGTM — no issues found'));
     }
@@ -305,7 +305,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (commentsToReview.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       log(chalk.green('✓ All detected issues were already commented on'));
     }
@@ -383,7 +383,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (selectedComments.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       log(chalk.gray('\nNo comments to post.'));
     }
