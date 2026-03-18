@@ -506,7 +506,10 @@ async function runReview(options: RunOptions): Promise<void> {
   }
 
   try {
-    logReview({
+  } catch (e) {
+    // Metrics logging is non-critical — don't fail the review
+    logErr(`Warning: metrics logging failed: ${e}`);
+  }
       repo: repoName,
       prNumber,
       reviewedAt: new Date().toISOString(),
