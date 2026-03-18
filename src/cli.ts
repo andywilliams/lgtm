@@ -108,7 +108,7 @@ program
       });
     } catch (error: any) {
       if (auto) {
-        console.log(formatAutoResult({ success: false, error: error.message, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+        console.log(formatAutoResult({ success: false, error: error.message, dryRun: options.dryRun, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
         console.error(chalk.red(`Error: ${error.message}`));
       }
@@ -339,7 +339,7 @@ async function runReview(options: RunOptions): Promise<void> {
     log();
 
     if (dryRun) {
-      if (batch) {
+      if (auto) {
         selectedComments.push(comment);
       }
       log(chalk.gray('(dry-run mode — not posting)\n'));
