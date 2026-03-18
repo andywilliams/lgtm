@@ -296,7 +296,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (result.comments.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
     } else {
       log(chalk.green('✓ LGTM — no issues found'));
     }
@@ -516,6 +516,7 @@ async function runReview(options: RunOptions): Promise<void> {
   } catch (e) {
     // Don't let metrics logging break the auto-mode JSON contract
     if (!auto) throw e;
+    process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
   }
 }
 
