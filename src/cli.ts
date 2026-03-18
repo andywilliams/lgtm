@@ -38,6 +38,7 @@ program
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
+  .option('--auto', 'Non-interactive mode for agents: implies --batch, outputs JSON to stdout', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
   .option('--usage-context', 'Include files that use changed symbols', false)
   .option('--context', 'Auto-expand context using static analysis', false)
@@ -89,20 +90,29 @@ program
       ai = available.includes('claude') ? 'claude' : 'codex';
     }
 
+    const auto = options.auto;
+    const batch = auto || options.batch;
+
     try {
       await runReview({
         prNumber,
         repo: options.repo,
         harshness,
         dryRun: options.dryRun,
-        batch: options.batch,
+        batch,
+        auto,
         fullContext: options.fullContext,
         usageContext: options.usageContext,
         context: options.context,
         ai,
       });
     } catch (error: any) {
-      console.error(chalk.red(`Error: ${error.message}`));
+      if (auto) {
+        const result = { success: false, error: error.message };
+        console.log(JSON.stringify(result));
+      } else {
+        console.error(chalk.red(`Error: ${error.message}`));
+      }
       process.exit(1);
     }
   });
@@ -113,6 +123,7 @@ interface RunOptions {
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
+  auto: boolean;
   fullContext: boolean;
   usageContext: boolean;
   context: boolean;
@@ -145,28 +156,32 @@ function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewCo
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, fullContext, usageContext, context, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, context, ai } = options;
+
+  // In auto mode, suppress decorative output — only JSON goes to stdout
+  const log = auto ? (..._args: any[]) => {} : console.log;
+  const logErr = auto ? (..._args: any[]) => {} : console.error;
 
   // Fetch PR details
-  console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
+  log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
   const pr = getPRDetails(prNumber, repo);
-  console.log(chalk.white(`   "${pr.title}" by ${pr.author}`));
-  console.log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
+  log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+  log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
 
   // Fetch diff
-  console.log(chalk.blue(`\n📄 Fetching diff...`));
+  log(chalk.blue(`\n📄 Fetching diff...`));
   const diff = getPRDiff(prNumber, repo);
-  
+
   // Truncate very large diffs
   const maxDiffLength = 50000;
-  const truncatedDiff = diff.length > maxDiffLength 
+  const truncatedDiff = diff.length > maxDiffLength
     ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)'
     : diff;
 
   // Fetch full file contents if requested
   let fileContents: Record<string, string> | undefined;
   if (fullContext) {
-    console.log(chalk.blue(`\n📁 Fetching full file contents...`));
+    log(chalk.blue(`\n📁 Fetching full file contents...`));
     const changedFiles = getChangedFiles(prNumber, repo);
     fileContents = {};
     for (const file of changedFiles) {
@@ -177,10 +192,10 @@ async function runReview(options: RunOptions): Promise<void> {
       const content = getFileContent(prNumber, file, repo);
       if (content) {
         if (content.length > 300000) { // Skip files > 300KB
-          console.log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
+          log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
         } else {
           fileContents[file] = content;
-          console.log(chalk.gray(`   ✓ ${file} (${Math.round(content.length / 1024)}KB)`));
+          log(chalk.gray(`   ✓ ${file} (${Math.round(content.length / 1024)}KB)`));
         }
       }
     }
@@ -189,22 +204,22 @@ async function runReview(options: RunOptions): Promise<void> {
   // Extract usage context if requested
   let usageContextStr = '';
   if (usageContext) {
-    console.log(chalk.blue(`\n🔗 Finding symbol usages...`));
+    log(chalk.blue(`\n🔗 Finding symbol usages...`));
     const symbols = extractChangedSymbols(diff);
-    console.log(chalk.gray(`   Found ${symbols.length} changed symbol(s): ${symbols.map(s => s.name).join(', ') || '(none)'}`));
-    
+    log(chalk.gray(`   Found ${symbols.length} changed symbol(s): ${symbols.map(s => s.name).join(', ') || '(none)'}`));
+
     if (symbols.length > 0) {
       const repoRoot = getRepoRoot();
       const usages = findUsages(symbols, repoRoot, {
         maxUsagesPerSymbol: 5,
         contextLines: 3
       });
-      
+
       if (usages.length > 0) {
-        console.log(chalk.gray(`   Found ${usages.length} usage(s) across ${new Set(usages.map(u => u.file)).size} file(s)`));
+        log(chalk.gray(`   Found ${usages.length} usage(s) across ${new Set(usages.map(u => u.file)).size} file(s)`));
         usageContextStr = formatUsageContext(usages);
       } else {
-        console.log(chalk.gray(`   No external usages found`));
+        log(chalk.gray(`   No external usages found`));
       }
     }
   }
@@ -213,29 +228,29 @@ async function runReview(options: RunOptions): Promise<void> {
   let expandedContextStr = '';
   let expanded: { path: string; reason: string; content: string }[] = [];
   if (context) {
-    console.log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
+    log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
     const changedFiles = getChangedFiles(prNumber, repo);
     const repoRoot = getRepoRoot();
     expanded = await expandContext(changedFiles, repoRoot, {
       maxFiles: 20,
       importDepth: 3,
     });
-    
+
     if (expanded.length > 0) {
-      console.log(chalk.gray(`   Found ${expanded.length} context file(s):`));
+      log(chalk.gray(`   Found ${expanded.length} context file(s):`));
       let tokenEstimate = 0;
       expandedContextStr = `\n## Expanded Context (Auto-discovered)\n`;
       expandedContextStr += `The following files were automatically discovered as relevant context:\n\n`;
       for (const file of expanded) {
-        console.log(chalk.gray(`   • ${file.path} (${file.reason})`));
+        log(chalk.gray(`   • ${file.path} (${file.reason})`));
         expandedContextStr += `### ${file.path}\n`;
         expandedContextStr += `_Reason: ${file.reason}_\n\n`;
         expandedContextStr += `\`\`\`\n${file.content}\n\`\`\`\n\n`;
         tokenEstimate += Math.ceil(file.content.length / 4);
       }
-      console.log(chalk.gray(`   Estimated tokens: ~${tokenEstimate}`));
+      log(chalk.gray(`   Estimated tokens: ~${tokenEstimate}`));
     } else {
-      console.log(chalk.gray(`   No additional context found`));
+      log(chalk.gray(`   No additional context found`));
     }
   }
 
@@ -246,31 +261,39 @@ async function runReview(options: RunOptions): Promise<void> {
   if (usageContext && usageContextStr) contextModes.push('usage context');
   if (context && expandedContextStr) contextModes.push('expanded context');
   const modeLabel = contextModes.join(' + ');
-  console.log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
+  log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
   const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr);
 
-  console.log(chalk.gray(`\n${result.summary}\n`));
+  log(chalk.gray(`\n${result.summary}\n`));
 
   if (result.comments.length === 0) {
-    console.log(chalk.green('✓ LGTM — no issues found'));
+    if (auto) {
+      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
+    } else {
+      log(chalk.green('✓ LGTM — no issues found'));
+    }
     return;
   }
 
-  console.log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
+  log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
   const existingComments = getExistingReviewComments(prNumber, repo);
   const commentsToReview = result.comments.filter((comment) => !isDuplicateComment(comment, existingComments));
   const duplicateCount = result.comments.length - commentsToReview.length;
 
   if (duplicateCount > 0) {
-    console.log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
+    log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
   }
 
   if (commentsToReview.length === 0) {
-    console.log(chalk.green('✓ All detected issues were already commented on'));
+    if (auto) {
+      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+    } else {
+      log(chalk.green('✓ All detected issues were already commented on'));
+    }
     return;
   }
 
-  console.log(chalk.white(`Found ${commentsToReview.length} potential comment(s):\n`));
+  log(chalk.white(`Found ${commentsToReview.length} potential comment(s):\n`));
 
   // Interactive selection
   const selectedComments: ReviewComment[] = [];
@@ -280,30 +303,30 @@ async function runReview(options: RunOptions): Promise<void> {
     const severityColor = SEVERITY_COLORS[comment.severity] || chalk.white;
     const severityIcon = SEVERITY_ICONS[comment.severity] || '•';
 
-    console.log(chalk.white('─'.repeat(60)));
-    console.log(
+    log(chalk.white('─'.repeat(60)));
+    log(
       chalk.white(`[${i + 1}/${commentsToReview.length}] `) +
       severityIcon + ' ' +
       severityColor(comment.severity) +
       chalk.gray(` | ${comment.file}:${comment.line}`)
     );
-    console.log(chalk.white('─'.repeat(60)));
-    console.log(chalk.bold(comment.title));
-    console.log(chalk.white(comment.body));
+    log(chalk.white('─'.repeat(60)));
+    log(chalk.bold(comment.title));
+    log(chalk.white(comment.body));
     if (comment.suggestion) {
-      console.log(chalk.green('\nSuggested fix:'));
-      console.log(chalk.gray(comment.suggestion));
+      log(chalk.green('\nSuggested fix:'));
+      log(chalk.gray(comment.suggestion));
     }
-    console.log();
+    log();
 
     if (dryRun) {
-      console.log(chalk.gray('(dry-run mode — not posting)\n'));
+      log(chalk.gray('(dry-run mode — not posting)\n'));
       continue;
     }
 
     if (batch) {
       selectedComments.push(comment);
-      console.log(chalk.green('✓ Queued\n'));
+      log(chalk.green('✓ Queued\n'));
       continue;
     }
 
@@ -319,30 +342,44 @@ async function runReview(options: RunOptions): Promise<void> {
     });
 
     if (response.action === 'quit') {
-      console.log(chalk.yellow('\nQuitting review.'));
+      log(chalk.yellow('\nQuitting review.'));
       break;
     }
 
     if (response.action === 'add') {
       selectedComments.push(comment);
-      console.log(chalk.green('✓ Queued\n'));
+      log(chalk.green('✓ Queued\n'));
     } else {
-      console.log(chalk.gray('⊘ Skipped\n'));
+      log(chalk.gray('⊘ Skipped\n'));
     }
   }
 
   // Summary
-  console.log(chalk.white('═'.repeat(60)));
-  console.log(chalk.white(`Summary: ${selectedComments.length} to post, ${commentsToReview.length - selectedComments.length} skipped`));
-  console.log(chalk.white('═'.repeat(60)));
+  log(chalk.white('═'.repeat(60)));
+  log(chalk.white(`Summary: ${selectedComments.length} to post, ${commentsToReview.length - selectedComments.length} skipped`));
+  log(chalk.white('═'.repeat(60)));
 
   if (selectedComments.length === 0) {
-    console.log(chalk.gray('\nNo comments to post.'));
+    if (auto) {
+      console.log(JSON.stringify({ success: true, summary: result.summary, commentsPosted: 0, comments: [] }));
+    } else {
+      log(chalk.gray('\nNo comments to post.'));
+    }
     return;
   }
 
   if (dryRun) {
-    console.log(chalk.yellow('\n(dry-run mode — skipping post)'));
+    if (auto) {
+      console.log(JSON.stringify({
+        success: true,
+        dryRun: true,
+        summary: result.summary,
+        commentsPosted: 0,
+        comments: commentsToReview.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+      }));
+    } else {
+      log(chalk.yellow('\n(dry-run mode — skipping post)'));
+    }
     return;
   }
 
@@ -356,14 +393,14 @@ async function runReview(options: RunOptions): Promise<void> {
     });
 
     if (!confirm.value) {
-      console.log(chalk.yellow('Cancelled.'));
+      log(chalk.yellow('Cancelled.'));
       return;
     }
   }
 
   // Post comments
-  console.log(chalk.blue('\n📤 Posting review...'));
-  
+  log(chalk.blue('\n📤 Posting review...'));
+
   const formattedComments = selectedComments.map(c => {
     return {
       path: c.file,
@@ -391,11 +428,25 @@ async function runReview(options: RunOptions): Promise<void> {
     }
     // Upload succeeded — clean up the cache
     deletePendingReview(prNumber, repoForCache);
-    console.log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
+    if (auto) {
+      console.log(JSON.stringify({
+        success: true,
+        summary: result.summary,
+        commentsPosted: selectedComments.length,
+        duplicatesSkipped: duplicateCount,
+        comments: selectedComments.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+      }));
+    } else {
+      log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
+    }
   } catch (uploadError: any) {
-    console.error(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
-    console.log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
-    console.log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
+    if (auto) {
+      console.log(JSON.stringify({ success: false, error: uploadError.message, commentsPosted: 0 }));
+    } else {
+      logErr(chalk.red(`\n✗ Upload failed: ${uploadError.message}`));
+      log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
+      log(chalk.white(`   lgtm retry ${prNumber}${repo ? ` -r ${repo}` : ''}`));
+    }
     process.exit(1);
   }
 
@@ -404,7 +455,7 @@ async function runReview(options: RunOptions): Promise<void> {
   const changedFiles = getChangedFiles(prNumber, repo);
   const contextFilesAdded = expanded?.length || 0;
   const contextReasons = expanded ? JSON.stringify(expanded.map(f => f.reason)) : '[]';
-  
+
   // Estimate token count (rough estimate: ~4 chars per token)
   let tokenEstimate = Math.ceil(diff.length / 4);
   if (expanded) {
@@ -412,7 +463,7 @@ async function runReview(options: RunOptions): Promise<void> {
       tokenEstimate += Math.ceil(file.content.length / 4);
     }
   }
-  
+
   logReview({
     repo: repoName,
     prNumber,
