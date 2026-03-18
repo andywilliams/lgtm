@@ -500,18 +500,23 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
-  logReview({
-    repo: repoName,
-    prNumber,
-    reviewedAt: new Date().toISOString(),
-    filesReviewed: changedFiles.length,
-    contextFilesAdded,
-    contextReasons,
-    tokenCount: tokenEstimate,
-    model: ai,
-    usedContextExpansion: context && expanded && expanded.length > 0,
-    falseNegative: false
-  });
+  try {
+    logReview({
+      repo: repoName,
+      prNumber,
+      reviewedAt: new Date().toISOString(),
+      filesReviewed: changedFiles.length,
+      contextFilesAdded,
+      contextReasons,
+      tokenCount: tokenEstimate,
+      model: ai,
+      usedContextExpansion: context && expanded && expanded.length > 0,
+      falseNegative: false
+    });
+  } catch (e) {
+    // Don't let metrics logging break the auto-mode JSON contract
+    if (!auto) throw e;
+  }
 }
 
 program
