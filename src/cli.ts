@@ -466,7 +466,7 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   } catch (uploadError: any) {
     if (auto) {
-      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: selectedComments.slice(0, commentsPostedCount) }));
     } else {
       logErr(chalk.red(`\n✗ Upload failed: ${uploadError?.message ?? String(uploadError)}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
@@ -483,7 +483,7 @@ async function runReview(options: RunOptions): Promise<void> {
       success: true,
       dryRun,
       summary: result.summary,
-      commentsPosted: selectedComments.length,
+      commentsPosted: commentsPostedCount,
       duplicatesSkipped: duplicateCount,
       comments: selectedComments,
     }));
