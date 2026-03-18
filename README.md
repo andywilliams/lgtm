@@ -106,6 +106,11 @@ run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --bat
 run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --usage-context
 ```
 
+**Use auto mode** for structured JSON output (useful for post-processing in CI):
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --auto --context
+```
+
 ## CLI Usage
 
 ```bash
@@ -127,6 +132,9 @@ lgtm review 86 --dry-run
 
 # Batch mode (post all without prompting)
 lgtm review 86 --batch
+
+# Auto mode (non-interactive, outputs JSON — designed for agents/CI)
+lgtm review 86 --auto
 
 # Full context mode (include entire modified files for pattern analysis)
 lgtm review 86 --full-context
@@ -202,6 +210,65 @@ lgtm review 86 --full-context --usage-context
 ```
 
 This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
+
+## Auto Mode (Non-Interactive)
+
+Use `--auto` for fully automated, non-interactive operation — ideal for AI agents, CI pipelines, and scripted workflows:
+
+```bash
+lgtm review 86 --auto
+```
+
+This mode:
+1. **Implies `--batch`** — all comments are posted without prompting
+2. **Outputs structured JSON to stdout** — machine-parseable results for downstream tools
+3. **Sends progress to stderr** — decorative output (spinners, colors) goes to stderr so stdout stays clean
+
+### JSON Output
+
+The JSON output has this structure:
+
+```json
+{
+  "status": "posted",
+  "summary": "Found 2 issues: 1 bug, 1 suggestion",
+  "comments": [
+    {
+      "file": "src/parser.ts",
+      "line": 42,
+      "severity": "BUG",
+      "title": "Missing null check",
+      "body": "The input parameter could be undefined...",
+      "suggestion": "if (!input) return null;"
+    }
+  ],
+  "posted": 2,
+  "duplicates": 0
+}
+```
+
+**Status values:**
+
+| Status | Meaning |
+|--------|---------|
+| `posted` | Comments were successfully posted to the PR |
+| `clean` | No issues found (or all were duplicates) |
+| `dry_run` | Comments found but not posted (when combined with `--dry-run`) |
+| `error` | Upload to GitHub failed (comments saved locally for retry) |
+
+### Examples
+
+```bash
+# Agent workflow: review and parse results
+result=$(lgtm review 86 --auto --context)
+echo "$result" | jq '.posted'
+
+# CI pipeline: review with full context, fail if bugs found
+lgtm review 86 --auto --context | jq -e '.comments | map(select(.severity == "BUG")) | length == 0'
+
+# Combine with dry-run to preview without posting
+lgtm review 86 --auto --dry-run
+```
 
 ## Retrying Failed Uploads
 
