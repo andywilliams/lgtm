@@ -453,17 +453,20 @@ async function runReview(options: RunOptions): Promise<void> {
     comments: formattedComments.map((c) => ({ file: c.path, line: c.line, body: c.body })),
   });
 
+  let commentsPostedCount = 0;
   try {
     if (batch) {
       postBatchReview(prNumber, formattedComments, repo);
+      commentsPostedCount = formattedComments.length;
     } else {
       for (const comment of formattedComments) {
         postReviewComment(prNumber, comment.path, comment.line, comment.body, repo);
+        commentsPostedCount++;
       }
     }
   } catch (uploadError: any) {
     if (auto) {
-      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: [] }));
     } else {
       logErr(chalk.red(`\n✗ Upload failed: ${uploadError?.message ?? String(uploadError)}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
@@ -628,7 +631,7 @@ function formatRecheckResult(opts: {
     dryRun: opts.dryRun ?? false,
     stillValid: opts.stillValid,
     resolved: opts.resolved,
-    ...(opts.failed ? { failed: opts.failed } : {}),
+    failed: opts.failed ?? 0,
     results: opts.results,
     ...(opts.error ? { error: opts.error } : {}),
   });
