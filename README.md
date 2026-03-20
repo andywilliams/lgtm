@@ -466,3 +466,9 @@ Summary: 1 to post, 1 skipped
 ## License
 
 MIT
+
+---
+
+> Why do programmers prefer dark mode?
+>
+> Because light attracts bugs.
