@@ -206,6 +206,12 @@ Summary: 1 to post, 1 skipped
 - **Uses `claude` CLI** — works with your existing Claude login, no API key config needed
 - **Transparent** — you see exactly what will be posted
 
+## One More Thing
+
+> Why did the developer mass-approve every PR review comment?
+>
+> Because they just wanted to say **LGTM**. 😄
+
 ## License
 
 MIT
