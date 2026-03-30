@@ -91,14 +91,19 @@ jobs:
 
 ### Customization
 
+**Full review** (default — expanded context, thorough):
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context
+```
+
+**Quick review** (diff only, faster, uses fewer tokens):
+```yaml
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch
+```
+
 **Adjust harshness level:**
 ```yaml
 run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --harshness pedantic
-```
-
-**Disable context expansion** (faster, uses fewer tokens):
-```yaml
-run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch
 ```
 
 **Add usage context** (finds code that calls changed functions):
@@ -109,8 +114,11 @@ run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --bat
 ## CLI Usage
 
 ```bash
-# Review a PR (interactive mode)
+# Quick review — diff only, fast (default)
 lgtm review 86
+
+# Full review — expanded context for thorough analysis (recommended for important PRs)
+lgtm review 86 --full-context --usage-context
 
 # Specify repository
 lgtm review 86 --repo owner/repo
