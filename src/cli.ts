@@ -4,7 +4,7 @@ import { program } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
-import { reviewPR, recheckComments, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
@@ -945,5 +945,146 @@ program
     console.log(`False Negative Rate:    ${falseNegativeRate}%`);
     console.log(`Context Expansion Used: ${contextCoverage}%\n`);
   });
+
+// Quiz command: test your understanding of a PR
+program
+  .command('quiz <pr-number>')
+  .description('Take a quiz to test your understanding of a PR')
+  .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .option('-n, --questions <count>', 'Number of questions', '5')
+  .action(async (prNumberStr: string, options) => {
+    const prNumber = parseInt(prNumberStr, 10);
+    if (isNaN(prNumber)) {
+      console.error(chalk.red('Invalid PR number'));
+      process.exit(1);
+    }
+
+    const questionCount = parseInt(options.questions, 10);
+    if (isNaN(questionCount) || questionCount < 1 || questionCount > 10) {
+      console.error(chalk.red('Question count must be between 1 and 10'));
+      process.exit(1);
+    }
+
+    // Determine AI provider
+    let ai: AIProvider;
+    if (options.ai) {
+      if (!['claude', 'codex'].includes(options.ai)) {
+        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
+        process.exit(1);
+      }
+      ai = options.ai as AIProvider;
+      if (ai === 'claude' && !checkClaudeCli()) {
+        console.error(chalk.red('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login'));
+        process.exit(1);
+      }
+      if (ai === 'codex' && !checkCodexCli()) {
+        console.error(chalk.red('Codex CLI not found. Install: npm install -g @openai/codex'));
+        process.exit(1);
+      }
+    } else {
+      const available = getAvailableProviders();
+      if (available.length === 0) {
+        console.error(chalk.red('No AI CLI found. Install claude or codex.'));
+        process.exit(1);
+      }
+      ai = available.includes('claude') ? 'claude' : 'codex';
+    }
+
+    try {
+      await runQuiz({ prNumber, repo: options.repo, ai, questionCount });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
+    }
+  });
+
+const OPTION_LETTERS = ['A', 'B', 'C', 'D'] as const;
+
+async function runQuiz(options: { prNumber: number; repo?: string; ai: AIProvider; questionCount: number }): Promise<void> {
+  const { prNumber, repo, ai, questionCount } = options;
+
+  // Fetch PR details
+  console.log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
+  const pr = getPRDetails(prNumber, repo);
+  console.log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+  console.log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
+
+  // Fetch diff
+  console.log(chalk.blue(`\n📄 Fetching diff...`));
+  const diff = getPRDiff(prNumber, repo);
+  const maxDiffLength = 50000;
+  const truncatedDiff = diff.length > maxDiffLength
+    ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)'
+    : diff;
+
+  // Generate quiz
+  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
+  console.log(chalk.blue(`\n🧠 Generating quiz with ${aiLabel}...\n`));
+  const quiz = await generateQuiz(truncatedDiff, pr.title, pr.body, ai, questionCount);
+
+  if (quiz.questions.length === 0) {
+    console.log(chalk.yellow('Could not generate questions for this PR.'));
+    return;
+  }
+
+  // Run the quiz interactively
+  console.log(chalk.bold.white(`📝 PR Comprehension Quiz: "${pr.title}"\n`));
+  console.log(chalk.gray(`Answer ${quiz.questions.length} questions to test your understanding.\n`));
+
+  let correct = 0;
+
+  for (let i = 0; i < quiz.questions.length; i++) {
+    const q = quiz.questions[i];
+
+    console.log(chalk.white('─'.repeat(60)));
+    console.log(chalk.bold(`Question ${i + 1}/${quiz.questions.length}`));
+    console.log(chalk.white(q.question) + '\n');
+
+    const response = await prompts({
+      type: 'select',
+      name: 'answer',
+      message: 'Your answer',
+      choices: q.options.map((opt, idx) => ({
+        title: `${OPTION_LETTERS[idx]}) ${opt}`,
+        value: idx,
+      })),
+    });
+
+    // User pressed Ctrl+C or escaped
+    if (response.answer === undefined) {
+      console.log(chalk.yellow('\nQuiz cancelled.'));
+      return;
+    }
+
+    if (response.answer === q.correctIndex) {
+      correct++;
+      console.log(chalk.green(`\n  ✓ Correct!`));
+    } else {
+      console.log(chalk.red(`\n  ✗ Incorrect — the answer was ${OPTION_LETTERS[q.correctIndex]}) ${q.options[q.correctIndex]}`));
+    }
+    console.log(chalk.gray(`  ${q.explanation}\n`));
+  }
+
+  // Results
+  const total = quiz.questions.length;
+  const pct = Math.round((correct / total) * 100);
+
+  console.log(chalk.white('═'.repeat(60)));
+  console.log(chalk.bold(`\n  Result: ${correct}/${total} (${pct}%)\n`));
+
+  if (pct === 100) {
+    console.log(chalk.green('  🌟 Perfect score! You have a strong understanding of this PR.'));
+  } else if (pct >= 80) {
+    console.log(chalk.green('  👍 Great job — you understand this PR well.'));
+  } else if (pct >= 60) {
+    console.log(chalk.yellow('  📖 Decent, but consider re-reading the parts you missed before approving.'));
+  } else {
+    console.log(chalk.red('  🔎 You may want to spend more time reviewing this PR before approving.'));
+    console.log(chalk.red('     Try reading the diff more carefully and check the PR description for context.'));
+  }
+
+  console.log();
+}
 
 program.parse();
