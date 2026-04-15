@@ -393,6 +393,12 @@ Mix these question types:
 
 Make the wrong answers plausible — they should be things someone who only skimmed the PR might pick. Avoid trivially obvious wrong answers.
 
+IMPORTANT — answer length and detail balance:
+- All four options for each question MUST be similar in length and level of detail. Do NOT make the correct answer longer or more specific than the wrong answers.
+- Wrong answers should contain the same amount of technical detail, specificity, and elaboration as the correct answer.
+- If the correct answer mentions specific file names, function names, or technical details, the wrong answers should too (just different/incorrect ones).
+- Vary which position (A–D) the correct answer appears in across questions — do not default to always placing it first or last.
+
 ## PR Title
 ${prTitle}
 
@@ -498,11 +504,22 @@ function parseQuizResponse(output: string): QuizResult {
 function normalizeQuestion(q: any): QuizQuestion {
   const options = Array.isArray(q.options) ? q.options.map(String) : ['A', 'B', 'C', 'D'];
   while (options.length < 4) options.push(`Option ${options.length + 1}`);
-  const correctIndex = Number(q.correctIndex);
+  const originalCorrectIndex = Number(q.correctIndex);
+  const safeCorrectIndex = originalCorrectIndex >= 0 && originalCorrectIndex <= 3 ? originalCorrectIndex : 0;
+
+  // Shuffle options to prevent the correct answer from being predictable by position
+  const indices = [0, 1, 2, 3];
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [indices[i], indices[j]] = [indices[j], indices[i]];
+  }
+  const shuffledOptions = indices.map(i => options[i]);
+  const newCorrectIndex = indices.indexOf(safeCorrectIndex);
+
   return {
     question: String(q.question || ''),
-    options: [options[0], options[1], options[2], options[3]] as [string, string, string, string],
-    correctIndex: correctIndex >= 0 && correctIndex <= 3 ? correctIndex : 0,
+    options: [shuffledOptions[0], shuffledOptions[1], shuffledOptions[2], shuffledOptions[3]] as [string, string, string, string],
+    correctIndex: newCorrectIndex,
     explanation: String(q.explanation || ''),
   };
 }
