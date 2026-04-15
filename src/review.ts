@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion } from './types.js';
 
 export type AIProvider = 'claude' | 'codex';
 
@@ -368,6 +368,143 @@ function parseRecheckResponse(output: string, comments: ExistingComment[]): Rech
     console.error('Raw response:', output.slice(0, 500));
     throw new Error('Failed to parse recheck response from AI');
   }
+}
+
+/**
+ * Generate quiz questions about a PR to test the user's understanding
+ */
+export async function generateQuiz(
+  diff: string,
+  prTitle: string,
+  prBody: string,
+  ai: AIProvider = 'claude',
+  questionCount: number = 5
+): Promise<QuizResult> {
+  const prompt = `You are a senior engineer creating a comprehension quiz about a pull request. Your goal is to test whether someone truly understands the PR — what it changes, why, and how.
+
+Generate exactly ${questionCount} multiple-choice questions about this PR. Each question should have exactly 4 options (A–D) with exactly one correct answer.
+
+Mix these question types:
+- **What**: What does this PR change? What files/functions are affected?
+- **Why**: What is the purpose or motivation behind the change?
+- **How**: How does the implementation work? What approach was taken?
+- **Impact**: What could break? What are the edge cases or risks?
+- **Context**: How does this fit into the broader codebase?
+
+Make the wrong answers plausible — they should be things someone who only skimmed the PR might pick. Avoid trivially obvious wrong answers.
+
+## PR Title
+${prTitle}
+
+## PR Description
+${prBody || '(no description)'}
+
+## Diff
+\`\`\`diff
+${diff}
+\`\`\`
+
+OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
+{
+  "questions": [
+    {
+      "question": "The question text",
+      "options": ["Option A", "Option B", "Option C", "Option D"],
+      "correctIndex": 0,
+      "explanation": "Brief explanation of why this is the correct answer"
+    }
+  ]
+}
+
+The "correctIndex" is 0-based (0 = first option, 3 = last option). Ensure exactly ${questionCount} questions.`;
+
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+
+  const tempFile = path.join(os.tmpdir(), `lgtm-quiz-${Date.now()}.txt`);
+  fs.writeFileSync(tempFile, prompt);
+
+  try {
+    let output: string;
+
+    if (ai === 'codex') {
+      const outputFile = tempFile + '.out';
+      try {
+        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        output = fs.readFileSync(outputFile, 'utf-8');
+      } finally {
+        try { fs.unlinkSync(outputFile); } catch {}
+      }
+    } else {
+      output = execSync(`claude --print < "${tempFile}"`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        maxBuffer: 10 * 1024 * 1024,
+      });
+    }
+
+    fs.unlinkSync(tempFile);
+    return parseQuizResponse(output);
+  } catch (error: any) {
+    try { (await import('fs')).unlinkSync(tempFile); } catch {}
+    if (error.message?.includes('not found') || error.code === 'ENOENT') {
+      const cliName = ai === 'codex' ? 'Codex' : 'Claude';
+      const installCmd = ai === 'codex'
+        ? 'npm install -g @openai/codex'
+        : 'npm install -g @anthropic-ai/claude-code';
+      throw new Error(`${cliName} CLI not found. Install it: ${installCmd}`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Parse AI response into QuizResult
+ */
+function parseQuizResponse(output: string): QuizResult {
+  let jsonStr = output.trim();
+
+  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (jsonMatch) {
+    jsonStr = jsonMatch[1].trim();
+  }
+
+  const questionsMatch = jsonStr.match(/\{"questions"[\s\S]*\}/);
+  if (questionsMatch) {
+    jsonStr = questionsMatch[0];
+  } else {
+    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (jsonObjectMatch) {
+      jsonStr = jsonObjectMatch[0];
+    }
+  }
+
+  try {
+    const result = JSON.parse(jsonStr.trim()) as QuizResult;
+    result.questions = (result.questions || []).map(normalizeQuestion);
+    return result;
+  } catch {
+    console.error('Failed to parse quiz response as JSON');
+    console.error('Raw response:', output.slice(0, 500));
+    throw new Error('Failed to parse quiz response from AI');
+  }
+}
+
+function normalizeQuestion(q: any): QuizQuestion {
+  const options = Array.isArray(q.options) ? q.options.map(String) : ['A', 'B', 'C', 'D'];
+  while (options.length < 4) options.push(`Option ${options.length + 1}`);
+  const correctIndex = Number(q.correctIndex);
+  return {
+    question: String(q.question || ''),
+    options: [options[0], options[1], options[2], options[3]] as [string, string, string, string],
+    correctIndex: correctIndex >= 0 && correctIndex <= 3 ? correctIndex : 0,
+    explanation: String(q.explanation || ''),
+  };
 }
 
 function normalizeComment(comment: any): ReviewComment {

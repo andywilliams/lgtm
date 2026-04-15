@@ -64,3 +64,14 @@ export interface RecheckResponse {
   summary: string;
   results: RecheckResult[];
 }
+
+export interface QuizQuestion {
+  question: string;
+  options: [string, string, string, string];
+  correctIndex: number;
+  explanation: string;
+}
+
+export interface QuizResult {
+  questions: QuizQuestion[];
+}

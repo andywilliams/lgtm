@@ -153,6 +153,12 @@ lgtm recheck 86
 
 # Recheck and auto-resolve outdated comments
 lgtm recheck 86 --batch
+
+# Quiz yourself on a PR before approving
+lgtm quiz 86
+
+# Quiz with more questions
+lgtm quiz 86 --questions 8
 ```
 
 ## AI Providers
@@ -305,6 +311,69 @@ Summary: 1 still valid, 1 to resolve, 1 kept
 📤 Resolving comments...
 ✓ Resolved 1 comment(s)
 ```
+
+## Quiz Mode
+
+Test your understanding of a PR before approving it. The AI generates multiple-choice questions about what the PR changes, why, how, and what could go wrong — helping ensure you actually understand the code you're approving.
+
+```bash
+# Take a 5-question quiz on a PR
+lgtm quiz 86
+
+# Specify number of questions (1–10)
+lgtm quiz 86 --questions 8
+
+# Specify repo or AI provider
+lgtm quiz 86 --repo owner/repo --ai claude
+```
+
+### Example
+
+```
+$ lgtm quiz 86
+
+🔍 Fetching PR #86...
+   "fix: handle edge case in parser" by andywilliams
+   3 files, +45/-12
+
+📄 Fetching diff...
+
+🧠 Generating quiz with Claude...
+
+📝 PR Comprehension Quiz: "fix: handle edge case in parser"
+
+Answer 5 questions to test your understanding.
+
+────────────────────────────────────────────────────────────
+Question 1/5
+What is the primary purpose of this PR?
+
+? Your answer › A) Add a new parser module
+                B) Fix a null pointer crash when input is empty
+                C) Refactor the parser for performance
+                D) Add unit tests for the parser
+
+  ✓ Correct!
+  The PR fixes a crash that occurred when the parser received
+  empty input, by adding a guard clause at line 42.
+
+...
+
+════════════════════════════════════════════════════════════
+
+  Result: 4/5 (80%)
+
+  👍 Great job — you understand this PR well.
+```
+
+### Scoring
+
+| Score | Verdict |
+|-------|---------|
+| 100% | Perfect — you have a strong understanding of this PR |
+| 80%+ | Great job — you understand this PR well |
+| 60%+ | Consider re-reading the parts you missed before approving |
+| Below 60% | Spend more time reviewing this PR before approving |
 
 ## Auto Mode (Non-Interactive)
 
