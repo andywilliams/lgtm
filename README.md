@@ -74,7 +74,7 @@ jobs:
           node-version: '18'
       
       - name: Run lgtm review
-        run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context
+        run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --related-files
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -100,7 +100,7 @@ jobs:
 
 **Full review** (default — expanded context, thorough):
 ```yaml
-run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --related-files
 ```
 
 **Quick review** (diff only, faster, uses fewer tokens):
@@ -110,12 +110,12 @@ run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --bat
 
 **Adjust harshness level:**
 ```yaml
-run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --harshness pedantic
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --related-files --harshness pedantic
 ```
 
 **Add usage context** (finds code that calls changed functions):
 ```yaml
-run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --context --usage-context
+run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --batch --related-files --usage-context
 ```
 
 ## CLI Usage
@@ -125,7 +125,7 @@ run: npx @andywilliams/lgtm review ${{ github.event.pull_request.number }} --bat
 lgtm review 86
 
 # Full review — expanded context for thorough analysis (recommended for important PRs)
-lgtm review 86 --full-context --usage-context
+lgtm review 86 --max-context
 
 # Specify repository
 lgtm review 86 --repo owner/repo
@@ -152,8 +152,11 @@ lgtm review 86 --full-context
 # Usage context mode (include files that use changed symbols)
 lgtm review 86 --usage-context
 
-# Combine both for maximum context
-lgtm review 86 --full-context --usage-context
+# Related files mode (auto-discover imports, callers, tests, infra)
+lgtm review 86 --related-files
+
+# Max context — shorthand for all three of the above
+lgtm review 86 --max-context
 
 # Recheck if existing comments are still valid after new commits
 lgtm recheck 86
@@ -391,7 +394,7 @@ Use `--auto` for fully non-interactive operation, designed for agents, scripts, 
 lgtm review 86 --auto
 
 # Combine with other flags
-lgtm review 86 --auto --harshness pedantic --context
+lgtm review 86 --auto --harshness pedantic --related-files
 lgtm review 86 --auto --repo owner/repo
 
 # Dry run in auto mode (review without posting, still get JSON)

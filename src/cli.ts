@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { program } from 'commander';
+import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
@@ -41,7 +41,9 @@ program
   .option('--auto', 'Non-interactive mode for agents: implies --batch, outputs JSON to stdout', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
   .option('--usage-context', 'Include files that use changed symbols', false)
-  .option('--context', 'Auto-expand context using static analysis', false)
+  .option('--related-files', 'Include related files (imports, callers, tests, infra) discovered via static analysis', false)
+  .option('--max-context', 'Shorthand: enables --full-context, --usage-context, and --related-files', false)
+  .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
   .action(async (prNumberStr: string, options) => {
     const auto = options.auto;
 
@@ -92,6 +94,15 @@ program
 
     const batch = auto || options.batch;
 
+    // Back-compat: --context is the deprecated name for --related-files.
+    if (options.context && !options.relatedFiles) {
+      console.error(chalk.yellow('⚠  --context is deprecated; use --related-files instead.'));
+    }
+    // --max-context turns on all three individual context flags.
+    const fullContext = options.fullContext || options.maxContext;
+    const usageContext = options.usageContext || options.maxContext;
+    const relatedFiles = options.relatedFiles || options.context || options.maxContext;
+
     try {
       await runReview({
         prNumber,
@@ -100,9 +111,9 @@ program
         dryRun: options.dryRun,
         batch,
         auto,
-        fullContext: options.fullContext,
-        usageContext: options.usageContext,
-        context: options.context,
+        fullContext,
+        usageContext,
+        relatedFiles,
         ai,
       });
     } catch (error: any) {
@@ -132,7 +143,7 @@ interface RunOptions {
   auto: boolean;
   fullContext: boolean;
   usageContext: boolean;
-  context: boolean;
+  relatedFiles: boolean;
   ai: AIProvider;
 }
 
@@ -182,7 +193,7 @@ function formatAutoResult(options: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, context, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, relatedFiles, ai } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -255,8 +266,8 @@ async function runReview(options: RunOptions): Promise<void> {
   // Auto-expand context if requested
   let expandedContextStr = '';
   let expanded: { path: string; reason: string; content: string }[] = [];
-  if (context) {
-    log(chalk.blue(`\n📚 Expanding context (static analysis)...`));
+  if (relatedFiles) {
+    log(chalk.blue(`\n📚 Finding related files (static analysis)...`));
     const changedFiles = getChangedFiles(prNumber, repo);
     const repoRoot = getRepoRoot();
     expanded = await expandContext(changedFiles, repoRoot, {
@@ -287,7 +298,7 @@ async function runReview(options: RunOptions): Promise<void> {
   const contextModes = [harshness + ' mode'];
   if (fullContext) contextModes.push('full context');
   if (usageContext && usageContextStr) contextModes.push('usage context');
-  if (context && expandedContextStr) contextModes.push('expanded context');
+  if (relatedFiles && expandedContextStr) contextModes.push('related files');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
   const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr);
@@ -515,7 +526,7 @@ async function runReview(options: RunOptions): Promise<void> {
       contextReasons,
       tokenCount: tokenEstimate,
       model: ai,
-      usedContextExpansion: context && expanded && expanded.length > 0,
+      usedContextExpansion: relatedFiles && expanded && expanded.length > 0,
       falseNegative: false
     });
   } catch (e) {
