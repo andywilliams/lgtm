@@ -10,9 +10,16 @@ LGTM uses Claude to review your pull requests, but unlike automated bots, *you* 
 git clone https://github.com/andywilliams/lgtm.git
 cd lgtm
 npm install
-npm run build
-npm link   # makes `lgtm` available globally
+npm run install-global   # builds and installs `lgtm` globally
 ```
+
+This runs `npm install -g .`, which is a real global install — it persists across terminal sessions and survives new tabs (unlike `npm link`, which can break when switching Node versions via nvm).
+
+To update after pulling changes, just re-run `npm run install-global`. To remove it, run `npm run uninstall-global`.
+
+### For active development
+
+If you're iterating on the tool itself and don't want to rebuild after every change, use `npm run dev -- <args>` (runs from source via `tsx`), or `npm link` for a live-symlinked global binary.
 
 ## Prerequisites
 

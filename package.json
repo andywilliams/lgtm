@@ -10,6 +10,8 @@
     "build": "tsc",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
+    "install-global": "npm run build && npm install -g .",
+    "uninstall-global": "npm uninstall -g lgtm-review",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
