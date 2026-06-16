@@ -146,6 +146,9 @@ lgtm review 86 --batch
 # Auto mode (non-interactive, JSON output — designed for agents/scripts)
 lgtm review 86 --auto
 
+# Agent mode (max context, read-only, returns ALL findings as JSON — never posts)
+lgtm review 86 --agent
+
 # Full context mode (include entire modified files for pattern analysis)
 lgtm review 86 --full-context
 
@@ -466,6 +469,86 @@ echo "Posted $posted comments"
 # Use with dry-run to inspect without posting
 lgtm review 86 --auto --dry-run | jq '.comments[] | {file, line, severity, title}'
 ```
+
+## Agent Mode
+
+`--agent` is a single flag for agents that want to **run a full-power review and consume the results themselves** rather than have LGTM post to GitHub. It's built for the case where an autonomous coding agent reviews its own (or another) PR, reads every finding, and decides what to do next.
+
+```bash
+lgtm review 86 --agent
+```
+
+It bundles three behaviors:
+
+- **Max context, always** — implies `--max-context` (full file contents + symbol usages + related files), so the AI sees as much as possible.
+- **Read-only** — it **never** posts comments and never writes to the PR. `posted` is always `false`.
+- **All findings returned** — every finding the review produced is emitted as JSON. Findings that duplicate a comment already on the PR are **flagged** (`"duplicate": true`), not dropped — so the agent gets the complete picture.
+
+### `--agent` vs `--auto`
+
+| | `--auto` | `--agent` |
+|---|---|---|
+| Output | JSON | JSON |
+| Context | whatever flags you pass | always max context |
+| Posts to GitHub | **yes** (implies `--batch`) | **no, ever** |
+| Duplicate findings | dropped from output | included, flagged `duplicate: true` |
+| Use case | automated reviewer (CI bot) | agent that acts on the results itself |
+
+If you want an agent to post, use `--auto`. If you want an agent to *read everything and decide*, use `--agent`.
+
+### JSON Output Format
+
+```json
+{
+  "success": true,
+  "mode": "agent",
+  "summary": "Found 2 issues: 1 bug, 1 suggestion",
+  "posted": false,
+  "commentsFound": 2,
+  "duplicates": 1,
+  "comments": [
+    {
+      "file": "src/parser.ts",
+      "line": 42,
+      "severity": "BUG",
+      "title": "Missing null check",
+      "body": "The input parameter could be undefined...",
+      "suggestion": "if (!input) return null;",
+      "duplicate": false
+    },
+    {
+      "file": "src/parser.ts",
+      "line": 87,
+      "severity": "SUGGESTION",
+      "title": "Extract magic number",
+      "body": "The value 1024 appears without explanation...",
+      "duplicate": true
+    }
+  ],
+  "context": {
+    "maxContext": true,
+    "relatedFiles": [
+      { "path": "src/lexer.ts", "reason": "imported by src/parser.ts" }
+    ],
+    "tokenEstimate": 12188
+  }
+}
+```
+
+On error (e.g. AI/CLI failure, invalid input), the same shape is returned with `success: false`, an `error` string, and an empty `comments` array. Exit code is `0` on success, `1` on error.
+
+### Agent Integration Example
+
+```bash
+# Get every finding, including ones already commented on, and act on the new ones
+result=$(lgtm review 86 --agent 2>/dev/null)
+echo "$result" | jq '.comments[] | select(.duplicate == false) | {file, line, severity, title}'
+
+# Count actionable (non-duplicate) bugs
+echo "$result" | jq '[.comments[] | select(.duplicate == false and .severity == "BUG")] | length'
+```
+
+> **Note:** Because agent mode always runs with max context, the AI response is large. The underlying review CLI occasionally returns malformed JSON on very large responses; when that happens you'll get `success: false` with an `error` — retry, or fall back to a lighter context mode.
 
 ## Harshness Levels
 
