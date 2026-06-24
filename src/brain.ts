@@ -168,16 +168,24 @@ async function fetchNote(root: string, id: string): Promise<any | null> {
   }
 }
 
+/** Read a note's markdown body from an API payload — some brains return `body`, ours returns `bodyMd`. */
+function apiBody(n: any): string | null {
+  if (typeof n?.body === 'string') return n.body;
+  if (typeof n?.bodyMd === 'string') return n.bodyMd;
+  return null;
+}
+
 async function fromUrl(base: string, repo: string): Promise<string> {
   try {
     const root = base.replace(/\/$/, '');
     const main = await fetchNote(root, `${repo}-handbook`);
-    if (!main || typeof main.body !== 'string' || !main.body.trim()) return '';
+    const mainBody = apiBody(main);
+    if (!main || !mainBody || !mainBody.trim()) return '';
 
-    // Gather one-hop neighbours from resolved relations + backlinks (present only).
+    // Gather one-hop neighbours from resolved relations + backlinks; skip known-missing.
     const ids: string[] = [];
     for (const r of Array.isArray(main.relations) ? main.relations : []) {
-      if (r?.id && r.present !== 0 && r.present !== false) ids.push(r.id);
+      if (r?.id && r.present !== 0 && r.present !== false && r.exists !== false) ids.push(r.id);
     }
     for (const b of Array.isArray(main.backlinks) ? main.backlinks : []) {
       if (b?.id) ids.push(b.id);
@@ -185,11 +193,12 @@ async function fromUrl(base: string, repo: string): Promise<string> {
 
     const resolve: Resolver = async (id) => {
       const n = await fetchNote(root, id);
-      if (!n || typeof n.body !== 'string') return null;
-      return { title: typeof n.title === 'string' ? n.title : id, body: n.body, type: n.type };
+      const b = apiBody(n);
+      if (!n || b === null) return null;
+      return { title: typeof n.title === 'string' ? n.title : id, body: b, type: n.type };
     };
     const related = await collectRelated(ids, repo, resolve);
-    return assemble(typeof main.title === 'string' ? main.title : `${repo}-handbook`, main.body, related);
+    return assemble(typeof main.title === 'string' ? main.title : `${repo}-handbook`, mainBody, related);
   } catch {
     return '';
   }
@@ -224,8 +233,9 @@ async function fromDir(dir: string, repo: string): Promise<string> {
 
     // Neighbours from frontmatter relation entries (`{ rel: …, to: <id> }`) and
     // body wiki-links — both narrowly matched so prose `to:` etc. can't leak in.
-    const relIds = [...raw.matchAll(/rel:\s*[a-z-]+\s*,\s*to:\s*([a-z0-9][a-z0-9-]*)/g)].map((m) => m[1]);
-    const wikiIds = [...mainBody.matchAll(/\[\[([a-z0-9][a-z0-9-]*)(?:\|[^\]]*)?\]\]/g)].map((m) => m[1]);
+    // Ids may be kebab- OR snake_case (our vault is ~70% underscore ids), so allow `_`.
+    const relIds = [...raw.matchAll(/rel:\s*[a-z_-]+\s*,\s*to:\s*([a-z0-9][a-z0-9_-]*)/g)].map((m) => m[1]);
+    const wikiIds = [...mainBody.matchAll(/\[\[([a-z0-9][a-z0-9_-]*)(?:\|[^\]]*)?\]\]/g)].map((m) => m[1]);
 
     const resolve: Resolver = (id) => readNoteFile(dir, id);
     const related = await collectRelated([...relIds, ...wikiIds], repo, resolve);
