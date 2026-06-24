@@ -234,7 +234,7 @@ async function fromDir(dir: string, repo: string): Promise<string> {
     // Neighbours from frontmatter relation entries (`{ rel: …, to: <id> }`) and
     // body wiki-links — both narrowly matched so prose `to:` etc. can't leak in.
     // Ids may be kebab- OR snake_case (our vault is ~70% underscore ids), so allow `_`.
-    const relIds = [...raw.matchAll(/rel:\s*[a-z-]+\s*,\s*to:\s*([a-z0-9][a-z0-9_-]*)/g)].map((m) => m[1]);
+    const relIds = [...raw.matchAll(/rel:\s*[a-z_-]+\s*,\s*to:\s*([a-z0-9][a-z0-9_-]*)/g)].map((m) => m[1]);
     const wikiIds = [...mainBody.matchAll(/\[\[([a-z0-9][a-z0-9_-]*)(?:\|[^\]]*)?\]\]/g)].map((m) => m[1]);
 
     const resolve: Resolver = (id) => readNoteFile(dir, id);
