@@ -50,17 +50,23 @@ program
   .option('--dry-run', 'Show comments without posting', false)
   .option('--batch', 'Post all comments without prompting', false)
   .option('--auto', 'Non-interactive mode for agents: implies --batch, outputs JSON to stdout', false)
+  .option('--agent', 'Agent mode: max context, read-only, returns ALL findings as JSON (never posts)', false)
   .option('--full-context', 'Include full file contents for pattern analysis', false)
   .option('--usage-context', 'Include files that use changed symbols', false)
   .option('--related-files', 'Include related files (imports, callers, tests, infra) discovered via static analysis', false)
   .option('--max-context', 'Shorthand: enables --full-context, --usage-context, and --related-files', false)
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
   .action(async (prNumberStr: string, options) => {
-    const auto = options.auto;
+    const agent = options.agent;
+    // Agent mode is built on top of auto mode: same suppressed-output + JSON-to-stdout
+    // machinery, but read-only and with a richer findings-focused payload.
+    const auto = options.auto || agent;
 
-    // Helper for validation errors: emit JSON in auto mode, plain text otherwise
+    // Helper for validation errors: emit JSON in agent/auto mode, plain text otherwise
     function exitWithError(message: string): never {
-      if (auto) {
+      if (agent) {
+        console.log(formatAgentResult({ success: false, error: message, summary: '', comments: [] }));
+      } else if (auto) {
         console.log(formatAutoResult({ success: false, error: message, dryRun: options.dryRun ?? false, summary: '', commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
       } else {
         console.error(chalk.red(message));
@@ -109,10 +115,11 @@ program
     if (options.context && !options.relatedFiles) {
       console.error(chalk.yellow('⚠  --context is deprecated; use --related-files instead.'));
     }
-    // --max-context turns on all three individual context flags.
-    const fullContext = options.fullContext || options.maxContext;
-    const usageContext = options.usageContext || options.maxContext;
-    const relatedFiles = options.relatedFiles || options.context || options.maxContext;
+    // --max-context (and --agent, which always runs with max context) turn on all
+    // three individual context flags.
+    const fullContext = options.fullContext || options.maxContext || agent;
+    const usageContext = options.usageContext || options.maxContext || agent;
+    const relatedFiles = options.relatedFiles || options.context || options.maxContext || agent;
 
     try {
       await runReview({
@@ -122,13 +129,20 @@ program
         dryRun: options.dryRun,
         batch,
         auto,
+        agent,
         fullContext,
         usageContext,
         relatedFiles,
         ai,
       });
     } catch (error: any) {
-      if (auto) {
+      if (agent) {
+        try {
+          console.log(formatAgentResult({ success: false, error: error?.message ?? String(error), summary: '', comments: [] }));
+        } catch {
+          console.log(JSON.stringify({ success: false, mode: 'agent', error: String(error), summary: '', posted: false, commentsFound: 0, duplicates: 0, comments: [] }));
+        }
+      } else if (auto) {
         // Auto-mode error contract: JSON with success:false goes to stdout so consumers
         // can parse it via $(lgtm review ... --auto). Note: subprocess stderr (e.g. from
         // gh CLI) may still leak to stderr — consumers should use 2>/dev/null if needed.
@@ -152,6 +166,7 @@ interface RunOptions {
   dryRun: boolean;
   batch: boolean;
   auto: boolean;
+  agent: boolean;
   fullContext: boolean;
   usageContext: boolean;
   relatedFiles: boolean;
@@ -203,8 +218,89 @@ function formatAutoResult(options: {
   });
 }
 
+// A finding plus whether it duplicates a comment already on the PR.
+type AnnotatedComment = ReviewComment & { duplicate: boolean };
+
+/**
+ * Agent-mode payload. Unlike formatAutoResult (which reports what was *posted*),
+ * this reports every finding the review produced — read-only — so an agent has the
+ * full picture. Duplicates of existing PR comments are flagged, not dropped.
+ */
+function formatAgentResult(options: {
+  success: boolean;
+  summary: string;
+  comments: AnnotatedComment[];
+  relatedFiles?: { path: string; reason: string }[];
+  tokenEstimate?: number;
+  error?: string;
+}): string {
+  const duplicates = options.comments.filter(c => c.duplicate).length;
+  return JSON.stringify({
+    success: options.success,
+    mode: 'agent',
+    summary: options.summary,
+    posted: false,
+    commentsFound: options.comments.length,
+    duplicates,
+    comments: options.comments.map(c => ({
+      file: c.file,
+      line: c.line,
+      severity: c.severity,
+      title: c.title,
+      body: c.body,
+      suggestion: c.suggestion,
+      duplicate: c.duplicate,
+    })),
+    context: {
+      maxContext: true,
+      relatedFiles: (options.relatedFiles ?? []).map(f => ({ path: f.path, reason: f.reason })),
+      tokenEstimate: options.tokenEstimate ?? 0,
+    },
+    ...(options.error ? { error: options.error } : {}),
+  });
+}
+
+/**
+ * Best-effort metrics logging for a completed review. Returns the rough token
+ * estimate (diff + expanded context) so callers can surface it. Never throws.
+ */
+function recordReviewMetrics(opts: {
+  repo?: string;
+  prNumber: number;
+  diff: string;
+  expanded: { path: string; reason: string; content: string }[];
+  relatedFiles: boolean;
+  ai: AIProvider;
+}): number {
+  const { repo, prNumber, diff, expanded, relatedFiles, ai } = opts;
+  let tokenEstimate = Math.ceil(diff.length / 4);
+  for (const file of expanded) {
+    tokenEstimate += Math.ceil(file.content.length / 4);
+  }
+  try {
+    const repoName = repo || getRepoRoot();
+    const changedFiles = getChangedFiles(prNumber, repo);
+    logReview({
+      repo: repoName,
+      prNumber,
+      reviewedAt: new Date().toISOString(),
+      filesReviewed: changedFiles.length,
+      contextFilesAdded: expanded.length,
+      contextReasons: JSON.stringify(expanded.map(f => f.reason)),
+      tokenCount: tokenEstimate,
+      model: ai,
+      usedContextExpansion: relatedFiles && expanded.length > 0,
+      falseNegative: false,
+    });
+  } catch (e) {
+    // Metrics logging is non-critical — don't fail the review.
+    process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
+  }
+  return tokenEstimate;
+}
+
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, auto, fullContext, usageContext, relatedFiles, ai } = options;
+  const { prNumber, repo, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -323,6 +419,33 @@ async function runReview(options: RunOptions): Promise<void> {
   const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr);
 
   log(chalk.gray(`\n${result.summary}\n`));
+
+  // Agent mode: read-only. Return EVERY finding (flagging duplicates of existing PR
+  // comments) and never post. The agent decides what to do with the results.
+  if (agent) {
+    // Fetch existing comments only to flag duplicates — best-effort, non-critical.
+    let existingComments: ExistingReviewComment[] = [];
+    try {
+      existingComments = getExistingReviewComments(prNumber, repo);
+    } catch {
+      // If we can't fetch existing comments, return findings without duplicate flags.
+    }
+    const annotated: AnnotatedComment[] = result.comments.map((comment) => ({
+      ...comment,
+      duplicate: isDuplicateComment(comment, existingComments),
+    }));
+
+    const tokenEstimate = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai });
+
+    console.log(formatAgentResult({
+      success: true,
+      summary: result.summary,
+      comments: annotated,
+      relatedFiles: expanded,
+      tokenEstimate,
+    }));
+    return;
+  }
 
   if (result.comments.length === 0) {
     if (auto) {
@@ -521,37 +644,8 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
   }
 
-  // Log review metadata for metrics
-  const repoName = repo || getRepoRoot();
-  const changedFiles = getChangedFiles(prNumber, repo);
-  const contextFilesAdded = expanded?.length || 0;
-  const contextReasons = expanded ? JSON.stringify(expanded.map(f => f.reason)) : '[]';
-
-  // Estimate token count (rough estimate: ~4 chars per token)
-  let tokenEstimate = Math.ceil(diff.length / 4);
-  if (expanded) {
-    for (const file of expanded) {
-      tokenEstimate += Math.ceil(file.content.length / 4);
-    }
-  }
-
-  try {
-    logReview({
-      repo: repoName,
-      prNumber,
-      reviewedAt: new Date().toISOString(),
-      filesReviewed: changedFiles.length,
-      contextFilesAdded,
-      contextReasons,
-      tokenCount: tokenEstimate,
-      model: ai,
-      usedContextExpansion: relatedFiles && expanded && expanded.length > 0,
-      falseNegative: false
-    });
-  } catch (e) {
-    // Metrics logging is non-critical — don't fail the review
-    process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
-  }
+  // Log review metadata for metrics (non-critical, never throws).
+  recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai });
 }
 
 program
