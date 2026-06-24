@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 /**
@@ -14,8 +14,8 @@ import { join } from 'node:path';
  * Three pluggable providers, tried in priority order; the first that yields
  * anything wins:
  *   1. LGTM_BRAIN_CMD  — run an arbitrary command (gets the repo as $LGTM_BRAIN_REPO
- *                        and as the final argument) and use its stdout. The escape
- *                        hatch: point this at ANY brain on ANY machine.
+ *                        and as the final, shell-quoted argument) and use its stdout.
+ *                        The escape hatch: point this at ANY brain on ANY machine.
  *   2. LGTM_BRAIN_URL  — a second-brain HTTP API; pulls the handbook + one-hop
  *                        graph neighbours (relations + backlinks).
  *   3. LGTM_BRAIN_DIR  — a second-brain vault on disk (works with the server off);
@@ -38,6 +38,8 @@ interface NoteLite {
   type?: string;
 }
 
+type Resolver = (id: string) => NoteLite | null | Promise<NoteLite | null>;
+
 // --- helpers ---------------------------------------------------------------
 
 function resolveRepoName(repo?: string): string | null {
@@ -51,6 +53,11 @@ function resolveRepoName(repo?: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** POSIX single-quote a value so it's safe to interpolate into a shell command. */
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 function stripFrontmatter(md: string): string {
@@ -67,6 +74,33 @@ function markSeen(seen: Set<string>, rid: string): void {
   seen.add(rid);
   seen.add(base);
   seen.add(`${base}-handbook`);
+}
+
+/** Order candidate neighbour ids so dedicated `-handbook` notes come first. */
+function handbookFirst(ids: string[], repo: string): string[] {
+  const cand = [...new Set(ids)].filter((id) => id && id !== repo && id !== `${repo}-handbook`);
+  return [...cand.filter((x) => x.endsWith('-handbook')), ...cand.filter((x) => !x.endsWith('-handbook'))];
+}
+
+/**
+ * Shared neighbour resolution: walk candidate ids (handbooks first), prefer each
+ * id's `-handbook` variant, de-dupe handbook-vs-stub, skip hub/person notes, and
+ * cap at MAX_RELATED. `resolve` may be sync (disk) or async (API).
+ */
+async function collectRelated(candIds: string[], repo: string, resolve: Resolver): Promise<NoteLite[]> {
+  const related: NoteLite[] = [];
+  const seen = new Set<string>([`${repo}-handbook`, repo]);
+  for (const cand of handbookFirst(candIds, repo)) {
+    if (related.length >= MAX_RELATED) break;
+    const rid = cand.endsWith('-handbook') ? cand : `${cand}-handbook`;
+    let note = seen.has(rid) ? null : await resolve(rid);
+    if (!note && !cand.endsWith('-handbook') && !seen.has(cand)) note = await resolve(cand);
+    if (!note || !note.body.trim()) continue;
+    markSeen(seen, rid);
+    if (note.type && SKIP_TYPES.has(note.type)) continue;
+    related.push(note);
+  }
+  return related;
 }
 
 /** Assemble the standard "Codebase Handbook Context" section (handbook + related). */
@@ -87,17 +121,12 @@ function assemble(mainTitle: string, mainBody: string, related: NoteLite[]): str
   return s;
 }
 
-/** Order candidate neighbour ids so dedicated `-handbook` notes come first. */
-function handbookFirst(ids: string[], repo: string): string[] {
-  const cand = [...new Set(ids)].filter((id) => id && id !== repo && id !== `${repo}-handbook`);
-  return [...cand.filter((x) => x.endsWith('-handbook')), ...cand.filter((x) => !x.endsWith('-handbook'))];
-}
-
 // --- provider 1: arbitrary command ----------------------------------------
 
 function fromCmd(cmd: string, repo: string): string {
   try {
-    const out = execSync(`${cmd} ${repo}`, {
+    // repo is also exposed as $LGTM_BRAIN_REPO; the appended arg is shell-quoted.
+    const out = execSync(`${cmd} ${shellQuote(repo)}`, {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 8000,
@@ -131,28 +160,30 @@ async function fetchNote(root: string, id: string): Promise<any | null> {
 }
 
 async function fromUrl(base: string, repo: string): Promise<string> {
-  const root = base.replace(/\/$/, '');
-  const main = await fetchNote(root, `${repo}-handbook`);
-  if (!main || typeof main.body !== 'string' || !main.body.trim()) return '';
+  try {
+    const root = base.replace(/\/$/, '');
+    const main = await fetchNote(root, `${repo}-handbook`);
+    if (!main || typeof main.body !== 'string' || !main.body.trim()) return '';
 
-  // Gather one-hop neighbours from resolved relations + backlinks (present only).
-  const ids: string[] = [];
-  for (const r of main.relations ?? []) if (r?.id && r.present !== 0) ids.push(r.id);
-  for (const b of main.backlinks ?? []) if (b?.id) ids.push(b.id);
+    // Gather one-hop neighbours from resolved relations + backlinks (present only).
+    const ids: string[] = [];
+    for (const r of Array.isArray(main.relations) ? main.relations : []) {
+      if (r?.id && r.present !== 0) ids.push(r.id);
+    }
+    for (const b of Array.isArray(main.backlinks) ? main.backlinks : []) {
+      if (b?.id) ids.push(b.id);
+    }
 
-  const related: NoteLite[] = [];
-  const seen = new Set<string>([`${repo}-handbook`, repo]);
-  for (const cand of handbookFirst(ids, repo)) {
-    if (related.length >= MAX_RELATED) break;
-    const rid = cand.endsWith('-handbook') ? cand : `${cand}-handbook`;
-    let note = seen.has(rid) ? null : await fetchNote(root, rid);
-    if (!note && !cand.endsWith('-handbook') && !seen.has(cand)) note = await fetchNote(root, cand);
-    if (!note || typeof note.body !== 'string' || !note.body.trim()) continue;
-    markSeen(seen, rid);
-    if (SKIP_TYPES.has(note.type)) continue;
-    related.push({ title: note.title || rid, body: note.body });
+    const resolve: Resolver = async (id) => {
+      const n = await fetchNote(root, id);
+      if (!n || typeof n.body !== 'string') return null;
+      return { title: typeof n.title === 'string' ? n.title : id, body: n.body, type: n.type };
+    };
+    const related = await collectRelated(ids, repo, resolve);
+    return assemble(typeof main.title === 'string' ? main.title : `${repo}-handbook`, main.body, related);
+  } catch {
+    return '';
   }
-  return assemble(main.title || `${repo}-handbook`, main.body, related);
 }
 
 // --- provider 3: second-brain vault on disk -------------------------------
@@ -170,36 +201,21 @@ function readNoteFile(dir: string, id: string): NoteLite | null {
   return null;
 }
 
-function fromDir(dir: string, repo: string): string {
+async function fromDir(dir: string, repo: string): Promise<string> {
   try {
-    const mem = join(dir, 'memories');
-    if (!existsSync(mem)) return '';
-    let hbPath = join(mem, `${repo}-handbook.md`);
-    if (!existsSync(hbPath)) {
-      const hit = readdirSync(mem).find((f) => f.endsWith('-handbook.md') && f.startsWith(repo));
-      if (!hit) return '';
-      hbPath = join(mem, hit);
-    }
+    const hbPath = join(dir, 'memories', `${repo}-handbook.md`);
+    if (!existsSync(hbPath)) return '';
     const raw = readFileSync(hbPath, 'utf-8');
     const mainTitle = raw.match(/^title:\s*["']?(.+?)["']?\s*$/m)?.[1] ?? `${repo}-handbook`;
     const mainBody = stripFrontmatter(raw);
 
-    // Neighbours from frontmatter relations (`to: <id>`) and body wiki-links.
-    const relIds = [...raw.matchAll(/to:\s*([a-z0-9][a-z0-9-]*)/g)].map((m) => m[1]);
+    // Neighbours from frontmatter relation entries (`{ rel: …, to: <id> }`) and
+    // body wiki-links — both narrowly matched so prose `to:` etc. can't leak in.
+    const relIds = [...raw.matchAll(/rel:\s*[a-z-]+\s*,\s*to:\s*([a-z0-9][a-z0-9-]*)/g)].map((m) => m[1]);
     const wikiIds = [...mainBody.matchAll(/\[\[([a-z0-9][a-z0-9-]*)(?:\|[^\]]*)?\]\]/g)].map((m) => m[1]);
 
-    const related: NoteLite[] = [];
-    const seen = new Set<string>([`${repo}-handbook`, repo]);
-    for (const cand of handbookFirst([...relIds, ...wikiIds], repo)) {
-      if (related.length >= MAX_RELATED) break;
-      const rid = cand.endsWith('-handbook') ? cand : `${cand}-handbook`;
-      let note = seen.has(rid) ? null : readNoteFile(dir, rid);
-      if (!note && !cand.endsWith('-handbook') && !seen.has(cand)) note = readNoteFile(dir, cand);
-      if (!note || !note.body.trim()) continue;
-      markSeen(seen, rid);
-      if (note.type && SKIP_TYPES.has(note.type)) continue;
-      related.push(note);
-    }
+    const resolve: Resolver = (id) => readNoteFile(dir, id);
+    const related = await collectRelated([...relIds, ...wikiIds], repo, resolve);
     return assemble(mainTitle, mainBody, related);
   } catch {
     return '';
@@ -230,7 +246,7 @@ export async function fetchBrainContext(repo?: string): Promise<string> {
     if (ctx) return ctx;
   }
   if (dir) {
-    const ctx = fromDir(dir, repoName);
+    const ctx = await fromDir(dir, repoName);
     if (ctx) return ctx;
   }
   return '';
