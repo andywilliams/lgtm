@@ -34,9 +34,11 @@ program
 // Discoverable breadcrumb for the optional second-brain integration (off by default).
 program.addHelpText(
   'after',
-  '\nOptional context:\n' +
-    '  Set LGTM_BRAIN_DIR to a second-brain vault path (or LGTM_BRAIN_URL to its API)\n' +
-    "  to enrich reviews with the repo's engineering handbook. No effect if unset.\n"
+  '\nOptional context (a "second brain") — enrich reviews with the repo\'s engineering\n' +
+    'handbook + related systems. Off unless one of these is set:\n' +
+    '  LGTM_BRAIN_CMD   command that prints context for a repo (any brain)\n' +
+    '  LGTM_BRAIN_URL   a second-brain HTTP API\n' +
+    '  LGTM_BRAIN_DIR   a second-brain vault on disk\n'
 );
 
 program

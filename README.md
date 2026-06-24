@@ -232,21 +232,27 @@ This gives the AI both the full modified files (for pattern analysis) and extern
 
 ## Handbook Context (optional)
 
-LGTM can enrich a review with domain knowledge about the repo being reviewed — known design constraints, gotchas, how the service is built — pulled from an engineering handbook in a local **second-brain** knowledge vault. This grounds the review in *why* the codebase is the way it is, not just the diff.
+LGTM can enrich a review with domain knowledge about the repo being reviewed — known design constraints, gotchas, how the service is built, **and the related systems it touches** — pulled from an engineering "second-brain" knowledge base. This grounds the review in *why* the codebase is the way it is, not just the diff.
 
-This is **off by default** and has no effect unless you point LGTM at a vault. Set one of:
+The contract is deliberately tiny: **given a repo name, a "brain" returns markdown context.** LGTM ships three pluggable providers, tried in priority order — set any one:
 
 ```bash
-# Read handbooks straight from the vault on disk (preferred — no server needed)
-export LGTM_BRAIN_DIR="$HOME/development/tools/second-brain/vault"
+# 1. Any command that prints context to stdout — the escape hatch for ANY brain,
+#    on any machine. Gets the repo as $LGTM_BRAIN_REPO and as the final argument.
+export LGTM_BRAIN_CMD="my-brain context"        # runs: my-brain context <repo>
 
-# …or fetch them from the second-brain HTTP API
+# 2. A second-brain HTTP API (pulls the handbook + its graph neighbours)
 export LGTM_BRAIN_URL="http://localhost:3101"
+
+# 3. A second-brain vault on disk (works with the server off)
+export LGTM_BRAIN_DIR="$HOME/development/tools/second-brain/vault"
 ```
 
-LGTM looks for a note named `<repo>-handbook` (e.g. `em-transactions-api` → `em-transactions-api-handbook`) and, if found, feeds its body to the model as background context. It's best-effort: if no vault is configured, no handbook matches, or the lookup fails, the review proceeds exactly as normal. You'll see `📖 Loaded engineering handbook context` and `handbook` in the mode line when it kicks in.
+For the built-in URL/DIR providers, LGTM looks for a note named `<repo>-handbook` (e.g. `em-transactions-api` → `em-transactions-api-handbook`) and **follows the knowledge graph one hop** — pulling in condensed handbooks for related systems (relations + backlinks; e.g. a change in `em-transactions-api` brings in `em-cis`, `em-budgets-api`). The `LGTM_BRAIN_CMD` provider lets a *different* brain implementation do its own lookup/navigation however it likes.
 
-> Don't have a second-brain vault? You can ignore this entirely — it changes nothing about how LGTM works for you.
+It's best-effort and **off by default**: if nothing is configured, no handbook matches, or a lookup fails (server down, timeout), the review proceeds exactly as normal. When it kicks in you'll see `📖 Loaded engineering handbook context` and `handbook` in the mode line.
+
+> Don't have a brain configured? You can ignore this entirely — it changes nothing about how LGTM works for you.
 
 ## Retrying Failed Uploads
 
