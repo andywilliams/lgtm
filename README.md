@@ -230,6 +230,30 @@ lgtm review 86 --full-context --usage-context
 
 This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
 
+## Handbook Context (optional)
+
+LGTM can enrich a review with domain knowledge about the repo being reviewed — known design constraints, gotchas, how the service is built, **and the related systems it touches** — pulled from an engineering "second-brain" knowledge base. This grounds the review in *why* the codebase is the way it is, not just the diff.
+
+The contract is deliberately tiny: **given a repo name, a "brain" returns markdown context.** LGTM ships three pluggable providers, tried in priority order — set any one:
+
+```bash
+# 1. Any command that prints context to stdout — the escape hatch for ANY brain,
+#    on any machine. Gets the repo as $LGTM_BRAIN_REPO and as the final argument.
+export LGTM_BRAIN_CMD="my-brain context"        # runs: my-brain context <repo>
+
+# 2. A second-brain HTTP API (pulls the handbook + its graph neighbours)
+export LGTM_BRAIN_URL="http://localhost:3101"
+
+# 3. A second-brain vault on disk (works with the server off)
+export LGTM_BRAIN_DIR="$HOME/development/tools/second-brain/vault"
+```
+
+For the built-in URL/DIR providers, LGTM looks for a note named `<repo>-handbook` (e.g. `em-transactions-api` → `em-transactions-api-handbook`) and **follows the knowledge graph one hop** — pulling in condensed handbooks for related systems (relations + backlinks; e.g. a change in `em-transactions-api` brings in `em-cis`, `em-budgets-api`). The `LGTM_BRAIN_CMD` provider lets a *different* brain implementation do its own lookup/navigation however it likes.
+
+It's best-effort and **off by default**: if nothing is configured, no handbook matches, or a lookup fails (server down, timeout), the review proceeds exactly as normal. When it kicks in you'll see `📖 Loaded engineering handbook context` and `handbook` in the mode line.
+
+> Don't have a brain configured? You can ignore this entirely — it changes nothing about how LGTM works for you.
+
 ## Retrying Failed Uploads
 
 If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:
