@@ -29,6 +29,7 @@ const TIMEOUT_MS = 2500;
 const HANDBOOK_MAX = 9000; // chars of the primary handbook
 const RELATED_MAX = 1400; // chars per related note
 const MAX_RELATED = 5; // how many neighbours to pull
+const MAX_ATTEMPTS = 14; // cap on resolve() calls regardless of hits — bounds worst-case latency
 const VAULT_SUBDIRS = ['memories', 'projects', 'people', 'areas', 'events'];
 const SKIP_TYPES = new Set(['area', 'person', 'event']); // hubs/people aren't useful as code context
 
@@ -90,11 +91,19 @@ function handbookFirst(ids: string[], repo: string): string[] {
 async function collectRelated(candIds: string[], repo: string, resolve: Resolver): Promise<NoteLite[]> {
   const related: NoteLite[] = [];
   const seen = new Set<string>([`${repo}-handbook`, repo]);
+  let attempts = 0; // count resolve() calls, not just hits, so a slow brain can't stall a review
   for (const cand of handbookFirst(candIds, repo)) {
-    if (related.length >= MAX_RELATED) break;
+    if (related.length >= MAX_RELATED || attempts >= MAX_ATTEMPTS) break;
     const rid = cand.endsWith('-handbook') ? cand : `${cand}-handbook`;
-    let note = seen.has(rid) ? null : await resolve(rid);
-    if (!note && !cand.endsWith('-handbook') && !seen.has(cand)) note = await resolve(cand);
+    let note: NoteLite | null = null;
+    if (!seen.has(rid)) {
+      attempts++;
+      note = await resolve(rid);
+    }
+    if (!note && !cand.endsWith('-handbook') && !seen.has(cand)) {
+      attempts++;
+      note = await resolve(cand);
+    }
     if (!note || !note.body.trim()) continue;
     markSeen(seen, rid);
     if (note.type && SKIP_TYPES.has(note.type)) continue;
@@ -168,7 +177,7 @@ async function fromUrl(base: string, repo: string): Promise<string> {
     // Gather one-hop neighbours from resolved relations + backlinks (present only).
     const ids: string[] = [];
     for (const r of Array.isArray(main.relations) ? main.relations : []) {
-      if (r?.id && r.present !== 0) ids.push(r.id);
+      if (r?.id && r.present !== 0 && r.present !== false) ids.push(r.id);
     }
     for (const b of Array.isArray(main.backlinks) ? main.backlinks : []) {
       if (b?.id) ids.push(b.id);
@@ -193,9 +202,13 @@ function readNoteFile(dir: string, id: string): NoteLite | null {
     const p = join(dir, sub, `${id}.md`);
     if (existsSync(p)) {
       const raw = readFileSync(p, 'utf-8');
-      const t = raw.match(/^title:\s*["']?(.+?)["']?\s*$/m);
-      const ty = raw.match(/^type:\s*([a-z]+)\s*$/m);
-      return { title: t ? t[1] : id, body: stripFrontmatter(raw), type: ty ? ty[1] : undefined };
+      const titleMatch = raw.match(/^title:\s*["']?(.+?)["']?\s*$/m);
+      const typeMatch = raw.match(/^type:\s*([a-z]+)\s*$/m);
+      return {
+        title: titleMatch ? titleMatch[1] : id,
+        body: stripFrontmatter(raw),
+        type: typeMatch ? typeMatch[1] : undefined,
+      };
     }
   }
   return null;
