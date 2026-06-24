@@ -230,6 +230,24 @@ lgtm review 86 --full-context --usage-context
 
 This gives the AI both the full modified files (for pattern analysis) and external usages (for breaking change detection).
 
+## Handbook Context (optional)
+
+LGTM can enrich a review with domain knowledge about the repo being reviewed — known design constraints, gotchas, how the service is built — pulled from an engineering handbook in a local **second-brain** knowledge vault. This grounds the review in *why* the codebase is the way it is, not just the diff.
+
+This is **off by default** and has no effect unless you point LGTM at a vault. Set one of:
+
+```bash
+# Read handbooks straight from the vault on disk (preferred — no server needed)
+export LGTM_BRAIN_DIR="$HOME/development/tools/second-brain/vault"
+
+# …or fetch them from the second-brain HTTP API
+export LGTM_BRAIN_URL="http://localhost:3101"
+```
+
+LGTM looks for a note named `<repo>-handbook` (e.g. `em-transactions-api` → `em-transactions-api-handbook`) and, if found, feeds its body to the model as background context. It's best-effort: if no vault is configured, no handbook matches, or the lookup fails, the review proceeds exactly as normal. You'll see `📖 Loaded engineering handbook context` and `handbook` in the mode line when it kicks in.
+
+> Don't have a second-brain vault? You can ignore this entirely — it changes nothing about how LGTM works for you.
+
 ## Retrying Failed Uploads
 
 If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:

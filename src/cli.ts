@@ -5,6 +5,7 @@ import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
@@ -29,6 +30,14 @@ program
   .name('lgtm')
   .description('AI-powered PR review CLI — you stay in control')
   .version('0.1.0');
+
+// Discoverable breadcrumb for the optional second-brain integration (off by default).
+program.addHelpText(
+  'after',
+  '\nOptional context:\n' +
+    '  Set LGTM_BRAIN_DIR to a second-brain vault path (or LGTM_BRAIN_URL to its API)\n' +
+    "  to enrich reviews with the repo's engineering handbook. No effect if unset.\n"
+);
 
 program
   .command('review <pr-number>')
@@ -293,15 +302,23 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
+  // Optional domain context from a local second-brain (opt-in via LGTM_BRAIN_DIR /
+  // LGTM_BRAIN_URL). No-op — and silent — for anyone who hasn't configured one.
+  const handbookContextStr = await fetchBrainContext(repo);
+  if (handbookContextStr) {
+    log(chalk.blue(`\n📖 Loaded engineering handbook context from second-brain`));
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
   const contextModes = [harshness + ' mode'];
   if (fullContext) contextModes.push('full context');
   if (usageContext && usageContextStr) contextModes.push('usage context');
   if (relatedFiles && expandedContextStr) contextModes.push('related files');
+  if (handbookContextStr) contextModes.push('handbook');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr);
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr);
 
   log(chalk.gray(`\n${result.summary}\n`));
 

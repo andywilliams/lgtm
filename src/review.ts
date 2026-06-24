@@ -45,7 +45,15 @@ IMPORTANT RULES:
 - Only comment on lines that are ADDED (start with + in the diff)
 - Use the line number shown after @@ in the diff hunk header for context
 - Be specific about what's wrong and how to fix it
-- Don't repeat yourself`;
+- Don't repeat yourself
+
+HUMAN READABILITY:
+Beyond correctness, consider whether a human can easily read and understand the added code. Flag readability problems such as:
+- Naming clarity: vague, misleading, or abbreviated names for variables, functions, or types
+- Function complexity: functions that are too long, deeply nested, or do too many things and should be broken up
+- Comments & intent: non-obvious logic that lacks a "why" comment, or code that fails to explain itself
+- Control flow clarity: convoluted conditionals, overly clever one-liners, or non-obvious flow that could be expressed more plainly
+When raising a readability issue, suggest the clearer alternative and use severity "SUGGESTION" (or "NITPICK" for trivial polish), never "BUG" or "SECURITY". Respect the harshness level below — at lower harshness these are suppressed.`;
 
 /**
  * Check if Claude CLI is available
@@ -92,7 +100,8 @@ export async function reviewPR(
   ai: AIProvider = 'claude',
   fileContents?: Record<string, string>,
   usageContext?: string,
-  expandedContext?: string
+  expandedContext?: string,
+  handbookContext?: string
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -120,6 +129,12 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
     expandedContextSection = expandedContext;
   }
 
+  // Add second-brain handbook (domain) context if provided
+  let handbookContextSection = '';
+  if (handbookContext) {
+    handbookContextSection = handbookContext;
+  }
+
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
 ## PR Title
@@ -132,7 +147,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${fileContextSection}${usageContextSection}${expandedContextSection}
+${handbookContextSection}${fileContextSection}${usageContextSection}${expandedContextSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
