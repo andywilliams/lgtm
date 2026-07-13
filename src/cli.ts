@@ -4,6 +4,7 @@ import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
+import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase } from './git.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -42,9 +43,11 @@ program.addHelpText(
 );
 
 program
-  .command('review <pr-number>')
-  .description('Review a pull request')
+  .command('review [pr-number]')
+  .description('Review a pull request (or local working-tree changes with --local)')
   .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('--local', 'Review local working-tree changes vs a base ref (no GitHub PR; never posts)', false)
+  .option('--base <ref>', 'Base ref for --local mode (default: auto-detected default branch)')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -56,8 +59,9 @@ program
   .option('--related-files', 'Include related files (imports, callers, tests, infra) discovered via static analysis', false)
   .option('--max-context', 'Shorthand: enables --full-context, --usage-context, and --related-files', false)
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
-  .action(async (prNumberStr: string, options) => {
+  .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
+    const local = options.local;
     // Agent mode is built on top of auto mode: same suppressed-output + JSON-to-stdout
     // machinery, but read-only and with a richer findings-focused payload.
     const auto = options.auto || agent;
@@ -74,9 +78,23 @@ program
       process.exit(1);
     }
 
-    const prNumber = parseInt(prNumberStr, 10);
-    if (isNaN(prNumber)) {
-      exitWithError('Invalid PR number');
+    // PR number is required unless we're in --local mode (which reviews the working tree).
+    let prNumber = 0;
+    if (!local) {
+      prNumber = parseInt(prNumberStr ?? '', 10);
+      if (isNaN(prNumber)) {
+        exitWithError('Invalid PR number (or pass --local to review working-tree changes)');
+      }
+    }
+
+    // Resolve the base ref for local mode up front so a bad base fails fast.
+    let base: string | undefined;
+    if (local) {
+      try {
+        base = options.base || detectDefaultBase();
+      } catch (e: any) {
+        exitWithError(e?.message ?? String(e));
+      }
     }
 
     const harshness = options.harshness as Harshness;
@@ -125,6 +143,8 @@ program
       await runReview({
         prNumber,
         repo: options.repo,
+        local,
+        base,
         harshness,
         dryRun: options.dryRun,
         batch,
@@ -162,6 +182,8 @@ program
 interface RunOptions {
   prNumber: number;
   repo?: string;
+  local: boolean;
+  base?: string;
   harshness: Harshness;
   dryRun: boolean;
   batch: boolean;
@@ -271,12 +293,16 @@ function recordReviewMetrics(opts: {
   expanded: { path: string; reason: string; content: string }[];
   relatedFiles: boolean;
   ai: AIProvider;
+  local?: boolean;
 }): number {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
+  // The metrics DB is keyed on GitHub PRs — skip persistence for local reviews (still
+  // return the token estimate so agent-mode output is populated).
+  if (local) return tokenEstimate;
   try {
     const repoName = repo || getRepoRoot();
     const changedFiles = getChangedFiles(prNumber, repo);
@@ -300,7 +326,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai } = options;
+  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -308,15 +334,19 @@ async function runReview(options: RunOptions): Promise<void> {
   const log = auto ? (..._args: any[]) => {} : console.log;
   const logErr = auto ? (..._args: any[]) => {} : console.error;
 
-  // Fetch PR details
-  log(chalk.blue(`\n🔍 Fetching PR #${prNumber}...`));
-  const pr = getPRDetails(prNumber, repo);
+  // Data sourcing: --local reads the working tree via git; otherwise the GitHub PR.
+  const changedFilesOf = (): string[] => (local ? getLocalChangedFiles(base!) : getChangedFiles(prNumber, repo));
+  const fileContentOf = (file: string): string | null => (local ? getLocalFileContent(file) : getFileContent(prNumber, file, repo));
+
+  // Fetch details
+  log(chalk.blue(`\n🔍 ${local ? `Analysing local changes (vs ${base})` : `Fetching PR #${prNumber}`}...`));
+  const pr = local ? getLocalDetails(base!) : getPRDetails(prNumber, repo);
   log(chalk.white(`   "${pr.title}" by ${pr.author}`));
   log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
 
   // Fetch diff
-  log(chalk.blue(`\n📄 Fetching diff...`));
-  const diff = getPRDiff(prNumber, repo);
+  log(chalk.blue(`\n📄 ${local ? 'Computing local diff' : 'Fetching diff'}...`));
+  const diff = local ? getLocalDiff(base!) : getPRDiff(prNumber, repo);
 
   // Truncate very large diffs
   const maxDiffLength = 50000;
@@ -328,14 +358,14 @@ async function runReview(options: RunOptions): Promise<void> {
   let fileContents: Record<string, string> | undefined;
   if (fullContext) {
     log(chalk.blue(`\n📁 Fetching full file contents...`));
-    const changedFiles = getChangedFiles(prNumber, repo);
+    const changedFiles = changedFilesOf();
     fileContents = {};
     for (const file of changedFiles) {
       // Skip very large files and non-code files
       if (file.endsWith('.lock') || file.endsWith('.json') && file.includes('package-lock')) {
         continue;
       }
-      const content = getFileContent(prNumber, file, repo);
+      const content = fileContentOf(file);
       if (content) {
         if (content.length > 300000) { // Skip files > 300KB
           log(chalk.yellow(`   ⊘ ${file} (too large: ${Math.round(content.length / 1024)}KB)`));
@@ -375,7 +405,7 @@ async function runReview(options: RunOptions): Promise<void> {
   let expanded: { path: string; reason: string; content: string }[] = [];
   if (relatedFiles) {
     log(chalk.blue(`\n📚 Finding related files (static analysis)...`));
-    const changedFiles = getChangedFiles(prNumber, repo);
+    const changedFiles = changedFilesOf();
     const repoRoot = getRepoRoot();
     expanded = await expandContext(changedFiles, repoRoot, {
       maxFiles: 20,
@@ -424,18 +454,21 @@ async function runReview(options: RunOptions): Promise<void> {
   // comments) and never post. The agent decides what to do with the results.
   if (agent) {
     // Fetch existing comments only to flag duplicates — best-effort, non-critical.
+    // Local mode has no PR, so there are no existing comments to dedupe against.
     let existingComments: ExistingReviewComment[] = [];
-    try {
-      existingComments = getExistingReviewComments(prNumber, repo);
-    } catch {
-      // If we can't fetch existing comments, return findings without duplicate flags.
+    if (!local) {
+      try {
+        existingComments = getExistingReviewComments(prNumber, repo);
+      } catch {
+        // If we can't fetch existing comments, return findings without duplicate flags.
+      }
     }
     const annotated: AnnotatedComment[] = result.comments.map((comment) => ({
       ...comment,
       duplicate: isDuplicateComment(comment, existingComments),
     }));
 
-    const tokenEstimate = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai });
+    const tokenEstimate = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai, local });
 
     console.log(formatAgentResult({
       success: true,
@@ -444,6 +477,41 @@ async function runReview(options: RunOptions): Promise<void> {
       relatedFiles: expanded,
       tokenEstimate,
     }));
+    return;
+  }
+
+  // Local mode is read-only — there is no PR to post to. Emit findings (JSON in auto mode,
+  // a rendered list otherwise) and stop before any dedup/posting logic.
+  if (local) {
+    if (auto) {
+      console.log(formatAutoResult({ success: true, dryRun: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: result.comments }));
+      return;
+    }
+    if (result.comments.length === 0) {
+      log(chalk.green('✓ LGTM — no issues found in local changes'));
+      return;
+    }
+    log(chalk.white(`Found ${result.comments.length} finding(s) — local, read-only:\n`));
+    for (let i = 0; i < result.comments.length; i++) {
+      const comment = result.comments[i];
+      const severityColor = SEVERITY_COLORS[comment.severity] || chalk.white;
+      const severityIcon = SEVERITY_ICONS[comment.severity] || '•';
+      log(chalk.white('─'.repeat(60)));
+      log(
+        chalk.white(`[${i + 1}/${result.comments.length}] `) +
+        severityIcon + ' ' +
+        severityColor(comment.severity) +
+        chalk.gray(` | ${comment.file}:${comment.line}`)
+      );
+      log(chalk.white('─'.repeat(60)));
+      log(chalk.bold(comment.title));
+      log(chalk.white(comment.body));
+      if (comment.suggestion) {
+        log(chalk.green('\nSuggested fix:'));
+        log(chalk.gray(comment.suggestion));
+      }
+      log();
+    }
     return;
   }
 
