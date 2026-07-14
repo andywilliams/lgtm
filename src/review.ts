@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
 export type AIProvider = 'claude' | 'codex';
 
@@ -53,7 +53,10 @@ Beyond correctness, consider whether a human can easily read and understand the 
 - Function complexity: functions that are too long, deeply nested, or do too many things and should be broken up
 - Comments & intent: non-obvious logic that lacks a "why" comment, or code that fails to explain itself
 - Control flow clarity: convoluted conditionals, overly clever one-liners, or non-obvious flow that could be expressed more plainly
-When raising a readability issue, suggest the clearer alternative and use severity "SUGGESTION" (or "NITPICK" for trivial polish), never "BUG" or "SECURITY". Respect the harshness level below — at lower harshness these are suppressed.`;
+When raising a readability issue, suggest the clearer alternative and use severity "SUGGESTION" (or "NITPICK" for trivial polish), never "BUG" or "SECURITY". Respect the harshness level below — at lower harshness these are suppressed.
+
+CLAIMS & CONVENTIONS — do not invent rules:
+You are reviewing from the diff and the provided context ONLY; you cannot browse the repository. So do NOT assert that a "project convention", "standard", "the codebase always does X", or similar exists unless it is directly evidenced in what you were given. If a finding depends on a convention you cannot see, phrase it conditionally ("if the project's convention is X, then…"), cap its severity at "SUGGESTION", and never state the convention as established fact. When unsure, under-claim rather than fabricate a rule — a confidently-wrong finding is worse than a missing one.`;
 
 /**
  * Check if Claude CLI is available
@@ -101,7 +104,8 @@ export async function reviewPR(
   fileContents?: Record<string, string>,
   usageContext?: string,
   expandedContext?: string,
-  handbookContext?: string
+  handbookContext?: string,
+  extra?: { scope?: string; decided?: DecidedFinding[] }
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -135,6 +139,29 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
     handbookContextSection = handbookContext;
   }
 
+  // Scope of the change (--scope): out-of-scope *quality* issues become follow-ups — but never
+  // downgrade a genuine bug/security risk just because it's out of scope, and defer to harshness.
+  let scopeSection = '';
+  if (extra?.scope) {
+    scopeSection = `\n## Scope of this change
+${extra.scope}
+
+For issues OUTSIDE this scope (pre-existing problems in the files you're touching, or unrelated concerns), prefix the title "(out of scope)". Treat out-of-scope *quality / style / improvement* issues as follow-ups at severity "SUGGESTION". But do NOT downgrade to hide risk — a genuine bug, crash, or security problem keeps "BUG"/"SECURITY" even when it is out of scope (just note it looks pre-existing). Focus your attention on the change itself, and still obey the harshness rules above: if they say not to emit suggestions, don't (that includes these out-of-scope follow-ups).
+`;
+  }
+
+  // Previously-dismissed findings (--decided): don't re-litigate settled points across a fix loop.
+  let decidedSection = '';
+  if (extra?.decided && extra.decided.length > 0) {
+    const items = extra.decided
+      .map((d) => `- ${d.file ? `${d.file}${d.line ? `:${d.line}` : ''} — ` : ''}"${d.title}" — dismissed because: ${d.reason}`)
+      .join('\n');
+    decidedSection = `\n## Already reviewed and dismissed — do NOT raise these again
+The following were raised in an earlier review round and deliberately dismissed for the stated reasons. Do NOT report them again unless the code has since changed in a way that clearly invalidates the reason:
+${items}
+`;
+  }
+
   const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
 
 ## PR Title
@@ -147,7 +174,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${handbookContextSection}${fileContextSection}${usageContextSection}${expandedContextSection}
+${handbookContextSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path

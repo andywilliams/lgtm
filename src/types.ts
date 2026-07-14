@@ -15,6 +15,17 @@ export interface ReviewResult {
   comments: ReviewComment[];
 }
 
+/**
+ * A finding raised in an earlier review round and deliberately dismissed. Fed back into a later
+ * round (via `--decided`) so the reviewer doesn't re-raise settled points across a fix-review loop.
+ */
+export interface DecidedFinding {
+  file?: string;
+  line?: number;
+  title: string;
+  reason: string;
+}
+
 export interface PRDetails {
   number: number;
   title: string;

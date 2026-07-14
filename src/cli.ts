@@ -3,6 +3,7 @@
 import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
+import { readFileSync } from 'node:fs';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
 import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase } from './git.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
@@ -11,7 +12,7 @@ import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } fr
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment } from './types.js';
+import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding } from './types.js';
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
   BUG: chalk.red,
@@ -48,6 +49,8 @@ program
   .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
   .option('--local', 'Review local working-tree changes vs a base ref (no GitHub PR; never posts)', false)
   .option('--base <ref>', 'Base ref for --local mode (default: auto-detected default branch)')
+  .option('--scope <text>', 'What this change is meant to do — out-of-scope quality issues become SUGGESTION follow-ups (genuine bugs/security are still flagged)')
+  .option('--decided <file>', 'JSON file of previously-dismissed findings ({file?,line?,title,reason}[]) the reviewer must not re-raise')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -139,6 +142,24 @@ program
     const usageContext = options.usageContext || options.maxContext || agent;
     const relatedFiles = options.relatedFiles || options.context || options.maxContext || agent;
 
+    // Previously-dismissed findings for the fix-review loop (--decided). Best-effort: a bad or
+    // missing file must not kill the review.
+    let decided: DecidedFinding[] | undefined;
+    if (options.decided) {
+      try {
+        const parsed = JSON.parse(readFileSync(options.decided, 'utf-8'));
+        if (Array.isArray(parsed)) {
+          decided = parsed.filter((d: any) => d && typeof d.title === 'string' && typeof d.reason === 'string');
+        } else {
+          console.error(chalk.yellow('⚠  Ignoring --decided file (expected a JSON array)'));
+        }
+      } catch (e: any) {
+        // Warn on stderr even in auto/agent mode — stderr isn't part of the stdout JSON contract, so an
+        // agent driving the loop can still see that its dismissed-findings feedback was dropped.
+        console.error(chalk.yellow(`⚠  Ignoring --decided file (${e?.message ?? e})`));
+      }
+    }
+
     try {
       await runReview({
         prNumber,
@@ -154,6 +175,8 @@ program
         usageContext,
         relatedFiles,
         ai,
+        scope: options.scope,
+        decided,
       });
     } catch (error: any) {
       if (agent) {
@@ -193,6 +216,8 @@ interface RunOptions {
   usageContext: boolean;
   relatedFiles: boolean;
   ai: AIProvider;
+  scope?: string;
+  decided?: DecidedFinding[];
 }
 
 function formatReviewCommentBody(comment: ReviewComment): string {
@@ -326,7 +351,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai } = options;
+  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -446,7 +471,7 @@ async function runReview(options: RunOptions): Promise<void> {
   if (handbookContextStr) contextModes.push('handbook');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr);
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided });
 
   log(chalk.gray(`\n${result.summary}\n`));
 
