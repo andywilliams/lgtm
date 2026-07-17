@@ -281,10 +281,12 @@ function sliceBalancedObject(s: string): string | null {
  * JSON (a fenced ```json block if present, else the first balanced object) then
  * tries a strict parse, falling back to jsonrepair — which fixes the truncated /
  * malformed JSON (unclosed strings, missing braces, trailing commas) that a raw
- * JSON.parse rejects and that used to fail the WHOLE review. Returns null only
- * if even repair can't recover an object.
+ * JSON.parse rejects and that used to fail the WHOLE review. Returns
+ * `{ value, recovered }`: `value` is the parsed object (null only if even repair
+ * can't recover one), and `recovered` is true when jsonrepair had to salvage it —
+ * so callers (notably agent mode) can flag that the result may be partial.
  */
-export function extractJsonObject(output: string): any | null {
+export function extractJsonObject(output: string): { value: any | null; recovered: boolean } {
   const asObject = (v: unknown): any | null =>
     v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
   // Candidate payloads: the first balanced object from a fenced ```json block
@@ -299,7 +301,7 @@ export function extractJsonObject(output: string): any | null {
   for (const c of candidates) {
     try {
       const o = asObject(JSON.parse(c));
-      if (o) return o;
+      if (o) return { value: o, recovered: false };
     } catch { /* fall through to repair */ }
   }
   for (const c of candidates) {
@@ -307,11 +309,11 @@ export function extractJsonObject(output: string): any | null {
       const o = asObject(JSON.parse(jsonrepair(c)));
       if (o) {
         console.warn('lgtm: model JSON was malformed — recovered via jsonrepair (result may be partial).');
-        return o;
+        return { value: o, recovered: true };
       }
     } catch { /* try next candidate */ }
   }
-  return null;
+  return { value: null, recovered: false };
 }
 
 /** Last-ditch salvage: pull the summary string out of an unparseable response. */
@@ -329,7 +331,7 @@ function salvageSummary(output: string): string | null {
  * Parse AI response into ReviewResult
  */
 function parseAIResponse(output: string): ReviewResult {
-  const parsed = extractJsonObject(output);
+  const { value: parsed, recovered } = extractJsonObject(output);
   if (!parsed) {
     const summary = salvageSummary(output);
     console.error('Failed to parse AI response as JSON (even after repair)');
@@ -339,6 +341,7 @@ function parseAIResponse(output: string): ReviewResult {
   const result = parsed as ReviewResult;
   // Validate and normalize comments
   result.comments = (result.comments || []).map(normalizeComment);
+  if (recovered) result.recovered = true;
   return result;
 }
 
@@ -432,7 +435,8 @@ Include a result for every comment listed above.`;
  * Parse AI response for recheck results
  */
 function parseRecheckResponse(output: string, comments: ExistingComment[]): RecheckResponse {
-  const parsed = extractJsonObject(output);
+  // `recovered` is intentionally dropped here — only agent-mode review output flags partial results.
+  const { value: parsed } = extractJsonObject(output);
   if (!parsed) {
     console.error('Failed to parse recheck response (even after repair)');
     console.error('Raw response:', output.slice(0, 500));
@@ -556,7 +560,8 @@ The "correctIndex" is 0-based (0 = first option, 3 = last option). Ensure exactl
  * Parse AI response into QuizResult
  */
 function parseQuizResponse(output: string): QuizResult {
-  const parsed = extractJsonObject(output);
+  // `recovered` is intentionally dropped here — only agent-mode review output flags partial results.
+  const { value: parsed } = extractJsonObject(output);
   if (!parsed) {
     console.error('Failed to parse quiz response as JSON (even after repair)');
     console.error('Raw response:', output.slice(0, 500));
