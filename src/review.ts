@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import { jsonrepair } from 'jsonrepair';
 import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
 export type AIProvider = 'claude' | 'codex';
@@ -249,39 +250,78 @@ If no issues found, respond with:
 }
 
 /**
+ * Slice the first brace-balanced JSON object out of a string, tracking string
+ * state so braces inside strings don't count. Returns the exact object, or — if
+ * it's truncated (no matching close) — the tail from the first '{' for repair.
+ */
+function sliceBalancedObject(s: string): string | null {
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  let inStr = false;
+  let esc = false;
+  let depth = 0;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') inStr = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return s.slice(start); // truncated — no matching close; caller repairs
+}
+
+/**
+ * Turn a model's free-text output into a JSON object, robustly. Extracts the
+ * JSON (a fenced ```json block if present, else the first balanced object) then
+ * tries a strict parse, falling back to jsonrepair — which fixes the truncated /
+ * malformed JSON (unclosed strings, missing braces, trailing commas) that a raw
+ * JSON.parse rejects and that used to fail the WHOLE review. Returns null only
+ * if even repair can't recover an object.
+ */
+export function extractJsonObject(output: string): any | null {
+  const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = sliceBalancedObject(fenced ? fenced[1] : output) ?? sliceBalancedObject(output);
+  if (!candidate) return null;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    try {
+      const recovered = JSON.parse(jsonrepair(candidate));
+      console.warn('lgtm: model JSON was malformed — recovered via jsonrepair (review may be partial).');
+      return recovered;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** Last-ditch salvage: pull the summary string out of an unparseable response. */
+function salvageSummary(output: string): string | null {
+  const m = output.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  return m ? m[1] : null;
+}
+
+/**
  * Parse AI response into ReviewResult
  */
 function parseAIResponse(output: string): ReviewResult {
-  let jsonStr = output.trim();
-
-  // First, try to extract from markdown code blocks
-  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1].trim();
-  }
-
-  // Try to find a JSON object that starts with {"summary" which is our expected format
-  const summaryMatch = jsonStr.match(/\{"summary"[\s\S]*\}/);
-  if (summaryMatch) {
-    jsonStr = summaryMatch[0];
-  } else {
-    // Fallback: try to find any JSON object
-    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonObjectMatch) {
-      jsonStr = jsonObjectMatch[0];
-    }
-  }
-
-  try {
-    const result = JSON.parse(jsonStr.trim()) as ReviewResult;
-    // Validate and normalize comments
-    result.comments = (result.comments || []).map(normalizeComment);
-    return result;
-  } catch (parseError) {
-    console.error('Failed to parse AI response as JSON');
+  const parsed = extractJsonObject(output);
+  if (!parsed) {
+    const summary = salvageSummary(output);
+    console.error('Failed to parse AI response as JSON (even after repair)');
     console.error('Raw response:', output.slice(0, 500));
-    throw new Error('Failed to parse review response from AI');
+    throw new Error(`Failed to parse review response from AI${summary ? ` — model summary was: ${summary.slice(0, 200)}` : ''}`);
   }
+  const result = parsed as ReviewResult;
+  // Validate and normalize comments
+  result.comments = (result.comments || []).map(normalizeComment);
+  return result;
 }
 
 /**
@@ -374,42 +414,25 @@ Include a result for every comment listed above.`;
  * Parse AI response for recheck results
  */
 function parseRecheckResponse(output: string, comments: ExistingComment[]): RecheckResponse {
-  let jsonStr = output.trim();
-
-  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1].trim();
-  }
-
-  const summaryMatch = jsonStr.match(/\{"summary"[\s\S]*\}/);
-  if (summaryMatch) {
-    jsonStr = summaryMatch[0];
-  } else {
-    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonObjectMatch) {
-      jsonStr = jsonObjectMatch[0];
-    }
-  }
-
-  try {
-    const result = JSON.parse(jsonStr.trim()) as RecheckResponse;
-    const validStatuses: CommentStatus[] = ['still_valid', 'resolved', 'outdated'];
-    const commentIds = new Set(comments.map(c => c.id));
-
-    result.results = (result.results || [])
-      .filter((r: RecheckResult) => commentIds.has(r.commentId))
-      .map((r: RecheckResult) => ({
-        commentId: r.commentId,
-        status: validStatuses.includes(r.status) ? r.status : 'still_valid',
-        reason: String(r.reason || ''),
-      }));
-
-    return result;
-  } catch {
-    console.error('Failed to parse recheck response');
+  const parsed = extractJsonObject(output);
+  if (!parsed) {
+    console.error('Failed to parse recheck response (even after repair)');
     console.error('Raw response:', output.slice(0, 500));
     throw new Error('Failed to parse recheck response from AI');
   }
+  const result = parsed as RecheckResponse;
+  const validStatuses: CommentStatus[] = ['still_valid', 'resolved', 'outdated'];
+  const commentIds = new Set(comments.map(c => c.id));
+
+  result.results = (result.results || [])
+    .filter((r: RecheckResult) => commentIds.has(r.commentId))
+    .map((r: RecheckResult) => ({
+      commentId: r.commentId,
+      status: validStatuses.includes(r.status) ? r.status : 'still_valid',
+      reason: String(r.reason || ''),
+    }));
+
+  return result;
 }
 
 /**
@@ -515,32 +538,15 @@ The "correctIndex" is 0-based (0 = first option, 3 = last option). Ensure exactl
  * Parse AI response into QuizResult
  */
 function parseQuizResponse(output: string): QuizResult {
-  let jsonStr = output.trim();
-
-  const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonStr = jsonMatch[1].trim();
-  }
-
-  const questionsMatch = jsonStr.match(/\{"questions"[\s\S]*\}/);
-  if (questionsMatch) {
-    jsonStr = questionsMatch[0];
-  } else {
-    const jsonObjectMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (jsonObjectMatch) {
-      jsonStr = jsonObjectMatch[0];
-    }
-  }
-
-  try {
-    const result = JSON.parse(jsonStr.trim()) as QuizResult;
-    result.questions = (result.questions || []).map(normalizeQuestion);
-    return result;
-  } catch {
-    console.error('Failed to parse quiz response as JSON');
+  const parsed = extractJsonObject(output);
+  if (!parsed) {
+    console.error('Failed to parse quiz response as JSON (even after repair)');
     console.error('Raw response:', output.slice(0, 500));
     throw new Error('Failed to parse quiz response from AI');
   }
+  const result = parsed as QuizResult;
+  result.questions = (result.questions || []).map(normalizeQuestion);
+  return result;
 }
 
 function normalizeQuestion(q: any): QuizQuestion {
