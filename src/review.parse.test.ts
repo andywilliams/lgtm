@@ -7,6 +7,7 @@ import { extractJsonObject } from "./review.js";
 describe("extractJsonObject", () => {
   it("parses clean JSON", () => {
     const r = extractJsonObject('{"summary":"ok","comments":[{"file":"a.js"}]}');
+    assert.ok(r);
     assert.strictEqual(r.summary, "ok");
     assert.strictEqual(r.comments.length, 1);
   });
@@ -15,7 +16,9 @@ describe("extractJsonObject", () => {
     const r = extractJsonObject('{"summary":"ok","comments":[{"file":"a.js","body":"cut off her');
     assert.ok(r);
     assert.strictEqual(r.summary, "ok");
-    assert.ok(Array.isArray(r.comments));
+    // the partially-recovered finding must SURVIVE repair, not be silently dropped
+    assert.strictEqual(r.comments.length, 1);
+    assert.strictEqual(r.comments[0].file, "a.js");
   });
 
   it("ignores prose around the object", () => {

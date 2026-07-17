@@ -285,26 +285,44 @@ function sliceBalancedObject(s: string): string | null {
  * if even repair can't recover an object.
  */
 export function extractJsonObject(output: string): any | null {
+  const asObject = (v: unknown): any | null =>
+    v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null;
+  // Candidate payloads: the first balanced object from a fenced ```json block
+  // (if any) AND from the raw output. Try to PARSE each — strict first, then
+  // repair — and take the first that yields an object. This way a stray fenced
+  // snippet (a diff/suggestion containing braces) can't win over the real
+  // payload, and jsonrepair can't manufacture a plausible-but-wrong non-object.
   const fenced = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = sliceBalancedObject(fenced ? fenced[1] : output) ?? sliceBalancedObject(output);
-  if (!candidate) return null;
-  try {
-    return JSON.parse(candidate);
-  } catch {
+  const candidates = [fenced?.[1], output]
+    .map((s) => (s ? sliceBalancedObject(s) : null))
+    .filter((s): s is string => s !== null);
+  for (const c of candidates) {
     try {
-      const recovered = JSON.parse(jsonrepair(candidate));
-      console.warn('lgtm: model JSON was malformed — recovered via jsonrepair (review may be partial).');
-      return recovered;
-    } catch {
-      return null;
-    }
+      const o = asObject(JSON.parse(c));
+      if (o) return o;
+    } catch { /* fall through to repair */ }
   }
+  for (const c of candidates) {
+    try {
+      const o = asObject(JSON.parse(jsonrepair(c)));
+      if (o) {
+        console.warn('lgtm: model JSON was malformed — recovered via jsonrepair (result may be partial).');
+        return o;
+      }
+    } catch { /* try next candidate */ }
+  }
+  return null;
 }
 
 /** Last-ditch salvage: pull the summary string out of an unparseable response. */
 function salvageSummary(output: string): string | null {
-  const m = output.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  return m ? m[1] : null;
+  const m = output.match(/"summary"\s*:\s*("(?:[^"\\]|\\.)*")/);
+  if (!m) return null;
+  try {
+    return JSON.parse(m[1]) as string; // unescape \n, \" etc.
+  } catch {
+    return null;
+  }
 }
 
 /**
