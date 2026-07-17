@@ -13,6 +13,12 @@ export interface ReviewComment {
 export interface ReviewResult {
   summary: string;
   comments: ReviewComment[];
+  /**
+   * True when the model's JSON was malformed and had to be recovered via jsonrepair — the
+   * result may be partial (e.g. a truncated final finding). Surfaced in agent-mode output so
+   * a driving agent knows the review was salvaged, not clean.
+   */
+  recovered?: boolean;
 }
 
 /**

@@ -279,6 +279,7 @@ function formatAgentResult(options: {
   comments: AnnotatedComment[];
   relatedFiles?: { path: string; reason: string }[];
   tokenEstimate?: number;
+  recovered?: boolean;
   error?: string;
 }): string {
   const duplicates = options.comments.filter(c => c.duplicate).length;
@@ -287,6 +288,9 @@ function formatAgentResult(options: {
     mode: 'agent',
     summary: options.summary,
     posted: false,
+    // True when the model's JSON was salvaged via jsonrepair — the review may be partial
+    // (e.g. a truncated final finding), so a driving agent should treat it with suspicion.
+    recovered: options.recovered ?? false,
     commentsFound: options.comments.length,
     duplicates,
     comments: options.comments.map(c => ({
@@ -501,6 +505,7 @@ async function runReview(options: RunOptions): Promise<void> {
       comments: annotated,
       relatedFiles: expanded,
       tokenEstimate,
+      recovered: result.recovered,
     }));
     return;
   }
