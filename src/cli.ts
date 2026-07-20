@@ -136,9 +136,11 @@ program
     // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
     // its escape codes and then blocks forever waiting for keypresses that can never arrive —
     // the "hang with no interface". Degrade to read-only so we still show the findings and exit
-    // cleanly. Explicit non-interactive modes (--auto/--agent/--batch/--dry-run) are untouched.
+    // cleanly. Explicit non-interactive modes (--auto/--agent/--batch/--dry-run) are untouched,
+    // and --local is skipped — it never posts under any flag, so the "to post…" hint would just
+    // mislead (its read-only path already prints findings without prompting).
     let dryRun = Boolean(options.dryRun);
-    if (!auto && !batch && !dryRun && !process.stdin.isTTY) {
+    if (!local && !auto && !batch && !dryRun && !process.stdin.isTTY) {
       console.error(chalk.yellow(
         '⚠  stdin is not an interactive terminal — showing findings read-only (nothing will be posted).\n' +
         '   To post, rerun in a terminal, or use --batch (post all) / --auto / --agent (JSON output).'
@@ -1151,11 +1153,14 @@ program
 
     // Re-uploading posts to the PR, so it needs an explicit confirmation. On non-TTY stdin
     // we can't ask — the comments are listed above; keep the cache and stop rather than hang.
+    // Signal a non-zero exit (like the quiz guard) so a script can tell this no-op apart from
+    // a successful upload; process.exitCode (not process.exit) lets buffered output flush.
     if (!process.stdin.isTTY) {
       console.error(chalk.yellow(
         '⚠  stdin is not an interactive terminal — not re-uploading (cache kept).\n' +
         '   Rerun `lgtm retry` in a terminal to confirm the upload.'
       ));
+      process.exitCode = 1;
       return;
     }
 
