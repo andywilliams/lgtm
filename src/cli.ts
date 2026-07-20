@@ -132,6 +132,20 @@ program
 
     const batch = auto || options.batch;
 
+    // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
+    // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
+    // its escape codes and then blocks forever waiting for keypresses that can never arrive —
+    // the "hang with no interface". Degrade to read-only so we still show the findings and exit
+    // cleanly. Explicit non-interactive modes (--auto/--agent/--batch/--dry-run) are untouched.
+    let dryRun = Boolean(options.dryRun);
+    if (!auto && !batch && !dryRun && !process.stdin.isTTY) {
+      console.error(chalk.yellow(
+        '⚠  stdin is not an interactive terminal — showing findings read-only (nothing will be posted).\n' +
+        '   To post, rerun in a terminal, or use --batch (post all) / --auto / --agent (JSON output).'
+      ));
+      dryRun = true;
+    }
+
     // Back-compat: --context is the deprecated name for --related-files.
     if (options.context && !options.relatedFiles) {
       console.error(chalk.yellow('⚠  --context is deprecated; use --related-files instead.'));
@@ -167,7 +181,7 @@ program
         local,
         base,
         harshness,
-        dryRun: options.dryRun,
+        dryRun,
         batch,
         auto,
         agent,
@@ -795,6 +809,18 @@ program
 
     const batch = auto || options.batch;
 
+    // Like `review`, interactive recheck prompts per comment. Non-TTY stdin can't drive
+    // prompts() (it would hang), so fall back to read-only: show the recheck results and
+    // resolve nothing. --auto/--batch/--dry-run stay non-interactive as chosen.
+    let dryRun = Boolean(options.dryRun);
+    if (!auto && !batch && !dryRun && !process.stdin.isTTY) {
+      console.error(chalk.yellow(
+        '⚠  stdin is not an interactive terminal — showing recheck results read-only (nothing will be resolved).\n' +
+        '   To resolve, rerun in a terminal, or use --batch (resolve all) / --auto (JSON output).'
+      ));
+      dryRun = true;
+    }
+
     try {
       await runRecheck({
         prNumber,
@@ -802,7 +828,7 @@ program
         ai,
         batch,
         auto,
-        dryRun: options.dryRun,
+        dryRun,
         author: options.author,
       });
     } catch (error: any) {
@@ -1123,6 +1149,16 @@ program
       console.log(chalk.gray(`  • ${c.file}:${c.line}`));
     }
 
+    // Re-uploading posts to the PR, so it needs an explicit confirmation. On non-TTY stdin
+    // we can't ask — the comments are listed above; keep the cache and stop rather than hang.
+    if (!process.stdin.isTTY) {
+      console.error(chalk.yellow(
+        '⚠  stdin is not an interactive terminal — not re-uploading (cache kept).\n' +
+        '   Rerun `lgtm retry` in a terminal to confirm the upload.'
+      ));
+      return;
+    }
+
     const confirm = await prompts({
       type: 'confirm',
       name: 'value',
@@ -1185,6 +1221,14 @@ program
     const questionCount = parseInt(options.questions, 10);
     if (isNaN(questionCount) || questionCount < 1 || questionCount > 10) {
       console.error(chalk.red('Question count must be between 1 and 10'));
+      process.exit(1);
+    }
+
+    // A comprehension quiz is inherently interactive — there's nothing to degrade to. Refuse
+    // up front on non-TTY stdin so we don't spend an AI call generating a quiz that can't be
+    // taken (and so prompts() never hangs).
+    if (!process.stdin.isTTY) {
+      console.error(chalk.red('The quiz needs an interactive terminal, but stdin is not a TTY. Run `lgtm quiz` directly in your terminal.'));
       process.exit(1);
     }
 
