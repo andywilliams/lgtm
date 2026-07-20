@@ -2,6 +2,29 @@ import { execSync } from 'child_process';
 import type { PRDetails, ExistingComment, ExistingReviewComment } from './types.js';
 
 /**
+ * Translate a raw `gh` failure into an actionable message.
+ *
+ * Without --repo, `gh` resolves the repository from the current directory's git remote. Run it
+ * outside a git checkout (or in one with no GitHub remote) and it fails with git's raw
+ * "not a git repository" / "no git remotes" text — which reads like a git or auth problem when
+ * it actually just means "I don't know which repo you mean". Detect that specific case (only
+ * when no --repo was supplied) and explain the real fix. Every other error falls through to the
+ * original "GitHub CLI error: …" wrapping, with the command kept for debugging.
+ */
+export function friendlyGhError(rawMessage: string, repo: string | undefined, cmd: string): string {
+  const noRepoResolved = /not a git repository|no git remotes|none of the git remotes/i.test(rawMessage);
+  if (!repo && noRepoResolved) {
+    return (
+      'Could not determine which repository to use: no --repo was given and the current ' +
+      'directory is not a git checkout (or it has no GitHub remote).\n' +
+      'Fix: run lgtm from inside the repository, or pass --repo owner/repo ' +
+      '(e.g. --repo EqualsGroup/em-transactions-api).'
+    );
+  }
+  return `GitHub CLI error: ${rawMessage}\nCommand: ${cmd}`;
+}
+
+/**
  * Execute a gh CLI command and return the output
  */
 function gh(args: string, repo?: string): string {
@@ -10,7 +33,7 @@ function gh(args: string, repo?: string): string {
   try {
     return execSync(cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (error: any) {
-    throw new Error(`GitHub CLI error: ${error.message}\nCommand: ${cmd}`);
+    throw new Error(friendlyGhError(error?.message ?? String(error), repo, cmd));
   }
 }
 
