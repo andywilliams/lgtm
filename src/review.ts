@@ -1,8 +1,10 @@
-import { execSync } from 'child_process';
 import { jsonrepair } from 'jsonrepair';
+import { runAIPrompt, type AIProvider } from './ai.js';
 import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
-export type AIProvider = 'claude' | 'codex';
+// Provider plumbing lives in ai.ts; re-exported here so existing importers keep working.
+export { checkClaudeCli, checkCodexCli, getAvailableProviders } from './ai.js';
+export type { AIProvider };
 
 const HARSHNESS_PROMPTS: Record<Harshness, string> = {
   chill: `Only flag issues that are:
@@ -60,40 +62,6 @@ CLAIMS & CONVENTIONS — do not invent rules:
 You are reviewing from the diff and the provided context ONLY; you cannot browse the repository. So do NOT assert that a "project convention", "standard", "the codebase always does X", or similar exists unless it is directly evidenced in what you were given. If a finding depends on a convention you cannot see, phrase it conditionally ("if the project's convention is X, then…"), cap its severity at "SUGGESTION", and never state the convention as established fact. When unsure, under-claim rather than fabricate a rule — a confidently-wrong finding is worse than a missing one.`;
 
 /**
- * Check if Claude CLI is available
- */
-export function checkClaudeCli(): boolean {
-  try {
-    execSync('claude --version', { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Check if Codex CLI is available
- */
-export function checkCodexCli(): boolean {
-  try {
-    execSync('codex --version', { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Check which AI providers are available
- */
-export function getAvailableProviders(): AIProvider[] {
-  const providers: AIProvider[] = [];
-  if (checkClaudeCli()) providers.push('claude');
-  if (checkCodexCli()) providers.push('codex');
-  return providers;
-}
-
-/**
  * Review a PR diff using specified AI CLI
  */
 export async function reviewPR(
@@ -106,7 +74,7 @@ export async function reviewPR(
   usageContext?: string,
   expandedContext?: string,
   handbookContext?: string,
-  extra?: { scope?: string; decided?: DecidedFinding[] }
+  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string }
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -151,6 +119,15 @@ For issues OUTSIDE this scope (pre-existing problems in the files you're touchin
 `;
   }
 
+  // In-repo architecture charter (--auto-detected): one conformance check, not a gate.
+  let charterSection = '';
+  if (extra?.charter) {
+    charterSection = `${extra.charter}
+### Charter conformance rule
+The charter above is context for ONE extra check only: if this diff (a) contradicts a stated invariant or scope boundary, or (b) visibly changes a responsibility, interface, or dependency the charter records — without updating the charter in the same diff — add ONE finding: severity "SUGGESTION", title prefixed "(charter)", body citing the specific charter line, anchored to the most relevant added line. At most one such finding per review; if the diff does not clearly do either, add nothing. This is a nudge to keep the charter honest, not a gate — architectural review proper is a separate tool (\`lgtm arch\`).
+`;
+  }
+
   // Previously-dismissed findings (--decided): don't re-litigate settled points across a fix loop.
   let decidedSection = '';
   if (extra?.decided && extra.decided.length > 0) {
@@ -175,7 +152,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${handbookContextSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
+${handbookContextSection}${charterSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
@@ -193,60 +170,8 @@ If no issues found, respond with:
 
   const fullPrompt = `${SYSTEM_PROMPT}\n\n${userPrompt}`;
 
-  // Write prompt to temp file to avoid shell escaping issues
-  const fs = await import('fs');
-  const os = await import('os');
-  const path = await import('path');
-  
-  const tempFile = path.join(os.tmpdir(), `lgtm-prompt-${Date.now()}.txt`);
-  fs.writeFileSync(tempFile, fullPrompt);
-
-  try {
-    let output: string;
-    
-    if (ai === 'codex') {
-      // Use codex exec with stdin input (-), output last message to temp file
-      const outputFile = tempFile + '.out';
-      try {
-        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        output = fs.readFileSync(outputFile, 'utf-8');
-      } finally {
-        try { fs.unlinkSync(outputFile); } catch {}
-      }
-    } else {
-      // Use claude CLI with --print flag to get output directly
-      output = execSync(`claude --print < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-    }
-
-    // Clean up temp file
-    fs.unlinkSync(tempFile);
-
-    // Parse JSON from response
-    return parseAIResponse(output);
-  } catch (error: any) {
-    // Clean up temp file on error
-    try {
-      const fs = await import('fs');
-      fs.unlinkSync(tempFile);
-    } catch {}
-
-    if (error.message?.includes('not found') || error.code === 'ENOENT') {
-      const cliName = ai === 'codex' ? 'Codex' : 'Claude';
-      const installCmd = ai === 'codex' 
-        ? 'npm install -g @openai/codex' 
-        : 'npm install -g @anthropic-ai/claude-code';
-      throw new Error(`${cliName} CLI not found. Install it: ${installCmd}`);
-    }
-    throw error;
-  }
+  const output = runAIPrompt(fullPrompt, ai, 'review');
+  return parseAIResponse(output);
 }
 
 /**
@@ -393,42 +318,8 @@ OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text bef
 
 Include a result for every comment listed above.`;
 
-  const fs = await import('fs');
-  const os = await import('os');
-  const path = await import('path');
-
-  const tempFile = path.join(os.tmpdir(), `lgtm-recheck-${Date.now()}.txt`);
-  fs.writeFileSync(tempFile, prompt);
-
-  try {
-    let output: string;
-
-    if (ai === 'codex') {
-      const outputFile = tempFile + '.out';
-      try {
-        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        output = fs.readFileSync(outputFile, 'utf-8');
-      } finally {
-        try { fs.unlinkSync(outputFile); } catch {}
-      }
-    } else {
-      output = execSync(`claude --print < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-    }
-
-    fs.unlinkSync(tempFile);
-    return parseRecheckResponse(output, comments);
-  } catch (error: any) {
-    try { fs.unlinkSync(tempFile); } catch {}
-    throw error;
-  }
+  const output = runAIPrompt(prompt, ai, 'recheck');
+  return parseRecheckResponse(output, comments);
 }
 
 /**
@@ -511,49 +402,8 @@ OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text bef
 
 The "correctIndex" is 0-based (0 = first option, 3 = last option). Ensure exactly ${questionCount} questions.`;
 
-  const fs = await import('fs');
-  const os = await import('os');
-  const path = await import('path');
-
-  const tempFile = path.join(os.tmpdir(), `lgtm-quiz-${Date.now()}.txt`);
-  fs.writeFileSync(tempFile, prompt);
-
-  try {
-    let output: string;
-
-    if (ai === 'codex') {
-      const outputFile = tempFile + '.out';
-      try {
-        execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
-          encoding: 'utf-8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        output = fs.readFileSync(outputFile, 'utf-8');
-      } finally {
-        try { fs.unlinkSync(outputFile); } catch {}
-      }
-    } else {
-      output = execSync(`claude --print < "${tempFile}"`, {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        maxBuffer: 10 * 1024 * 1024,
-      });
-    }
-
-    fs.unlinkSync(tempFile);
-    return parseQuizResponse(output);
-  } catch (error: any) {
-    try { (await import('fs')).unlinkSync(tempFile); } catch {}
-    if (error.message?.includes('not found') || error.code === 'ENOENT') {
-      const cliName = ai === 'codex' ? 'Codex' : 'Claude';
-      const installCmd = ai === 'codex'
-        ? 'npm install -g @openai/codex'
-        : 'npm install -g @anthropic-ai/claude-code';
-      throw new Error(`${cliName} CLI not found. Install it: ${installCmd}`);
-    }
-    throw error;
-  }
+  const output = runAIPrompt(prompt, ai, 'quiz');
+  return parseQuizResponse(output);
 }
 
 /**

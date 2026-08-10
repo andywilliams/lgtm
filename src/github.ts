@@ -147,6 +147,25 @@ export function postBatchReview(
 }
 
 /**
+ * Post a single top-level (issue-style) comment on a PR. Used by `lgtm arch`, whose
+ * output is one summary comment by design — never inline review comments. The body
+ * goes via stdin (--body-file -) so markdown/quotes survive untouched.
+ */
+export function postIssueComment(prNumber: number, body: string, repo?: string): void {
+  const repoFlag = repo ? `-R ${repo}` : '';
+  const cmd = `gh pr comment ${prNumber} --body-file - ${repoFlag}`.trim();
+  try {
+    execSync(cmd, {
+      input: body,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error: any) {
+    throw new Error(friendlyGhError(error?.message ?? String(error), repo, cmd));
+  }
+}
+
+/**
  * Backward-compatible alias for old submit API
  */
 export function submitReview(
