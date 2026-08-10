@@ -236,20 +236,48 @@ export async function runArchNew(options: ArchNewOptions): Promise<void> {
   const turns: InterviewTurn[] = [];
   let draft: DraftResult | null = null;
   let finishRequested = false;
+  let forcedDraftAttempts = 0; // model asked again after being told to draft
+  let parseFailures = 0; // consecutive unusable model turns
+
+  // The human's typed answers are the expensive part of this loop — never let a bad
+  // model turn discard them. Parse failures retry (bounded); if we give up, the
+  // transcript is printed so the answers survive the error.
+  const bail = (error: unknown): never => {
+    if (turns.length > 0) {
+      console.error(chalk.yellow('\nYour answers so far (so nothing is lost):'));
+      for (const t of turns) console.error(chalk.yellow(`  Q: ${t.question}\n  A: ${t.answer}`));
+    }
+    throw error;
+  };
 
   while (!draft) {
-    const instruction =
-      finishRequested || turns.length >= MAX_QUESTIONS
-        ? '\nThe interview is over. Draft the charter now from the answers so far (mark genuinely unknown areas with "> ❓ TODO confirm: …" rather than inventing them).'
-        : `\nAsk your next question, or draft if the interview is complete. (${turns.length}/${MAX_QUESTIONS} questions asked.)`;
-    const turn = parseTurn(runAIPrompt(preamble + transcriptSection(turns) + instruction + '\n\n' + INTERVIEW_TURN_FORMAT, options.ai, 'arch-interview'));
+    const mustDraft = finishRequested || turns.length >= MAX_QUESTIONS;
+    const instruction = mustDraft
+      ? `\nThe interview is over. You MUST return status "draft" now${forcedDraftAttempts > 0 ? ` (attempt ${forcedDraftAttempts + 1} — a question is not an acceptable response)` : ''}. Draft the charter from the answers so far, marking genuinely unknown areas with "> ❓ TODO confirm: …" rather than inventing them.`
+      : `\nAsk your next question, or draft if the interview is complete. (${turns.length}/${MAX_QUESTIONS} questions asked.)`;
+
+    let turn: ReturnType<typeof parseTurn>;
+    try {
+      turn = parseTurn(runAIPrompt(preamble + transcriptSection(turns) + instruction + '\n\n' + INTERVIEW_TURN_FORMAT, options.ai, 'arch-interview'));
+      parseFailures = 0;
+    } catch (error) {
+      parseFailures++;
+      if (parseFailures > 2) bail(error);
+      console.error(chalk.yellow(`⚠  Unusable model turn (${parseFailures}/3) — retrying...`));
+      continue;
+    }
 
     if (turn.status === 'draft') {
       draft = turn;
       break;
     }
-    if (finishRequested || turns.length >= MAX_QUESTIONS) {
-      // The model asked again despite being told to draft — force the point next round.
+    if (mustDraft) {
+      // The model asked again despite being told to draft — bounded, or this loop
+      // would re-send the same prompt (and spend an AI call) forever.
+      forcedDraftAttempts++;
+      if (forcedDraftAttempts >= 3) {
+        bail(new Error('The model kept asking questions instead of drafting the charter. Re-run the interview.'));
+      }
       finishRequested = true;
       continue;
     }

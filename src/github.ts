@@ -299,6 +299,19 @@ function validateRepoComponents(owner: string, repoName: string): void {
 }
 
 /**
+ * The cwd checkout's owner/repo slug, or null if it can't be determined. Used to
+ * check whether the cwd checkout IS the repo under review (e.g. before trusting
+ * its ARCHITECTURE.md as charter context for a --repo pointing elsewhere).
+ */
+export function getCurrentRepoSlug(): string | null {
+  try {
+    return getRepoFromGit();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Get repo from current git directory
  */
 function getRepoFromGit(): string {

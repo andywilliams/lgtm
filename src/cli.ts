@@ -5,7 +5,7 @@ import prompts from 'prompts';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
-import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
+import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment, getCurrentRepoSlug } from './github.js';
 import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase } from './git.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { archReview, formatArchComment } from './arch.js';
@@ -48,6 +48,20 @@ function resolveProvider(requested: string | undefined, fail: (msg: string) => n
 function exitWithTextError(message: string): never {
   console.error(chalk.red(message));
   process.exit(1);
+}
+
+/**
+ * The cwd checkout's root — but only when the cwd checkout IS the repo under
+ * review. With `--repo` pointing at a different repository, the cwd repo's
+ * ARCHITECTURE.md must not leak in as that repo's charter; returning null keeps
+ * charter resolution to the (repo-name-keyed) brain fallback instead.
+ */
+function charterRepoRoot(repo?: string): string | null {
+  let root: string | null = null;
+  try { root = getRepoRoot(); } catch { return null; }
+  if (!repo) return root;
+  const cwdSlug = getCurrentRepoSlug();
+  return cwdSlug && cwdSlug.toLowerCase() === repo.toLowerCase() ? root : null;
 }
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
@@ -504,8 +518,7 @@ async function runReview(options: RunOptions): Promise<void> {
   let charterContextStr = '';
   if (charterEnabled) {
     try {
-      let repoRoot: string | null = null;
-      try { repoRoot = getRepoRoot(); } catch { /* not in a git checkout */ }
+      const repoRoot = charterRepoRoot(repo);
       const repoName = repo ? repo.split('/').pop() : repoRoot ? basename(repoRoot) : undefined;
       charterContextStr = (await buildArchitectureContext(repoRoot, repoName)).charterBlock;
     } catch { /* charter resolution must never block a review */ }
@@ -1462,8 +1475,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     }
   }
 
-  let repoRoot: string | null = null;
-  try { repoRoot = getRepoRoot(); } catch { /* not in a git checkout */ }
+  const repoRoot = charterRepoRoot(repo);
   const repoName = repo ? repo.split('/').pop() : repoRoot ? basename(repoRoot) : undefined;
 
   const archCtx = await buildArchitectureContext(repoRoot, repoName);

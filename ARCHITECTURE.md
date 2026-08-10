@@ -14,7 +14,8 @@ lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitH
 
 ## Interfaces & dependencies
 **Exposes**
-- The `lgtm` global CLI (`dist/cli.js`), commands: `review [pr]` (incl. `--local` working-tree mode), `recheck`, `retry`, `tag`, `report`, `quiz` *(inferred from: package.json `bin`; command registrations in src/cli.ts)*. Consumers: the operator interactively; coding agents and CI via `--agent`/`--auto`/`--batch` (JSON findings, no prompts) *(inferred from: PR titles #8, #11; the DWLF workflow's `lgtm review <PR#> --agent` in CLAUDE.md)*.
+- The `lgtm` global CLI (`dist/cli.js`), commands: `review [pr]` (incl. `--local` working-tree mode), `arch` (`review [pr]`/`new`/`init` — architecture altitude: decision records against an ARCHITECTURE.md charter, one summary comment, never inline), `recheck`, `retry`, `tag`, `report`, `quiz` *(inferred from: package.json `bin`; command registrations in src/cli.ts; PR #26)*. Consumers: the operator interactively; coding agents and CI via `--agent`/`--auto`/`--batch` (JSON findings, no prompts) *(inferred from: PR titles #8, #11; the DWLF workflow's `lgtm review <PR#> --agent` in CLAUDE.md)*.
+- Charter/system input contract: `ARCHITECTURE.md` (root, then `docs/`, then `.lgtm/`) with `title:`/`system:` frontmatter as the only code-parsed fields; `SYSTEM.md` via the `system:` pointer or `LGTM_SYSTEM_DIR` *(inferred from: src/charter.ts; PR #26)*.
 - Local data: a review log in SQLite at `~/.lgtm/reviews.db` (src/db.ts) and metrics/false-negative data in cwd-relative `data/reviews.json` (src/metrics/reviewLogger.js).
 
 **Depends on**
