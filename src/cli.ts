@@ -4,15 +4,65 @@ import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
-import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, getPRComments, getExistingReviewComments, resolveComment } from './github.js';
+import { basename } from 'node:path';
+import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment, getCurrentRepoSlug } from './github.js';
 import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase } from './git.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { archReview, formatArchComment } from './arch.js';
+import { runArchNew, runArchInit } from './archInterview.js';
+import { buildArchitectureContext } from './charter.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding } from './types.js';
+import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility } from './types.js';
+
+/**
+ * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
+ * (preferring claude). `fail` carries each command's own error contract (plain text vs
+ * JSON-to-stdout), so this stays usable from every subcommand.
+ */
+function resolveProvider(requested: string | undefined, fail: (msg: string) => never): AIProvider {
+  if (requested) {
+    if (!['claude', 'codex'].includes(requested)) {
+      fail('Invalid AI provider. Use: claude, codex');
+    }
+    const ai = requested as AIProvider;
+    if (ai === 'claude' && !checkClaudeCli()) {
+      fail('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
+    }
+    if (ai === 'codex' && !checkCodexCli()) {
+      fail('Codex CLI not found. Install: npm install -g @openai/codex');
+    }
+    return ai;
+  }
+  const available = getAvailableProviders();
+  if (available.length === 0) {
+    fail('No AI CLI found. Install claude or codex.');
+  }
+  return available.includes('claude') ? 'claude' : 'codex';
+}
+
+/** Plain-text error exit, for commands with no JSON output contract. */
+function exitWithTextError(message: string): never {
+  console.error(chalk.red(message));
+  process.exit(1);
+}
+
+/**
+ * The cwd checkout's root — but only when the cwd checkout IS the repo under
+ * review. With `--repo` pointing at a different repository, the cwd repo's
+ * ARCHITECTURE.md must not leak in as that repo's charter; returning null keeps
+ * charter resolution to the (repo-name-keyed) brain fallback instead.
+ */
+function charterRepoRoot(repo?: string): string | null {
+  let root: string | null = null;
+  try { root = getRepoRoot(); } catch { return null; }
+  if (!repo) return root;
+  const cwdSlug = getCurrentRepoSlug();
+  return cwdSlug && cwdSlug.toLowerCase() === repo.toLowerCase() ? root : null;
+}
 
 const SEVERITY_COLORS: Record<string, (s: string) => string> = {
   BUG: chalk.red,
@@ -61,6 +111,7 @@ program
   .option('--usage-context', 'Include files that use changed symbols', false)
   .option('--related-files', 'Include related files (imports, callers, tests, infra) discovered via static analysis', false)
   .option('--max-context', 'Shorthand: enables --full-context, --usage-context, and --related-files', false)
+  .option('--no-charter', 'Skip the ARCHITECTURE.md charter conformance context (on by default when the repo has one)')
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
@@ -105,30 +156,7 @@ program
       exitWithError('Invalid harshness level. Use: chill, medium, pedantic');
     }
 
-    // Determine AI provider
-    let ai: AIProvider;
-    if (options.ai) {
-      if (!['claude', 'codex'].includes(options.ai)) {
-        exitWithError('Invalid AI provider. Use: claude, codex');
-      }
-      ai = options.ai as AIProvider;
-
-      // Check if specified provider is available
-      if (ai === 'claude' && !checkClaudeCli()) {
-        exitWithError('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
-      }
-      if (ai === 'codex' && !checkCodexCli()) {
-        exitWithError('Codex CLI not found. Install: npm install -g @openai/codex');
-      }
-    } else {
-      // Auto-detect available provider
-      const available = getAvailableProviders();
-      if (available.length === 0) {
-        exitWithError('No AI CLI found. Install claude or codex.');
-      }
-      // Prefer claude, fall back to codex
-      ai = available.includes('claude') ? 'claude' : 'codex';
-    }
+    const ai = resolveProvider(options.ai, exitWithError);
 
     const batch = auto || options.batch;
 
@@ -193,6 +221,7 @@ program
         ai,
         scope: options.scope,
         decided,
+        charterEnabled: options.charter !== false,
       });
     } catch (error: any) {
       if (agent) {
@@ -234,6 +263,7 @@ interface RunOptions {
   ai: AIProvider;
   scope?: string;
   decided?: DecidedFinding[];
+  charterEnabled: boolean;
 }
 
 function formatReviewCommentBody(comment: ReviewComment): string {
@@ -371,7 +401,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided } = options;
+  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, charterEnabled } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -482,6 +512,21 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.blue(`\n📖 Loaded engineering handbook context from second-brain`));
   }
 
+  // In-repo architecture charter (ARCHITECTURE.md; optional brain fallback) — adds one
+  // conformance check to the review. On by default when the repo has a charter;
+  // --no-charter is the off switch. Full architecture altitude is `lgtm arch`.
+  let charterContextStr = '';
+  if (charterEnabled) {
+    try {
+      const repoRoot = charterRepoRoot(repo);
+      const repoName = repo ? repo.split('/').pop() : repoRoot ? basename(repoRoot) : undefined;
+      charterContextStr = (await buildArchitectureContext(repoRoot, repoName)).charterBlock;
+    } catch { /* charter resolution must never block a review */ }
+  }
+  if (charterContextStr) {
+    log(chalk.blue(`\n📐 Loaded architecture charter (conformance check enabled)`));
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
   const contextModes = [harshness + ' mode'];
@@ -489,9 +534,10 @@ async function runReview(options: RunOptions): Promise<void> {
   if (usageContext && usageContextStr) contextModes.push('usage context');
   if (relatedFiles && expandedContextStr) contextModes.push('related files');
   if (handbookContextStr) contextModes.push('handbook');
+  if (charterContextStr) contextModes.push('charter');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided });
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr });
 
   log(chalk.gray(`\n${result.summary}\n`));
 
@@ -788,26 +834,7 @@ program
       exitWithError('Invalid PR number');
     }
 
-    // Determine AI provider (same logic as review)
-    let ai: AIProvider;
-    if (options.ai) {
-      if (!['claude', 'codex'].includes(options.ai)) {
-        exitWithError('Invalid AI provider. Use: claude, codex');
-      }
-      ai = options.ai as AIProvider;
-      if (ai === 'claude' && !checkClaudeCli()) {
-        exitWithError('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login');
-      }
-      if (ai === 'codex' && !checkCodexCli()) {
-        exitWithError('Codex CLI not found. Install: npm install -g @openai/codex');
-      }
-    } else {
-      const available = getAvailableProviders();
-      if (available.length === 0) {
-        exitWithError('No AI CLI found. Install claude or codex.');
-      }
-      ai = available.includes('claude') ? 'claude' : 'codex';
-    }
+    const ai = resolveProvider(options.ai, exitWithError);
 
     const batch = auto || options.batch;
 
@@ -1237,30 +1264,7 @@ program
       process.exit(1);
     }
 
-    // Determine AI provider
-    let ai: AIProvider;
-    if (options.ai) {
-      if (!['claude', 'codex'].includes(options.ai)) {
-        console.error(chalk.red('Invalid AI provider. Use: claude, codex'));
-        process.exit(1);
-      }
-      ai = options.ai as AIProvider;
-      if (ai === 'claude' && !checkClaudeCli()) {
-        console.error(chalk.red('Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code && claude login'));
-        process.exit(1);
-      }
-      if (ai === 'codex' && !checkCodexCli()) {
-        console.error(chalk.red('Codex CLI not found. Install: npm install -g @openai/codex'));
-        process.exit(1);
-      }
-    } else {
-      const available = getAvailableProviders();
-      if (available.length === 0) {
-        console.error(chalk.red('No AI CLI found. Install claude or codex.'));
-        process.exit(1);
-      }
-      ai = available.includes('claude') ? 'claude' : 'codex';
-    }
+    const ai = resolveProvider(options.ai, exitWithTextError);
 
     try {
       await runQuiz({ prNumber, repo: options.repo, ai, questionCount });
@@ -1357,5 +1361,273 @@ async function runQuiz(options: { prNumber: number; repo?: string; ai: AIProvide
 
   console.log();
 }
+
+// ---------------------------------------------------------------------------
+// `lgtm arch` — architecture review: a second altitude. `review` asks "is this
+// code correct?"; `arch` asks "was this the right thing to build, built in the
+// right place, and what does it cost us later?" Output is decision records, never
+// inline comments. Design rationale: docs/ARCHITECTURE-REVIEW.md.
+// ---------------------------------------------------------------------------
+
+const ARCH_AUTHORITY_COLORS: Record<ArchAuthority, (s: string) => string> = {
+  charter: chalk.magenta,
+  'codebase-pattern': chalk.cyan,
+  'diff-evidence': chalk.blue,
+  judgement: chalk.gray,
+};
+
+const ARCH_REVERSIBILITY_LABELS: Record<ArchReversibility, string> = {
+  cheap: chalk.gray('cheap to reverse'),
+  costly: chalk.yellow('costly to reverse'),
+  'one-way': chalk.red.bold('ONE-WAY DOOR'),
+};
+
+function formatArchAgentResult(opts: {
+  success: boolean;
+  result?: ArchResult;
+  charterPath?: string;
+  charterSource?: string;
+  systemPath?: string;
+  error?: string;
+}): string {
+  const r = opts.result;
+  return JSON.stringify({
+    success: opts.success,
+    mode: 'arch',
+    posted: false,
+    verdict: r?.verdict ?? 'no-decisions',
+    summary: r?.summary ?? '',
+    recovered: r?.recovered ?? false,
+    decisions: r?.decisions ?? [],
+    skipped_checks: r?.skipped_checks ?? [],
+    context: {
+      charter: opts.charterPath ?? null,
+      charterSource: opts.charterSource ?? null,
+      system: opts.systemPath ?? null,
+    },
+    ...(opts.error ? { error: opts.error } : {}),
+  });
+}
+
+function renderArchResult(result: ArchResult, log: (...args: any[]) => void): void {
+  log(chalk.gray(`\n${result.summary}\n`));
+  if (result.decisions.length === 0) {
+    log(chalk.green('✓ No architectural decisions found in this change.'));
+  }
+  result.decisions.forEach((d, i) => {
+    log(chalk.white('─'.repeat(60)));
+    log(
+      chalk.white(`[${i + 1}/${result.decisions.length}] `) +
+      ARCH_AUTHORITY_COLORS[d.authority](d.authority.toUpperCase()) +
+      chalk.gray(' | ') +
+      ARCH_REVERSIBILITY_LABELS[d.reversibility] +
+      chalk.gray(` | confidence: ${d.confidence}`)
+    );
+    log(chalk.white('─'.repeat(60)));
+    log(chalk.bold(d.decision));
+    if (d.evidence.length) log(chalk.gray(`Evidence: ${d.evidence.join(' · ')}`));
+    log(chalk.white(`Rationale found: ${d.rationale_found}`));
+    if (d.alternatives_not_taken.length) log(chalk.white(`Alternatives not taken: ${d.alternatives_not_taken.join('; ')}`));
+    for (const ram of d.ramifications) log(chalk.yellow(`  ↳ ${ram}`));
+    if (d.falsifiable_by) log(chalk.gray(`Wrong if: ${d.falsifiable_by}`));
+    if (d.ask_the_author) log(chalk.green(`❓ Ask the author: ${d.ask_the_author}`));
+    log();
+  });
+  if (result.skipped_checks.length) log(chalk.gray(`Skipped checks: ${result.skipped_checks.join('; ')}`));
+  if (result.recovered) log(chalk.yellow('⚠ Model JSON was salvaged — this review may be partial.'));
+}
+
+interface ArchRunOptions {
+  prNumber: number;
+  repo?: string;
+  local: boolean;
+  base?: string;
+  agent: boolean;
+  dryRun: boolean;
+  fullContext: boolean;
+  ai: AIProvider;
+}
+
+async function runArchReview(options: ArchRunOptions): Promise<void> {
+  const { prNumber, repo, local, base, agent, dryRun, fullContext, ai } = options;
+  const log = agent ? (..._args: any[]) => {} : console.log;
+
+  log(chalk.blue(`\n🏛  ${local ? `Architecture review of local changes (vs ${base})` : `Architecture review of PR #${prNumber}`}...`));
+  const pr = local ? getLocalDetails(base!) : getPRDetails(prNumber, repo);
+  log(chalk.white(`   "${pr.title}" by ${pr.author}`));
+  log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
+
+  const diff = local ? getLocalDiff(base!) : getPRDiff(prNumber, repo);
+  const maxDiffLength = 50000;
+  const truncatedDiff = diff.length > maxDiffLength ? diff.slice(0, maxDiffLength) + '\n... (diff truncated)' : diff;
+
+  // Full contents of changed files (always on in agent mode) — pattern claims must be
+  // countable, and placement judgements need to see the whole file, not the hunk.
+  let fileContents: Record<string, string> | undefined;
+  if (fullContext || agent) {
+    log(chalk.blue(`\n📁 Fetching full file contents...`));
+    const changedFiles = local ? getLocalChangedFiles(base!) : getChangedFiles(prNumber, repo);
+    fileContents = {};
+    for (const file of changedFiles) {
+      if (file.endsWith('.lock') || (file.endsWith('.json') && file.includes('package-lock'))) continue;
+      const content = local ? getLocalFileContent(file) : getFileContent(prNumber, file, repo);
+      if (content && content.length <= 300000) fileContents[file] = content;
+    }
+  }
+
+  const repoRoot = charterRepoRoot(repo);
+  const repoName = repo ? repo.split('/').pop() : repoRoot ? basename(repoRoot) : undefined;
+
+  const archCtx = await buildArchitectureContext(repoRoot, repoName);
+  if (archCtx.charterBlock) {
+    log(chalk.blue(`\n📐 Charter: ${archCtx.charterPath ?? `${repoName}-charter (second-brain)`}`));
+  } else {
+    log(chalk.yellow(`\n📐 No charter found — charter-grounded checks will be skipped. Bootstrap one: lgtm arch init`));
+  }
+  if (archCtx.systemPath) log(chalk.blue(`🗺  System doc: ${archCtx.systemPath}`));
+
+  const handbookBlock = await fetchBrainContext(repo);
+  if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
+
+  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
+  log(chalk.blue(`\n🤖 Reviewing architecture with ${aiLabel}...`));
+  const result = await archReview(truncatedDiff, pr.title, pr.body, ai, {
+    charterBlock: archCtx.charterBlock,
+    systemBlock: archCtx.systemBlock,
+    handbookBlock,
+    fileContents,
+  });
+
+  if (agent) {
+    console.log(formatArchAgentResult({
+      success: true,
+      result,
+      charterPath: archCtx.charterPath,
+      charterSource: archCtx.charterSource,
+      systemPath: archCtx.systemPath,
+    }));
+    return;
+  }
+
+  renderArchResult(result, log);
+
+  // One summary comment, never inline — and nothing worth posting on "no-decisions".
+  if (local || result.verdict === 'no-decisions') return;
+  if (dryRun) {
+    log(chalk.yellow('\n(dry-run — not posting)'));
+    return;
+  }
+  if (!process.stdin.isTTY) {
+    console.error(chalk.yellow('\n⚠  stdin is not an interactive terminal — not posting. Use --agent for JSON output.'));
+    return;
+  }
+  const confirm = await prompts({
+    type: 'confirm',
+    name: 'value',
+    message: `Post this architecture review as ONE summary comment on PR #${prNumber}?`,
+    initial: true,
+  });
+  if (!confirm.value) {
+    log(chalk.yellow('Not posted.'));
+    return;
+  }
+  postIssueComment(prNumber, formatArchComment(result), repo);
+  log(chalk.green('\n✓ Posted architecture review comment'));
+}
+
+const arch = program
+  .command('arch')
+  .description('Architecture review — the decisions a change commits the system to (also: arch init, arch new)');
+
+arch
+  .command('review [pr-number]', { isDefault: true })
+  .description('Review a PR (or --local changes) for architectural decisions and their consequences')
+  .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('--local', 'Review local working-tree changes vs a base ref (never posts)', false)
+  .option('--base <ref>', 'Base ref for --local mode (default: auto-detected default branch)')
+  .option('--agent', 'Agent mode: read-only, full JSON to stdout (never posts)', false)
+  .option('--dry-run', 'Show the review without posting', false)
+  .option('--full-context', 'Include full contents of changed files (always on in agent mode)', false)
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .action(async (prNumberStr: string | undefined, options) => {
+    const agent = options.agent;
+    function exitWithError(message: string): never {
+      if (agent) {
+        console.log(formatArchAgentResult({ success: false, error: message }));
+      } else {
+        console.error(chalk.red(message));
+      }
+      process.exit(1);
+    }
+
+    const local = options.local;
+    let prNumber = 0;
+    if (!local) {
+      prNumber = parseInt(prNumberStr ?? '', 10);
+      if (isNaN(prNumber)) {
+        exitWithError('Invalid PR number (or pass --local to review working-tree changes)');
+      }
+    }
+    let base: string | undefined;
+    if (local) {
+      try {
+        base = options.base || detectDefaultBase();
+      } catch (e: any) {
+        exitWithError(e?.message ?? String(e));
+      }
+    }
+    const ai = resolveProvider(options.ai, exitWithError);
+
+    try {
+      await runArchReview({
+        prNumber,
+        repo: options.repo,
+        local,
+        base,
+        agent,
+        dryRun: options.dryRun,
+        fullContext: options.fullContext,
+        ai,
+      });
+    } catch (error: any) {
+      exitWithError(error?.message ?? String(error));
+    }
+  });
+
+arch
+  .command('new')
+  .description('Design a NEW repo before any code: interview → draft ARCHITECTURE.md → critique → write')
+  .option('--name <repo-name>', 'Repo name (default: current directory name)')
+  .option('--out <file>', 'Output path (default: ./ARCHITECTURE.md)')
+  .option('--system <path>', 'System doc or directory to check fit against (default: $LGTM_SYSTEM_DIR)')
+  .option('--answers <file>', 'JSON array of pre-supplied answers (scripted/rehearsal run)')
+  .option('--force', 'Overwrite an existing file', false)
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .action(async (options) => {
+    const ai = resolveProvider(options.ai, exitWithTextError);
+    try {
+      await runArchNew({ ai, out: options.out, name: options.name, system: options.system, answers: options.answers, force: options.force });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
+    }
+  });
+
+arch
+  .command('init')
+  .description('Infer a draft ARCHITECTURE.md for an EXISTING repo — every claim marked with its evidence, for correction')
+  .option('--out <file>', 'Output path (default: <repo-root>/ARCHITECTURE.md)')
+  .option('--system <path>', 'System doc or directory this repo belongs to (default: $LGTM_SYSTEM_DIR)')
+  .option('--force', 'Overwrite an existing file', false)
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .action(async (options) => {
+    const ai = resolveProvider(options.ai, exitWithTextError);
+    try {
+      await runArchInit({ ai, out: options.out, system: options.system, force: options.force });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
+    }
+  });
 
 program.parse();

@@ -82,6 +82,39 @@ export interface RecheckResponse {
   results: RecheckResult[];
 }
 
+/**
+ * Architecture review (`lgtm arch`) types — a different output unit from code review.
+ * The unit is the DECISION RECORD: a fork the change commits the system to, with its
+ * evidence, cost and — crucially — which rung of the authority ladder it stands on.
+ */
+export type ArchAuthority = 'charter' | 'codebase-pattern' | 'diff-evidence' | 'judgement';
+export type ArchReversibility = 'cheap' | 'costly' | 'one-way';
+export type ArchConfidence = 'high' | 'medium' | 'low';
+
+export interface ArchDecision {
+  id: string;
+  decision: string;
+  evidence: string[];
+  rationale_found: string;
+  alternatives_not_taken: string[];
+  reversibility: ArchReversibility;
+  ramifications: string[];
+  authority: ArchAuthority;
+  confidence: ArchConfidence;
+  falsifiable_by: string;
+  ask_the_author: string;
+}
+
+export interface ArchResult {
+  verdict: 'no-decisions' | 'decisions-found';
+  summary: string;
+  decisions: ArchDecision[];
+  /** Checks that could not run (no charter, no system doc, …) — reported, not papered over. */
+  skipped_checks: string[];
+  /** True when the model's JSON had to be salvaged via jsonrepair — result may be partial. */
+  recovered?: boolean;
+}
+
 export interface QuizQuestion {
   question: string;
   options: [string, string, string, string];

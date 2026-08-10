@@ -248,6 +248,31 @@ async function fromDir(dir: string, repo: string): Promise<string> {
 // --- public API ------------------------------------------------------------
 
 /**
+ * Fetch a single note by id from the configured brain (URL then DIR providers; the
+ * CMD provider only answers the handbook question, so it is skipped here). Used by
+ * `lgtm arch` for the optional `<repo>-charter` fallback when the repo has no
+ * in-repo ARCHITECTURE.md. Best-effort: never throws, null when nothing matches.
+ */
+export async function fetchBrainNote(id: string): Promise<{ title: string; body: string } | null> {
+  try {
+    const url = process.env.LGTM_BRAIN_URL?.trim();
+    const dir = process.env.LGTM_BRAIN_DIR?.trim();
+    if (url) {
+      const n = await fetchNote(url.replace(/\/$/, ''), id);
+      const b = apiBody(n);
+      if (n && b && b.trim()) return { title: typeof n.title === 'string' ? n.title : id, body: b };
+    }
+    if (dir) {
+      const n = readNoteFile(dir, id);
+      if (n && n.body.trim()) return { title: n.title, body: n.body };
+    }
+  } catch {
+    // fall through — a broken brain must never block an arch review
+  }
+  return null;
+}
+
+/**
  * Returns a handbook-context block for the repo under review, or '' if no brain is
  * configured / nothing matches. Never throws.
  */

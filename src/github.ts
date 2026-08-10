@@ -147,6 +147,34 @@ export function postBatchReview(
 }
 
 /**
+ * Post a single top-level (issue-style) comment on a PR. Used by `lgtm arch`, whose
+ * output is one summary comment by design — never inline review comments. The body
+ * goes via stdin (--body-file -) so markdown/quotes survive untouched.
+ */
+export function postIssueComment(prNumber: number, body: string, repo?: string): void {
+  // Same guards as the sibling posting functions — this path is also driven
+  // programmatically, so the shell-interpolated repo must be validated.
+  if (repo) {
+    const [owner, repoName] = repo.split('/');
+    validateRepoComponents(owner ?? '', repoName ?? '');
+  }
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid PR number: ${prNumber}`);
+  }
+  const repoFlag = repo ? `-R ${repo}` : '';
+  const cmd = `gh pr comment ${prNumber} --body-file - ${repoFlag}`.trim();
+  try {
+    execSync(cmd, {
+      input: body,
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (error: any) {
+    throw new Error(friendlyGhError(error?.message ?? String(error), repo, cmd));
+  }
+}
+
+/**
  * Backward-compatible alias for old submit API
  */
 export function submitReview(
@@ -276,6 +304,19 @@ function validateRepoComponents(owner: string, repoName: string): void {
   const valid = /^[a-zA-Z0-9._-]+$/;
   if (!valid.test(owner) || !valid.test(repoName)) {
     throw new Error(`Invalid repository format: ${owner}/${repoName}`);
+  }
+}
+
+/**
+ * The cwd checkout's owner/repo slug, or null if it can't be determined. Used to
+ * check whether the cwd checkout IS the repo under review (e.g. before trusting
+ * its ARCHITECTURE.md as charter context for a --repo pointing elsewhere).
+ */
+export function getCurrentRepoSlug(): string | null {
+  try {
+    return getRepoFromGit();
+  } catch {
+    return null;
   }
 }
 
