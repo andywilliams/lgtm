@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { parseArchResponse, formatArchComment } from './arch.js';
+import { parseArchResponse, formatArchComment, enforceSkippedChecks } from './arch.js';
 
 // Guards the normalization that keeps the authority ladder honest: unknown enum
 // values must collapse to the WEAKEST claim (judgement / cheap / low), never a
@@ -84,6 +84,40 @@ describe('parseArchResponse', () => {
 
   it('throws on genuine garbage', () => {
     assert.throws(() => parseArchResponse('no json here at all'));
+  });
+});
+
+describe('enforceSkippedChecks', () => {
+  it('adds canonical entries from ground truth when the model omits them', () => {
+    const r = parseArchResponse(JSON.stringify({ verdict: 'no-decisions', summary: 's', decisions: [], skipped_checks: [] }));
+    enforceSkippedChecks(r, false, false);
+    assert.strictEqual(r.skipped_checks.length, 2);
+    assert.ok(r.skipped_checks[0].includes('charter-grounded'));
+    assert.ok(r.skipped_checks[1].includes('system-fit'));
+  });
+
+  it('drops model paraphrases of the canonical entries and keeps its other entries', () => {
+    const r = parseArchResponse(JSON.stringify({
+      verdict: 'no-decisions',
+      summary: 's',
+      decisions: [],
+      skipped_checks: ['Charter-grounded checks were not possible here', 'org-fit — no org context configured'],
+    }));
+    enforceSkippedChecks(r, false, true);
+    assert.deepStrictEqual(r.skipped_checks.filter((s) => s.includes('org-fit')).length, 1);
+    assert.strictEqual(r.skipped_checks.filter((s) => /charter/i.test(s)).length, 1);
+    assert.ok(!r.skipped_checks.some((s) => /system-fit/.test(s)));
+  });
+
+  it('reports nothing skipped when both contexts were provided', () => {
+    const r = parseArchResponse(JSON.stringify({
+      verdict: 'no-decisions',
+      summary: 's',
+      decisions: [],
+      skipped_checks: ['system-fit checks — no system doc resolvable'],
+    }));
+    enforceSkippedChecks(r, true, true);
+    assert.deepStrictEqual(r.skipped_checks, []);
   });
 });
 

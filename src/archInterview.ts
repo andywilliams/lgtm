@@ -292,29 +292,37 @@ export async function runArchNew(options: ArchNewOptions): Promise<void> {
   console.log(chalk.blue('\n📄 Draft charter:\n'));
   console.log(draft.charter);
 
-  // Critique the draft while the design is still cheap to change.
-  console.log(chalk.blue('\n🔎 Critiquing the draft (design review, not prose review)...\n'));
-  const critique = critiqueDraft(draft.charter, system, options.ai);
-  if (critique.summary) console.log(chalk.gray(critique.summary + '\n'));
+  // Critique the draft while the design is still cheap to change. A completed draft
+  // already exists at this point — a critique/revise failure must not discard it, so
+  // model errors here degrade to "keep the uncritiqued draft" (an explicit user
+  // cancel still aborts without writing).
+  try {
+    console.log(chalk.blue('\n🔎 Critiquing the draft (design review, not prose review)...\n'));
+    const critique = critiqueDraft(draft.charter, system, options.ai);
+    if (critique.summary) console.log(chalk.gray(critique.summary + '\n'));
 
-  if (critique.points.length === 0) {
-    console.log(chalk.green('✓ No design concerns raised.'));
-  } else {
-    const responses: { point: string; response: string }[] = [];
-    for (let i = 0; i < critique.points.length; i++) {
-      const p = critique.points[i];
-      console.log(chalk.white('─'.repeat(60)));
-      console.log(chalk.bold(`[${i + 1}/${critique.points.length}] ${p.point}`));
-      console.log(chalk.yellow(`   ❓ ${p.question}`));
-      const answer = await answerSource.next(p.question, '');
-      if (answer !== null && answer.trim()) responses.push({ point: p.point, response: answer });
+    if (critique.points.length === 0) {
+      console.log(chalk.green('✓ No design concerns raised.'));
+    } else {
+      const responses: { point: string; response: string }[] = [];
+      for (let i = 0; i < critique.points.length; i++) {
+        const p = critique.points[i];
+        console.log(chalk.white('─'.repeat(60)));
+        console.log(chalk.bold(`[${i + 1}/${critique.points.length}] ${p.point}`));
+        console.log(chalk.yellow(`   ❓ ${p.question}`));
+        const answer = await answerSource.next(p.question, '');
+        if (answer !== null && answer.trim()) responses.push({ point: p.point, response: answer });
+      }
+      if (responses.length > 0) {
+        console.log(chalk.blue('\n✍️  Folding your responses back into the charter...'));
+        draft = reviseDraft(draft.charter, responses, system, options.ai);
+        console.log(chalk.blue('\n📄 Revised charter:\n'));
+        console.log(draft.charter);
+      }
     }
-    if (responses.length > 0) {
-      console.log(chalk.blue('\n✍️  Folding your responses back into the charter...'));
-      draft = reviseDraft(draft.charter, responses, system, options.ai);
-      console.log(chalk.blue('\n📄 Revised charter:\n'));
-      console.log(draft.charter);
-    }
+  } catch (error: any) {
+    if (error?.message === 'Interview cancelled') throw error;
+    console.error(chalk.yellow(`⚠  Critique step failed (${error?.message ?? error}) — keeping the uncritiqued draft.`));
   }
 
   writeCharterFile(outPath, draft.charter, Boolean(options.force || !existsSync(outPath)));

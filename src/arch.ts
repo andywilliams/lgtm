@@ -125,7 +125,27 @@ ${fileContextSection}
 ${ARCH_OUTPUT_FORMAT}`;
 
   const output = runAIPrompt(prompt, ai, 'arch');
-  return parseArchResponse(output);
+  const result = parseArchResponse(output);
+  return enforceSkippedChecks(result, Boolean(context.charterBlock), Boolean(context.systemBlock));
+}
+
+const CHARTER_SKIP = 'charter-grounded checks — repo has no ARCHITECTURE.md';
+const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
+
+/**
+ * The skipped_checks honesty contract is enforced from ground truth, not model
+ * self-report: archReview KNOWS whether charter/system context was provided, so the
+ * canonical entries are set here (and the model's own phrasings of them dropped).
+ * Exported for tests.
+ */
+export function enforceSkippedChecks(result: ArchResult, hasCharter: boolean, hasSystem: boolean): ArchResult {
+  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit/i.test(s));
+  const canonical = [
+    ...(hasCharter ? [] : [CHARTER_SKIP]),
+    ...(hasSystem ? [] : [SYSTEM_SKIP]),
+  ];
+  result.skipped_checks = [...canonical, ...rest];
+  return result;
 }
 
 /** Parse + normalize the model's arch response. Exported for tests. */

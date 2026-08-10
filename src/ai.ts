@@ -65,7 +65,11 @@ export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt'): s
       maxBuffer: 10 * 1024 * 1024,
     });
   } catch (error: any) {
-    if (error.message?.includes('not found') || error.code === 'ENOENT') {
+    // Only claim "CLI not found" when the binary genuinely isn't runnable NOW —
+    // message-sniffing ('not found' / ENOENT) misdiagnoses unrelated failures
+    // (e.g. codex exiting 0 without writing its output file) as a missing install.
+    const installed = ai === 'codex' ? checkCodexCli() : checkClaudeCli();
+    if (!installed) {
       const cliName = ai === 'codex' ? 'Codex' : 'Claude';
       const installCmd = ai === 'codex'
         ? 'npm install -g @openai/codex'
