@@ -37,16 +37,33 @@ describe('parseArchResponse', () => {
     assert.strictEqual(r.recovered, undefined);
   });
 
-  it('collapses unknown enum values to the weakest claim, never a stronger one', () => {
+  it('collapses unknown claim-strength values to the weakest claim, never a stronger one', () => {
     const r = parseArchResponse(JSON.stringify({
       verdict: 'decisions-found',
       summary: 's',
-      decisions: [decision({ authority: 'organisational-standard', reversibility: 'irreversible!!', confidence: 'certain' })],
+      decisions: [decision({ authority: 'organisational-standard', confidence: 'certain' })],
       skipped_checks: [],
     }));
     assert.strictEqual(r.decisions[0].authority, 'judgement');
-    assert.strictEqual(r.decisions[0].reversibility, 'cheap');
     assert.strictEqual(r.decisions[0].confidence, 'low');
+  });
+
+  it('reversibility near-misses keep their risk instead of collapsing to lowest', () => {
+    const cases: [string, string][] = [
+      ['one-way door', 'one-way'],
+      ['irreversible!!', 'one-way'],
+      ['cheap now, costly later', 'costly'],
+      ['costly to reverse', 'costly'],
+      ['cheap', 'cheap'],
+      ['no idea', 'costly'],
+    ];
+    for (const [input, expected] of cases) {
+      const r = parseArchResponse(JSON.stringify({
+        verdict: 'decisions-found', summary: 's',
+        decisions: [decision({ reversibility: input })], skipped_checks: [],
+      }));
+      assert.strictEqual(r.decisions[0].reversibility, expected, `"${input}" → ${expected}`);
+    }
   });
 
   it('caps decisions at 5, keeping the first (highest-ranked)', () => {

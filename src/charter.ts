@@ -23,7 +23,6 @@ import { fetchBrainNote } from './brain.js';
  */
 
 const CHARTER_CANDIDATES = ['ARCHITECTURE.md', join('docs', 'ARCHITECTURE.md'), join('.lgtm', 'ARCHITECTURE.md')];
-const SYSTEM_CANDIDATES = ['SYSTEM.md', 'ARCHITECTURE.md'];
 const CHARTER_MAX = 14000; // chars fed to the model
 const SYSTEM_MAX = 14000;
 
@@ -101,7 +100,10 @@ export function resolveSystemDoc(repoRoot: string, systemRef?: string): SystemDo
     const base = isAbsolute(ref) ? ref : resolve(repoRoot, ref);
     if (!existsSync(base)) continue;
     try {
-      const candidates = statSync(base).isDirectory() ? SYSTEM_CANDIDATES.map((c) => join(base, c)) : [base];
+      // A directory ref must contain a SYSTEM.md — accepting e.g. an ARCHITECTURE.md
+      // there would silently promote an ordinary sibling repo's CHARTER to system
+      // authority on a typo'd pointer. Naming a file directly is explicit intent.
+      const candidates = statSync(base).isDirectory() ? [join(base, 'SYSTEM.md')] : [base];
       for (const p of candidates) {
         if (!existsSync(p)) continue;
         const content = readFileSync(p, 'utf-8');

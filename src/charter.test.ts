@@ -103,6 +103,13 @@ describe('resolveSystemDoc', () => {
     assert.ok(doc?.content.includes('EnvSystem'));
   });
 
+  it('does not promote a directory\'s ARCHITECTURE.md to system context', () => {
+    const sibling = join(dir, 'ordinary-repo');
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, 'ARCHITECTURE.md'), '# a charter, not a system doc');
+    assert.strictEqual(resolveSystemDoc(dir, './ordinary-repo'), null);
+  });
+
   it('skips remote refs (local-path resolution only)', () => {
     assert.strictEqual(resolveSystemDoc(dir, 'https://github.com/x/y'), null);
     assert.strictEqual(resolveSystemDoc(dir, 'git@github.com:x/y.git'), null);

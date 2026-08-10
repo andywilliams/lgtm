@@ -178,9 +178,23 @@ function toStringArray(v: unknown): string[] {
   return (Array.isArray(v) ? v : []).map(String).filter((s) => s.trim().length > 0);
 }
 
+/**
+ * Reversibility is a RISK marker, so collapse-to-weakest would invert its meaning —
+ * a near-miss like "one-way door" or "cheap now, costly later" must not silently
+ * become lowest-risk. Fuzzy-match the vocabulary (highest risk wins on a mix);
+ * genuinely unrecognized values land on the midpoint, not the floor.
+ */
+function normalizeReversibility(v: unknown): ArchReversibility {
+  const s = String(v ?? '').toLowerCase();
+  if (s === 'cheap' || s === 'costly' || s === 'one-way') return s;
+  if (/one[\s-]?way|irrevers/.test(s)) return 'one-way';
+  if (/costly/.test(s)) return 'costly';
+  if (/cheap/.test(s)) return 'cheap';
+  return 'costly';
+}
+
 function normalizeDecision(d: any): ArchDecision {
   const authorities: ArchAuthority[] = ['charter', 'codebase-pattern', 'diff-evidence', 'judgement'];
-  const reversibilities: ArchReversibility[] = ['cheap', 'costly', 'one-way'];
   const confidences: ArchConfidence[] = ['high', 'medium', 'low'];
   return {
     id: String(d?.id || 'decision'),
@@ -188,9 +202,9 @@ function normalizeDecision(d: any): ArchDecision {
     evidence: toStringArray(d?.evidence),
     rationale_found: String(d?.rationale_found || 'none'),
     alternatives_not_taken: toStringArray(d?.alternatives_not_taken),
-    // Unknown values collapse to the weakest claim, never a stronger one:
-    reversibility: reversibilities.includes(d?.reversibility) ? d.reversibility : 'cheap',
+    reversibility: normalizeReversibility(d?.reversibility),
     ramifications: toStringArray(d?.ramifications),
+    // Unknown CLAIM-strength values collapse to the weakest claim, never a stronger one:
     authority: authorities.includes(d?.authority) ? d.authority : 'judgement',
     confidence: confidences.includes(d?.confidence) ? d.confidence : 'low',
     falsifiable_by: String(d?.falsifiable_by || ''),
