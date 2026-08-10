@@ -5,7 +5,7 @@ title: lgtm — architecture charter
 # lgtm — architecture charter
 
 ## Purpose & scope boundary
-lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitHub PR (or diffs the local working tree), has an LLM CLI produce findings, and keeps the human in charge of what actually gets posted *(inferred from: package.json description "AI-powered PR review CLI — you stay in control"; README)*. A second, unattended posture exists for agents and CI: `--agent`/`--auto`/`--batch` emit findings as JSON without prompting, and a GitHub Actions recipe runs it on every PR push *(inferred from: PR titles #9, #11, #24; README "GitHub Actions Mode")*.
+lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitHub PR (or diffs the local working tree), has an LLM CLI produce findings, and keeps the human in charge of what actually gets posted *(inferred from: package.json description "AI-powered PR review CLI — you stay in control"; README)*. A second, unattended posture exists for agents and CI: `--agent`/`--auto` emit findings as JSON, `--batch` posts all comments without prompting, and a GitHub Actions recipe runs it on every PR push *(inferred from: PR titles #9, #11, #24; README "GitHub Actions Mode")*.
 
 **Not for:**
 - A hosted service or GitHub App. Only a CLI binary ships (`bin: {"lgtm": "dist/cli.js"}`); the App exists solely as design docs *(inferred from: package.json `bin`; docs/ARCHITECTURE-GITHUB-APP.md and docs/IMPLEMENTATION-TICKETS.md with no server code under src/)*.
@@ -14,7 +14,7 @@ lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitH
 
 ## Interfaces & dependencies
 **Exposes**
-- The `lgtm` global CLI (`dist/cli.js`), commands: `review [pr]` (incl. `--local` working-tree mode), `arch` (`review [pr]`/`new`/`init` — architecture altitude: decision records against an ARCHITECTURE.md charter, one summary comment, never inline), `recheck`, `retry`, `tag`, `report`, `quiz` *(inferred from: package.json `bin`; command registrations in src/cli.ts; PR #26)*. Consumers: the operator interactively; coding agents and CI via `--agent`/`--auto`/`--batch` (JSON findings, no prompts) *(inferred from: PR titles #8, #11; the DWLF workflow's `lgtm review <PR#> --agent` in CLAUDE.md)*.
+- The `lgtm` global CLI (`dist/cli.js`), commands: `review [pr]` (incl. `--local` working-tree mode), `arch` (`review [pr]`/`new`/`init` — architecture altitude: decision records against an ARCHITECTURE.md charter, one summary comment, never inline), `recheck`, `retry`, `tag`, `report`, `quiz` *(inferred from: package.json `bin`; command registrations in src/cli.ts; PR #26)*. Consumers: the operator interactively; coding agents and CI via `--agent`/`--auto` (JSON findings) and `--batch` (post-all, no prompts) *(inferred from: PR titles #8, #11; the DWLF workflow's `lgtm review <PR#> --agent` in CLAUDE.md)*.
 - Charter/system input contract: `ARCHITECTURE.md` (root, then `docs/`, then `.lgtm/`) with `title:`/`system:` frontmatter as the only code-parsed fields; `SYSTEM.md` via the `system:` pointer or `LGTM_SYSTEM_DIR` *(inferred from: src/charter.ts; PR #26)*.
 - Local data: a review log in SQLite at `~/.lgtm/reviews.db` (src/db.ts) and metrics/false-negative data in cwd-relative `data/reviews.json` (src/metrics/reviewLogger.js).
 

@@ -152,6 +152,15 @@ export function postBatchReview(
  * goes via stdin (--body-file -) so markdown/quotes survive untouched.
  */
 export function postIssueComment(prNumber: number, body: string, repo?: string): void {
+  // Same guards as the sibling posting functions — this path is also driven
+  // programmatically, so the shell-interpolated repo must be validated.
+  if (repo) {
+    const [owner, repoName] = repo.split('/');
+    validateRepoComponents(owner ?? '', repoName ?? '');
+  }
+  if (!Number.isInteger(prNumber) || prNumber <= 0) {
+    throw new Error(`Invalid PR number: ${prNumber}`);
+  }
   const repoFlag = repo ? `-R ${repo}` : '';
   const cmd = `gh pr comment ${prNumber} --body-file - ${repoFlag}`.trim();
   try {

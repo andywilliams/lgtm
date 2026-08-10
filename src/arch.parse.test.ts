@@ -2,10 +2,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { parseArchResponse, formatArchComment, enforceSkippedChecks } from './arch.js';
 
-// Guards the normalization that keeps the authority ladder honest: unknown enum
-// values must collapse to the WEAKEST claim (judgement / cheap / low), never a
-// stronger one, and the verdict must reflect what actually survived — a model
-// claiming "decisions-found" with an empty array must not mislead a caller.
+// Guards the normalization that keeps the authority ladder honest. Two different
+// rules, on purpose: unknown CLAIM-STRENGTH values (authority/confidence) collapse
+// to the weakest claim (judgement/low) so the tool never overclaims; RISK values
+// (reversibility) fuzzy-match toward their stated risk — midpoint when unrecognized
+// — so a near-miss can't silently read as lowest-risk. And the verdict must reflect
+// what actually survived — "decisions-found" with an empty array must not mislead.
 
 const decision = (over: Record<string, unknown> = {}) => ({
   id: 'a-decision',

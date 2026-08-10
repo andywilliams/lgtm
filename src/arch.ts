@@ -48,7 +48,7 @@ Silence is a correct answer. Most changes contain no architectural decisions. If
 
 Rank by consequence and return AT MOST ${MAX_DECISIONS} decisions. Prefer one-way doors over reversible choices, and consequences over preferences. "ask_the_author" is your highest-value field — ask the question that is awkward not to have an answer to.
 
-Record honestly in "skipped_checks" any check you could not ground: if no Architecture Charter section was provided, include "charter-grounded checks — repo has no ARCHITECTURE.md"; if no System Architecture Context section was provided, include "system-fit checks — no system doc resolvable".`;
+Record honestly in "skipped_checks" any check you could not ground: if no Architecture Charter section was provided, include "charter-grounded checks — no charter resolvable"; if no System Architecture Context section was provided, include "system-fit checks — no system doc resolvable".`;
 
 const ARCH_OUTPUT_FORMAT = `OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 {
@@ -129,7 +129,9 @@ ${ARCH_OUTPUT_FORMAT}`;
   return enforceSkippedChecks(result, Boolean(context.charterBlock), Boolean(context.systemBlock));
 }
 
-const CHARTER_SKIP = 'charter-grounded checks — repo has no ARCHITECTURE.md';
+// "no charter RESOLVABLE", not "repo has none" — with --repo pointing away from the
+// cwd checkout the target repo may well have a charter lgtm never looked at.
+const CHARTER_SKIP = 'charter-grounded checks — no charter resolvable';
 const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
 
 /**
