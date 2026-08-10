@@ -257,6 +257,64 @@ It's best-effort and **off by default**: if nothing is configured, no handbook m
 
 > Don't have a brain configured? You can ignore this entirely — it changes nothing about how LGTM works for you.
 
+## Architecture Review (`lgtm arch`)
+
+A second review altitude. `lgtm review` asks *"is this code correct?"* — `lgtm arch` asks *"was this the right thing to build, built in the right place, and what does it cost us later?"* It's a rarer, heavier review: run it against a draft PR or a branch while the decision is still cheap to change, not as a merge gate. Full design rationale: [docs/ARCHITECTURE-REVIEW.md](docs/ARCHITECTURE-REVIEW.md).
+
+```bash
+# Architecture-review a PR — offers to post ONE summary comment (never inline)
+lgtm arch 42
+
+# Read-only JSON for agents (never posts)
+lgtm arch 42 --agent
+
+# Review the working tree before a PR exists
+lgtm arch --local --base main
+
+# Infer a draft ARCHITECTURE.md for an EXISTING repo — every claim marked with
+# its evidence, unknowns become "❓ TODO confirm" questions, you correct it
+lgtm arch init
+
+# Design a NEW repo's ARCHITECTURE.md by interview, BEFORE any code — one
+# question at a time, then draft → critique → your responses folded back in
+lgtm arch new
+lgtm arch new --system ../my-system --answers rehearsal.json   # scripted run
+```
+
+Output is up to **5 ranked decision records** — the fork taken, its evidence, reversibility (`cheap` / `costly` / `one-way door`), ramifications, what would make the finding wrong, and a question for the author. **"No decisions" is a normal, common outcome** — most changes aren't architectural, and the tool is built not to manufacture significance.
+
+Every finding declares which rung of the **authority ladder** it stands on, printed in the output:
+
+| Authority | Grounded in | May say |
+|---|---|---|
+| `charter` | A cited line of your ARCHITECTURE.md / SYSTEM.md | "This contradicts X" — assertive |
+| `codebase-pattern` | A counted fact ("6 of 7 handlers do X") | The divergence, with the count |
+| `diff-evidence` | The change itself; the consequence is deduced | Evidence assertively, consequence as a question |
+| `judgement` | Generic engineering opinion | Questions only — never "violates" |
+
+### The charter: `ARCHITECTURE.md`
+
+The normative document that lets findings climb above `judgement`: what the repo is for, what must **not** live in it, its interfaces, invariants, standing decisions (with rationale), and accepted debt. LGTM looks for it at `ARCHITECTURE.md`, then `docs/ARCHITECTURE.md`, then `.lgtm/ARCHITECTURE.md`. Bootstrap one with `lgtm arch init` (existing repo) or `lgtm arch new` (repo that doesn't exist yet).
+
+**Charter evolution is deliberately manual** — the tools write drafts for you to correct and commit; no review ever edits a charter behind your back. Only three things are parsed by code (the filename search order, and the `title:` / `system:` frontmatter fields) — everything else in the file is prose read by the reviewer, so you can shape it freely.
+
+**One conformance check in normal reviews:** when the repo has a charter, `lgtm review` gets it as context and may raise at most one `(charter)`-prefixed SUGGESTION if a diff contradicts a stated invariant/boundary, or changes a documented responsibility without updating the charter in the same diff. Turn it off with `--no-charter`.
+
+### The level above the repo: `SYSTEM.md`
+
+Cross-repo architecture lives in a small system doc — the repos, one-line responsibilities, and the **contracts** between them (who talks to whom, via what, who owns the schema). Keep it in its own repo checked out next to the others, and point each charter at it via frontmatter:
+
+```yaml
+---
+title: my-repo — architecture charter
+system: ../my-system        # local path to the system repo (or set LGTM_SYSTEM_DIR)
+---
+```
+
+With a system doc resolved, `arch` also judges **placement** (does this work belong in this repo?) and **contract coherence** (does the change alter an edge another repo depends on?), and `arch new` checks a proposed repo for overlap with existing responsibilities — then proposes the SYSTEM.md addition (new node + edges) for you to land deliberately, ideally via a PR on the system repo. Remote URLs aren't fetched yet; use a local checkout.
+
+If a repo has no charter file, the URL/DIR brain providers are tried for a `<repo>-charter` note as a fallback (the `LGTM_BRAIN_CMD` provider is deliberately not used here — its contract answers the *handbook* question, and feeding arbitrary command output in as a *normative* charter is how a review ends up arguing from junk). No charter anywhere? The review still runs and honestly reports `charter-grounded checks` in `skipped_checks`.
+
 ## Retrying Failed Uploads
 
 If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:
