@@ -326,8 +326,11 @@ lgtm standards init
 # Accept every recommendation non-interactively (thresholds proposed from the scan)
 lgtm standards init --yes
 
-# Scripted run (answers consumed in order), preset profile
-lgtm standards init --answers answers.json --profile service
+# Scripted run — answers.json is an object keyed by question id (preferred; a
+# positional array also works but must track which questions your stances trigger)
+#   {"profile":"service","FUN-1":"balanced","G5":"rule-of-three","fnWarn":60,
+#    "houseRules":["Every list read paginates or asserts single-page."]}
+lgtm standards init --answers answers.json
 ```
 
 `standards init` is deliberately **AI-free and deterministic**: the catalog is the distillation, the questions are fixed — repo profile (`lib` / `service` / `frontend`), five genuinely contested toggles (function size, comment posture, DRY aggressiveness, file size, module granularity), thresholds, house rules — and the same answers always generate the same document. A quick repo scan runs first so threshold questions are asked against measured reality ("your p95 is 74 — propose 80?") and every adoption states its **existing-violation cost**.

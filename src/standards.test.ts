@@ -213,6 +213,17 @@ describe('measureFunctions (approximate scan)', () => {
     assert.strictEqual(maxArgs, 4);
   });
 
+  it('takes an inline callback\'s own params, not the enclosing call\'s parens', () => {
+    const src = [
+      "router.get('/x', (req, res) => {",
+      '  res.send(req.params);',
+      '});',
+    ].join('\n');
+    const { lengths, maxArgs } = measureFunctions(src);
+    assert.deepStrictEqual(lengths, [3]);
+    assert.strictEqual(maxArgs, 2);
+  });
+
   it('does not count control-flow blocks as functions', () => {
     const src = [
       'if (x) {', '  y();', '}',

@@ -89,7 +89,18 @@ function isFunctionStart(line: string): boolean {
  * first line would systematically under-report the worst F1 offenders.
  */
 function extractParams(lines: string[], start: number, maxLookahead = 12): string {
-  const open = lines[start].indexOf('(');
+  // Arrow starts (incl. inline callbacks like `router.get('/x', (req, res) => {`):
+  // take the paren group IMMEDIATELY before the arrow — the first '(' on such a
+  // line is often the enclosing CALL's, and following it would swallow the whole
+  // callback body into the "parameter list".
+  const line = lines[start];
+  if (line.includes('=>')) {
+    const parenParams = line.match(/\(([^()]*)\)\s*=>/);
+    if (parenParams) return parenParams[1];
+    const bareParam = line.match(/(?:^|[,(=]\s*)([\w$]+)\s*=>/);
+    return bareParam ? bareParam[1] : ''; // unrecognized arrow shape — skip rather than guess
+  }
+  const open = line.indexOf('(');
   if (open === -1) return '';
   let depth = 0;
   let collected = '';
@@ -318,7 +329,10 @@ class AnswerSource {
     console.log(chalk.bold(question));
     if (this.map) {
       const v = this.map[key];
-      const rules = Array.isArray(v) ? v.map(String).map((s) => s.trim()).filter(Boolean) : [];
+      // Coerce a bare string to one rule — every other key takes a scalar, so this
+      // is an easy slip, and silently dropping it defeats the unattended-run mode.
+      const raw = Array.isArray(v) ? v : typeof v === 'string' ? [v] : [];
+      const rules = raw.map(String).map((s) => s.trim()).filter(Boolean);
       for (const r of rules) console.log(chalk.cyan(`   [scripted] ${r}`));
       return rules;
     }
