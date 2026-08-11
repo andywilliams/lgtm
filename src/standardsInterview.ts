@@ -3,8 +3,8 @@ import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { askEntries, type RepoProfile } from './standardsCatalog.js';
-import { DEFAULT_THRESHOLDS, generateStandardsDoc, type StandardsSelections, type StandardsThresholds } from './standards.js';
+import { askEntries, catalogEntry, type RepoProfile } from './standardsCatalog.js';
+import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, type StandardsSelections, type StandardsThresholds } from './standards.js';
 
 /**
  * `lgtm standards init` — produce the repo's STANDARDS.md from the catalog.
@@ -71,7 +71,16 @@ function tryExec(cmd: string, args: string[]): string {
   }
 }
 
-const FN_START = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^\s*(?:export\s+)?const\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::[^=]*)?=>\s*\{\s*$|=>\s*\{\s*$|^\s*(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*(?:async\s+)?[\w$]+\s*\([^;{}]*\)\s*\{\s*$/;
+const FN_DECL = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^\s*(?:export\s+)?const\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::[^=]*)?=>\s*\{\s*$|=>\s*\{\s*$/;
+// Class-method shape — but `if (x) {` / `for (...) {` / `catch (e) {` fit the same
+// `name(...) {` pattern, so control-flow keywords must be excluded or top-level
+// blocks get measured as functions and skew the very percentiles the interview quotes.
+const METHODISH = /^\s*(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+)*(?:async\s+)?[\w$]+\s*\([^;{}]*\)\s*\{\s*$/;
+const CONTROL_KEYWORD = /^\s*(?:if|for|while|switch|catch|return|else|do|try)\b/;
+
+function isFunctionStart(line: string): boolean {
+  return FN_DECL.test(line) || (METHODISH.test(line) && !CONTROL_KEYWORD.test(line));
+}
 
 /**
  * Approximate function lengths in a source file: detect likely function-start
@@ -85,7 +94,7 @@ export function measureFunctions(source: string): { lengths: number[]; maxArgs: 
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (FN_START.test(line)) {
+    if (isFunctionStart(line)) {
       const params = line.match(/\(([^)]*)\)/)?.[1] ?? '';
       if (params.trim()) {
         // Count top-level commas only — object/array/generic commas inside nesting don't add parameters.
@@ -324,16 +333,29 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
       askChoices[e.id] = await answerSource.select(`${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
     }
 
-    if (askChoices['FUN-1'] !== 'off') {
+    // Threshold questions apply only when the chosen stance actually renders a rule —
+    // derived from the option's own (possibly empty) rule, not a hardcoded value name.
+    const stanceHasRule = (id: string): boolean => {
+      const entry = catalogEntry(id);
+      const option = entry?.ask?.options.find((o) => o.value === askChoices[id]);
+      return Boolean(option?.rule.trim());
+    };
+
+    if (stanceHasRule('FUN-1')) {
       console.log(chalk.gray(`   (scan: function lines p95 ${scan.fnLines.p95}, ${scan.fnOver(proposed.fnWarn)} over ${proposed.fnWarn}, ${scan.fnOver(proposed.fnMax)} over ${proposed.fnMax})`));
-      thresholds = { ...thresholds, fnWarn: await answerSource.number(`Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn) };
-      thresholds = { ...thresholds, fnMax: await answerSource.number(`Function-length finding threshold (proposed ${proposed.fnMax}):`, proposed.fnMax) };
+      const fnWarn = await answerSource.number(`Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
+      // Re-propose the finding threshold relative to the warn just entered, so a
+      // custom warn can't sit above a stale proposed finding value.
+      const fnMaxProposal = Math.max(proposed.fnMax, fnWarn + 30);
+      thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number(`Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
     }
-    if (askChoices['FMT-2'] !== 'off') {
+    if (stanceHasRule('FMT-2')) {
       console.log(chalk.gray(`   (scan: file lines p95 ${scan.fileLines.p95}, ${scan.filesOver(proposed.fileWarn)} over ${proposed.fileWarn}, ${scan.filesOver(proposed.fileMax)} over ${proposed.fileMax})`));
-      thresholds = { ...thresholds, fileWarn: await answerSource.number(`File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn) };
-      thresholds = { ...thresholds, fileMax: await answerSource.number(`File-length finding threshold (proposed ${proposed.fileMax}):`, proposed.fileMax) };
+      const fileWarn = await answerSource.number(`File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
+      const fileMaxProposal = Math.max(proposed.fileMax, fileWarn + 400);
+      thresholds = { ...thresholds, fileWarn, fileMax: await answerSource.number(`File-length finding threshold (proposed ${fileMaxProposal}):`, fileMaxProposal) };
     }
+    thresholds = clampThresholds(thresholds);
 
     houseRules = await answerSource.textLoop('House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
   }

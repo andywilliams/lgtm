@@ -35,8 +35,19 @@ function stripFrontmatter(md: string): string {
   return md.replace(/^---\n[\s\S]*?\n---\n?/, '').trimStart();
 }
 
-function clip(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + '\n… (truncated)' : s;
+/**
+ * Clip an oversize standards doc from the MIDDLE, never the end: the tail
+ * sections (Not enforced / Rejected / Choices) carry the never-re-raise
+ * contract, and end-truncation would silently re-open exactly the settled
+ * decisions this feature promises not to re-litigate.
+ */
+function clipKeepingTail(s: string, max: number): string {
+  if (s.length <= max) return s;
+  console.error(`lgtm: STANDARDS.md exceeds the ${max}-char review budget — clipping the middle (Not enforced / Rejected tail preserved).`);
+  const marker = '\n… (middle truncated — full document in the repo)\n';
+  const headLen = Math.floor((max - marker.length) * 0.6);
+  const tailLen = max - marker.length - headLen;
+  return s.slice(0, headLen) + marker + s.slice(-tailLen);
 }
 
 /** Locate the repo's standards doc, if it has one. */
@@ -74,7 +85,7 @@ export function buildStandardsBlock(repoRoot: string | null): { block: string; p
     `- NEVER raise anything the document lists under "Rejected" or "Not enforced" — those are settled decisions.\n` +
     `- House rules in the document carry the same authority as catalog standards.\n` +
     `- Do not restate findings you are already raising for correctness reasons; a standards finding must add something.\n\n` +
-    `### ${doc.path}\n${clip(doc.content, STANDARDS_MAX)}\n`;
+    `### ${doc.path}\n${clipKeepingTail(doc.content, STANDARDS_MAX)}\n`;
   return { block, path: doc.path };
 }
 
@@ -88,6 +99,19 @@ export interface StandardsThresholds {
 }
 
 export const DEFAULT_THRESHOLDS: StandardsThresholds = { fnWarn: 50, fnMax: 80, fileWarn: 400, fileMax: 800 };
+
+/**
+ * Enforce warn < finding on user-supplied thresholds. Interview answers (and
+ * scripted --answers files) collect the two numbers independently, so a custom
+ * warn above an accepted default finding would otherwise generate a
+ * self-contradictory document.
+ */
+export function clampThresholds(t: StandardsThresholds): StandardsThresholds {
+  const out = { ...t };
+  if (out.fnMax <= out.fnWarn) out.fnMax = out.fnWarn + 30;
+  if (out.fileMax <= out.fileWarn) out.fileMax = out.fileWarn + 400;
+  return out;
+}
 
 export interface StandardsSelections {
   /** Chosen ask-option value per ask-entry id (e.g. { 'FUN-1': 'balanced' }). */

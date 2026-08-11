@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CATALOG, GROUPS, REJECTED, askEntries } from './standardsCatalog.js';
-import { findStandardsDoc, buildStandardsBlock, generateStandardsDoc, DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
+import { findStandardsDoc, buildStandardsBlock, generateStandardsDoc, clampThresholds, DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { measureFunctions, proposeThresholds, type RepoScan } from './standardsInterview.js';
 
 // Guards three promises: the catalog is internally consistent (unique ids, every
@@ -51,9 +51,12 @@ describe('standards catalog integrity', () => {
     }
   });
 
-  it('on-entries carry a rule; off-entries carry a reason or vanish silently', () => {
+  it('on-entries carry a rule; off-entries carry a non-empty reason when they record one', () => {
     for (const e of CATALOG) {
       if (e.default === 'on') assert.ok(e.rule.trim(), `${e.id} default:on with empty rule`);
+      if (e.default === 'off' && e.offReason !== undefined) {
+        assert.ok(e.offReason.trim(), `${e.id} default:off with blank offReason — drop the field or state the reason`);
+      }
     }
   });
 });
@@ -130,6 +133,28 @@ describe('findStandardsDoc / buildStandardsBlock', () => {
     assert.match(block, /G30 · Do one thing/);
     assert.match(block, /Rejected/); // the never-raise instruction names the section
   });
+
+  it('clips an oversize doc from the middle, preserving the never-re-raise tail', () => {
+    const tail = '## Rejected\n- **J1 · Wildcard imports** — inverted in TS.\n';
+    const doc = '# r — engineering standards\n' + '- filler line about a standard\n'.repeat(1200) + tail;
+    writeFileSync(join(dir, 'STANDARDS.md'), doc);
+    const { block } = buildStandardsBlock(dir);
+    assert.ok(block.length < doc.length);
+    assert.match(block, /middle truncated/);
+    assert.match(block, /J1 · Wildcard imports/); // tail survived
+  });
+});
+
+describe('clampThresholds', () => {
+  it('repairs an inverted warn/finding pair from independent answers', () => {
+    const t = clampThresholds({ fnWarn: 100, fnMax: 80, fileWarn: 900, fileMax: 800 });
+    assert.strictEqual(t.fnMax, 130);
+    assert.strictEqual(t.fileMax, 1300);
+  });
+
+  it('leaves a valid pair untouched', () => {
+    assert.deepStrictEqual(clampThresholds(DEFAULT_THRESHOLDS), DEFAULT_THRESHOLDS);
+  });
 });
 
 describe('measureFunctions (approximate scan)', () => {
@@ -141,6 +166,18 @@ describe('measureFunctions (approximate scan)', () => {
     ].join('\n');
     const { lengths } = measureFunctions(src);
     assert.deepStrictEqual(lengths, [5, 3]);
+  });
+
+  it('does not count control-flow blocks as functions', () => {
+    const src = [
+      'if (x) {', '  y();', '}',
+      'for (const a of b) {', '  y();', '}',
+      'while (x) {', '  y();', '}',
+      'switch (x) {', '  default: break;', '}',
+      'function real() {', '  return 1;', '}',
+    ].join('\n');
+    const { lengths } = measureFunctions(src);
+    assert.deepStrictEqual(lengths, [3]);
   });
 
   it('counts only top-level commas as parameters', () => {
