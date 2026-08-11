@@ -10,7 +10,9 @@ import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileConten
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
+import { runStandardsInit } from './standardsInterview.js';
 import { buildArchitectureContext } from './charter.js';
+import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
@@ -112,6 +114,7 @@ program
   .option('--related-files', 'Include related files (imports, callers, tests, infra) discovered via static analysis', false)
   .option('--max-context', 'Shorthand: enables --full-context, --usage-context, and --related-files', false)
   .option('--no-charter', 'Skip the ARCHITECTURE.md charter conformance context (on by default when the repo has one)')
+  .option('--no-standards', 'Skip the STANDARDS.md engineering-standards check (on by default when the repo has one)')
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
@@ -222,6 +225,7 @@ program
         scope: options.scope,
         decided,
         charterEnabled: options.charter !== false,
+        standardsEnabled: options.standards !== false,
       });
     } catch (error: any) {
       if (agent) {
@@ -264,6 +268,7 @@ interface RunOptions {
   scope?: string;
   decided?: DecidedFinding[];
   charterEnabled: boolean;
+  standardsEnabled: boolean;
 }
 
 function formatReviewCommentBody(comment: ReviewComment): string {
@@ -401,7 +406,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, charterEnabled } = options;
+  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, charterEnabled, standardsEnabled } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -527,6 +532,19 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.blue(`\n📐 Loaded architecture charter (conformance check enabled)`));
   }
 
+  // In-repo engineering standards (STANDARDS.md) — up to three `(standard <id>)`
+  // findings citing the repo's own adopted standards. Same leak guard as the
+  // charter: with --repo pointing elsewhere, the cwd's STANDARDS.md must not apply.
+  let standardsContextStr = '';
+  if (standardsEnabled) {
+    try {
+      standardsContextStr = buildStandardsBlock(charterRepoRoot(repo)).block;
+    } catch { /* standards resolution must never block a review */ }
+  }
+  if (standardsContextStr) {
+    log(chalk.blue(`\n📏 Loaded engineering standards (STANDARDS.md check enabled)`));
+  }
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
   const contextModes = [harshness + ' mode'];
@@ -535,9 +553,10 @@ async function runReview(options: RunOptions): Promise<void> {
   if (relatedFiles && expandedContextStr) contextModes.push('related files');
   if (handbookContextStr) contextModes.push('handbook');
   if (charterContextStr) contextModes.push('charter');
+  if (standardsContextStr) contextModes.push('standards');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr });
+  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr });
 
   log(chalk.gray(`\n${result.summary}\n`));
 
@@ -1624,6 +1643,34 @@ arch
     const ai = resolveProvider(options.ai, exitWithTextError);
     try {
       await runArchInit({ ai, out: options.out, system: options.system, force: options.force });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
+    }
+  });
+
+// ---------------------------------------------------------------------------
+// `lgtm standards` — the maintainability altitude's document. `standards init`
+// selects the repo's standards from the built-in clean-code catalog (AI-free:
+// fixed contested-toggle questions against a repo scan) and writes STANDARDS.md,
+// which `lgtm review` then cites as `(standard <id>)` findings.
+// ---------------------------------------------------------------------------
+
+const standards = program
+  .command('standards')
+  .description("Engineering standards — select the repo's maintainability standards from lgtm's clean-code catalog");
+
+standards
+  .command('init')
+  .description('Scan the repo, ask the contested toggles, write STANDARDS.md (no AI call)')
+  .option('--out <file>', 'Output path (default: <repo-root>/STANDARDS.md)')
+  .option('--force', 'Overwrite an existing file', false)
+  .option('--answers <file>', 'JSON array of pre-supplied answers (scripted run)')
+  .option('--yes', 'Accept every recommendation non-interactively (scan-informed)', false)
+  .option('--profile <profile>', 'Repo profile: lib, service, frontend (skips the profile question)')
+  .action(async (options) => {
+    try {
+      await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile });
     } catch (error: any) {
       console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
       process.exit(1);
