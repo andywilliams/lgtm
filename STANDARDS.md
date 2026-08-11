@@ -169,4 +169,4 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - 2026-08-11 — **MOD-4** → Balanced (recommended) — flag both over-aggregation and over-sharding
 - 2026-08-11 — **G5** → Rule of Three (recommended) — knowledge-dup only, abstraction must be real
 - 2026-08-11 — thresholds: function warn >90 / finding >120 lines · file warn >470 / finding >870 lines
-- 2026-08-11 — repo scan at selection time: 27 source files; function lines p50 12 / p95 81 / max 421; file lines p50 179 / p95 463 / max 1681; max positional args seen 3 (F1 caps at 3) (approximate scan)
+- 2026-08-11 — repo scan at selection time: 27 source files; function lines p50 12 / p95 85 / max 421; file lines p50 179 / p95 463 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)

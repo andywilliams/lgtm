@@ -61,6 +61,9 @@ export const GROUPS: { key: string; title: string; note?: string }[] = [
   { key: 'hygiene', title: 'General hygiene' },
 ];
 
+/** F1's positional-argument cap — referenced by the rule text AND the scan summary, so they can't drift. */
+export const F1_MAX_POSITIONAL_ARGS = 3;
+
 // Threshold placeholders substituted at doc-generation time: {fnWarn} {fnMax} {fileWarn} {fileMax}
 export const CATALOG: CatalogEntry[] = [
   // --- Posture ---------------------------------------------------------------
@@ -103,7 +106,7 @@ export const CATALOG: CatalogEntry[] = [
   { id: 'FUN-3', group: 'functions', title: 'Stepdown order', rule: 'Entry points/exports first, helpers after, caller above callee — but order for the reader, never contort code for narrative flow.', default: 'on', scope: 'new-code' },
   { id: 'XP-15', group: 'functions', title: 'Extract by topic, not size', rule: 'Extract when code solves a DIFFERENT problem than the function\'s stated goal — never on line count alone; sequential paragraphs inside one function are fine.', default: 'on', scope: 'new-code' },
   { id: 'XP-11', group: 'functions', title: 'One Pile', rule: 'When logic is fragmented across pieces too small to understand, inlining them back together and re-chunking is the correct refactoring, not a regression.', default: 'on', scope: 'new-code' },
-  { id: 'F1', group: 'functions', title: 'Few arguments', rule: 'Max 3 positional args; past 2–3, a typed options object or a value object for the travelling clump. Few EXPLICIT args beat zero args fed by hidden state.', default: 'on', scope: 'new-code' },
+  { id: 'F1', group: 'functions', title: 'Few arguments', rule: `Max ${F1_MAX_POSITIONAL_ARGS} positional args; past 2–3, a typed options object or a value object for the travelling clump. Few EXPLICIT args beat zero args fed by hidden state.`, default: 'on', scope: 'new-code' },
   { id: 'XP-7', group: 'functions', title: 'Data clumps', rule: 'The same 3+ values travelling together become a typed value object.', default: 'on', scope: 'new-code' },
   { id: 'F2', group: 'functions', title: 'No output arguments', rule: 'Do not mutate parameters — return new values.', default: 'on', scope: 'new-code' },
   { id: 'F3', group: 'functions', title: 'No flag or selector arguments', rule: 'A bare boolean/mode argument declares the function does N things — split it (named option objects like {dryRun:true} acceptable at API edges).', default: 'on', scope: 'new-code' },

@@ -1665,7 +1665,7 @@ standards
   .description('Scan the repo, ask the contested toggles, write STANDARDS.md (no AI call)')
   .option('--out <file>', 'Output path (default: <repo-root>/STANDARDS.md)')
   .option('--force', 'Overwrite an existing file', false)
-  .option('--answers <file>', 'JSON array of pre-supplied answers (scripted run)')
+  .option('--answers <file>', 'Scripted answers: JSON object keyed by question id (profile, FUN-1…, fnWarn…, houseRules) — or a positional array')
   .option('--yes', 'Accept every recommendation non-interactively (scan-informed)', false)
   .option('--profile <profile>', 'Repo profile: lib, service, frontend (skips the profile question)')
   .action(async (options) => {

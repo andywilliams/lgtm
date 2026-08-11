@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { askEntries, type RepoProfile } from './standardsCatalog.js';
+import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
 
 /**
@@ -82,6 +82,32 @@ function isFunctionStart(line: string): boolean {
   return FN_DECL.test(line) || (METHODISH.test(line) && !CONTROL_KEYWORD.test(line));
 }
 
+/**
+ * Extract a function's parameter text starting at its detected start line,
+ * following a WRAPPED signature across lines until the paren closes — long
+ * parameter lists are exactly the ones formatters wrap, so reading only the
+ * first line would systematically under-report the worst F1 offenders.
+ */
+function extractParams(lines: string[], start: number, maxLookahead = 12): string {
+  const open = lines[start].indexOf('(');
+  if (open === -1) return '';
+  let depth = 0;
+  let collected = '';
+  for (let j = start; j < lines.length && j < start + maxLookahead; j++) {
+    const text = j === start ? lines[j].slice(open) : lines[j];
+    for (const ch of text) {
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        if (depth === 0) return collected.slice(1); // drop the opening paren
+      }
+      collected += ch;
+    }
+    collected += '\n';
+  }
+  return ''; // unbalanced within the lookahead — skip rather than guess
+}
+
 /** Count top-level commas only — object/array/generic commas inside nesting don't add parameters. */
 function countTopLevelParams(params: string): number {
   if (!params.trim()) return 0;
@@ -125,8 +151,7 @@ export function measureFunctions(source: string): { lengths: number[]; maxArgs: 
       i++;
       continue;
     }
-    const params = lines[i].match(/\(([^)]*)\)/)?.[1] ?? '';
-    maxArgs = Math.max(maxArgs, countTopLevelParams(params));
+    maxArgs = Math.max(maxArgs, countTopLevelParams(extractParams(lines, i)));
     const end = findBlockEnd(lines, i);
     lengths.push(end - i + 1);
     i = end + 1;
@@ -191,7 +216,7 @@ export function scanRepo(repoRoot: string): RepoScan {
     summary:
       `${sources.length} source files; function lines p50 ${fnStats.p50} / p95 ${fnStats.p95} / max ${fnStats.max}; ` +
       `file lines p50 ${fileStats.p50} / p95 ${fileStats.p95} / max ${fileStats.max}; ` +
-      `max positional args seen ${maxArgs} (F1 caps at 3) (approximate scan)`,
+      `max positional args seen ${maxArgs} (F1 caps at ${F1_MAX_POSITIONAL_ARGS}) (approximate scan)`,
   };
 }
 
@@ -210,27 +235,48 @@ export function proposeThresholds(scan: RepoScan): StandardsThresholds {
 
 // --- Interview ---------------------------------------------------------------
 
-/** Answer source: pre-supplied answers first (scripted runs), then the terminal. */
+/**
+ * Answer source: pre-supplied answers first (scripted runs), then the terminal.
+ *
+ * Two scripted forms:
+ *  - OBJECT (preferred): keyed by question id — {"profile":"service","FUN-1":"strict",
+ *    "fnWarn":60,"houseRules":["…"]}. Immune to question-order and conditional-
+ *    question changes: threshold questions are asked only for consumed stances,
+ *    so positional files can silently mis-slot when an earlier answer changes
+ *    which questions exist.
+ *  - ARRAY (positional, arch-new style): consumed in question order; keep such
+ *    files in sync with the stances they choose.
+ */
 class AnswerSource {
-  private queue: string[];
+  private queue: string[] = [];
+  private map: Record<string, unknown> | null = null;
+
   constructor(answersFile?: string) {
-    this.queue = [];
-    if (answersFile) {
-      const parsed = JSON.parse(readFileSync(answersFile, 'utf-8'));
-      if (!Array.isArray(parsed)) throw new Error('--answers file must contain a JSON array of strings');
-      this.queue = parsed.map(String);
-    }
+    if (!answersFile) return;
+    const parsed = JSON.parse(readFileSync(answersFile, 'utf-8'));
+    if (Array.isArray(parsed)) this.queue = parsed.map(String);
+    else if (parsed && typeof parsed === 'object') this.map = parsed as Record<string, unknown>;
+    else throw new Error('--answers file must contain a JSON array (positional) or object (keyed by question id)');
   }
 
   hasScripted(): boolean {
-    return this.queue.length > 0;
+    return this.queue.length > 0 || this.map !== null;
   }
 
-  async select(question: string, options: { value: string; label: string }[], initial: string): Promise<string> {
+  /** Scripted answer for a question, if one exists (keyed lookup or next positional). */
+  private scripted(key: string): string | undefined {
+    if (this.map) {
+      const v = this.map[key];
+      return v === undefined || v === null ? undefined : String(v);
+    }
+    return this.queue.length > 0 ? this.queue.shift() : undefined;
+  }
+
+  async select(key: string, question: string, options: { value: string; label: string }[], initial: string): Promise<string> {
     console.log(chalk.white('─'.repeat(60)));
     console.log(chalk.bold(question));
-    if (this.queue.length > 0) {
-      const answer = this.queue.shift()!;
+    const answer = this.scripted(key);
+    if (answer !== undefined) {
       const matched = options.find((o) => o.value === answer);
       if (!matched) {
         console.log(chalk.yellow(`   [scripted] "${answer}" is not one of: ${options.map((o) => o.value).join(', ')} — using ${initial}`));
@@ -251,10 +297,10 @@ class AnswerSource {
     return response.value as string;
   }
 
-  async number(question: string, initial: number): Promise<number> {
+  async number(key: string, question: string, initial: number): Promise<number> {
     console.log(chalk.bold(question));
-    if (this.queue.length > 0) {
-      const answer = this.queue.shift()!;
+    const answer = this.scripted(key);
+    if (answer !== undefined) {
       const n = parseInt(answer, 10);
       console.log(chalk.cyan(`   [scripted] ${answer}`));
       return Number.isFinite(n) && n > 0 ? n : initial;
@@ -266,10 +312,16 @@ class AnswerSource {
     return Number.isFinite(n) && n > 0 ? n : initial;
   }
 
-  /** Free-text loop for house rules; empty or /done finishes. */
-  async textLoop(question: string): Promise<string[]> {
+  /** Free-text loop for house rules; empty or /done finishes. Keyed form: an array of strings. */
+  async textLoop(key: string, question: string): Promise<string[]> {
     console.log(chalk.white('─'.repeat(60)));
     console.log(chalk.bold(question));
+    if (this.map) {
+      const v = this.map[key];
+      const rules = Array.isArray(v) ? v.map(String).map((s) => s.trim()).filter(Boolean) : [];
+      for (const r of rules) console.log(chalk.cyan(`   [scripted] ${r}`));
+      return rules;
+    }
     const collected: string[] = [];
     while (true) {
       if (this.queue.length > 0) {
@@ -336,10 +388,10 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
   } else {
     profile =
       parseProfile(options.profile) ??
-      (await answerSource.select('Repo profile — sets defaults and thresholds:', PROFILES, scan.profileGuess)) as RepoProfile;
+      (await answerSource.select('profile', 'Repo profile — sets defaults and thresholds:', PROFILES, scan.profileGuess)) as RepoProfile;
 
     for (const e of askEntries()) {
-      askChoices[e.id] = await answerSource.select(`${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
+      askChoices[e.id] = await answerSource.select(e.id, `${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
     }
 
     // Threshold questions apply only when some CHOSEN rule will actually render
@@ -350,21 +402,21 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
     if (consumed.fn) {
       console.log(chalk.gray(`   (scan: function lines p95 ${scan.fnLines.p95}, ${scan.fnOver(proposed.fnWarn)} over ${proposed.fnWarn}, ${scan.fnOver(proposed.fnMax)} over ${proposed.fnMax})`));
-      const fnWarn = await answerSource.number(`Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
+      const fnWarn = await answerSource.number('fnWarn', `Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
       // Re-propose the finding threshold relative to the warn just entered, so a
       // custom warn can't sit above a stale proposed finding value.
       const fnMaxProposal = Math.max(proposed.fnMax, fnWarn + 30);
-      thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number(`Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
+      thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number('fnMax', `Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
     }
     if (consumed.file) {
       console.log(chalk.gray(`   (scan: file lines p95 ${scan.fileLines.p95}, ${scan.filesOver(proposed.fileWarn)} over ${proposed.fileWarn}, ${scan.filesOver(proposed.fileMax)} over ${proposed.fileMax})`));
-      const fileWarn = await answerSource.number(`File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
+      const fileWarn = await answerSource.number('fileWarn', `File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
       const fileMaxProposal = Math.max(proposed.fileMax, fileWarn + 400);
-      thresholds = { ...thresholds, fileWarn, fileMax: await answerSource.number(`File-length finding threshold (proposed ${fileMaxProposal}):`, fileMaxProposal) };
+      thresholds = { ...thresholds, fileWarn, fileMax: await answerSource.number('fileMax', `File-length finding threshold (proposed ${fileMaxProposal}):`, fileMaxProposal) };
     }
     thresholds = clampThresholds(thresholds);
 
-    houseRules = await answerSource.textLoop('House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
+    houseRules = await answerSource.textLoop('houseRules', 'House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
   }
 
   const selections: StandardsSelections = { askChoices, thresholds, houseRules };
@@ -372,9 +424,16 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   writeFileSync(outPath, doc.endsWith('\n') ? doc : doc + '\n');
   console.log(chalk.green(`\n✓ Wrote ${outPath}`));
-  console.log(chalk.gray(`   Profile ${profile} · function >${thresholds.fnWarn}/${thresholds.fnMax} lines · file >${thresholds.fileWarn}/${thresholds.fileMax} lines · ${houseRules.length} house rule(s)`));
-  const fnCost = scan.fnOver(thresholds.fnMax);
-  const fileCost = scan.filesOver(thresholds.fileMax);
+  // Closing output honors the same gating as the questions and the document —
+  // a stance without thresholds must not be reported (or costed) as having them.
+  const consumedOut = thresholdsConsumed(profile, askChoices);
+  const summaryParts = [`Profile ${profile}`];
+  if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);
+  if (consumedOut.file) summaryParts.push(`file >${thresholds.fileWarn}/${thresholds.fileMax} lines`);
+  summaryParts.push(`${houseRules.length} house rule(s)`);
+  console.log(chalk.gray(`   ${summaryParts.join(' · ')}`));
+  const fnCost = consumedOut.fn ? scan.fnOver(thresholds.fnMax) : 0;
+  const fileCost = consumedOut.file ? scan.filesOver(thresholds.fileMax) : 0;
   if (fnCost + fileCost > 0) {
     console.log(chalk.yellow(`   Existing-violation cost: ~${fnCost} function(s) and ~${fileCost} file(s) already exceed the finding thresholds — standards apply to NEW code, so these become findings only when touched.`));
   }

@@ -198,6 +198,21 @@ describe('measureFunctions (approximate scan)', () => {
     assert.deepStrictEqual(lengths, [5, 3]);
   });
 
+  it('follows a wrapped signature across lines when counting parameters', () => {
+    const src = [
+      'export async function reviewPR(',
+      '  diff: string,',
+      '  prTitle: string,',
+      '  prBody: string,',
+      '  opts: { a: number, b: number }',
+      ') {',
+      '  return diff;',
+      '}',
+    ].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 4);
+  });
+
   it('does not count control-flow blocks as functions', () => {
     const src = [
       'if (x) {', '  y();', '}',
