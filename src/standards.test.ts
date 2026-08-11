@@ -224,6 +224,31 @@ describe('measureFunctions (approximate scan)', () => {
     assert.strictEqual(maxArgs, 2);
   });
 
+  it('keeps declarations with arrow-typed params on the declaration path', () => {
+    const src = [
+      'function resolveProvider(requested: string | undefined, fail: (msg: string) => never): AIProvider {',
+      '  return requested as AIProvider;',
+      '}',
+    ].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 2); // not the callback type's 1
+  });
+
+  it('does not let => in a wrapped signature break comma counting', () => {
+    const src = [
+      'export function findUsages(',
+      '  symbols: string[],',
+      '  repoRoot: string,',
+      '  onEach: (u: string) => void,',
+      '  opts: { max: number }',
+      ') {',
+      '  return symbols;',
+      '}',
+    ].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 4);
+  });
+
   it('does not count control-flow blocks as functions', () => {
     const src = [
       'if (x) {', '  y();', '}',

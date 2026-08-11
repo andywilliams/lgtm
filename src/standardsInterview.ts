@@ -71,6 +71,7 @@ function tryExec(cmd: string, args: string[]): string {
   }
 }
 
+const FN_KEYWORD_START = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b/;
 const FN_DECL = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^\s*(?:export\s+)?const\s+[\w$]+\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::[^=]*)?=>\s*\{\s*$|=>\s*\{\s*$/;
 // Class-method shape — but `if (x) {` / `for (...) {` / `catch (e) {` fit the same
 // `name(...) {` pattern, so control-flow keywords must be excluded or top-level
@@ -92,9 +93,12 @@ function extractParams(lines: string[], start: number, maxLookahead = 12): strin
   // Arrow starts (incl. inline callbacks like `router.get('/x', (req, res) => {`):
   // take the paren group IMMEDIATELY before the arrow — the first '(' on such a
   // line is often the enclosing CALL's, and following it would swallow the whole
-  // callback body into the "parameter list".
+  // callback body into the "parameter list". But ONLY for arrow starts: a
+  // function/method declaration whose parameter TYPES contain an arrow
+  // (`fail: (msg: string) => never`) must stay on the declaration path, or the
+  // arrow branch returns the callback type's params as the function's.
   const line = lines[start];
-  if (line.includes('=>')) {
+  if (!FN_KEYWORD_START.test(line) && !METHODISH.test(line) && line.includes('=>')) {
     const parenParams = line.match(/\(([^()]*)\)\s*=>/);
     if (parenParams) return parenParams[1];
     const bareParam = line.match(/(?:^|[,(=]\s*)([\w$]+)\s*=>/);
@@ -124,7 +128,11 @@ function countTopLevelParams(params: string): number {
   if (!params.trim()) return 0;
   let depth = 0;
   let args = 1;
-  for (const ch of params) {
+  for (let k = 0; k < params.length; k++) {
+    const ch = params[k];
+    // The '>' of a function-typed param's '=>' is not a closing bracket — counting
+    // it drives depth negative and silently skips every later top-level comma.
+    if (ch === '=' && params[k + 1] === '>') { k++; continue; }
     if ('([{<'.includes(ch)) depth++;
     else if (')]}>'.includes(ch)) depth--;
     else if (ch === ',' && depth === 0) args++;
@@ -265,9 +273,22 @@ class AnswerSource {
   constructor(answersFile?: string) {
     if (!answersFile) return;
     const parsed = JSON.parse(readFileSync(answersFile, 'utf-8'));
-    if (Array.isArray(parsed)) this.queue = parsed.map(String);
-    else if (parsed && typeof parsed === 'object') this.map = parsed as Record<string, unknown>;
-    else throw new Error('--answers file must contain a JSON array (positional) or object (keyed by question id)');
+    if (Array.isArray(parsed)) {
+      this.queue = parsed.map(String);
+      return;
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('--answers file must contain a JSON array (positional) or object (keyed by question id)');
+    }
+    this.map = parsed as Record<string, unknown>;
+    // A typo'd key would otherwise be silently ignored and the question would take
+    // its recommended default — in the unattended mode this form exists for, that
+    // diverges from the author's intent with zero signal. Warn loudly.
+    const validKeys = new Set(['profile', 'fnWarn', 'fnMax', 'fileWarn', 'fileMax', 'houseRules', ...askEntries().map((e) => e.id)]);
+    const unknown = Object.keys(this.map).filter((k) => !validKeys.has(k));
+    if (unknown.length > 0) {
+      console.error(chalk.yellow(`⚠  --answers: unknown key(s) ignored: ${unknown.join(', ')} — valid keys: ${[...validKeys].join(', ')}`));
+    }
   }
 
   hasScripted(): boolean {
