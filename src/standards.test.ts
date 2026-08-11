@@ -259,6 +259,20 @@ describe('measureFunctions (approximate scan)', () => {
     assert.strictEqual(maxArgs, 2); // not the callback type's 1
   });
 
+  it('reads params of a formatter-wrapped arrow whose start line is `) => {`', () => {
+    const src = [
+      'const f = async (',
+      '  a: string,',
+      '  b: number,',
+      '  c: { x: number, y: number }',
+      ') => {',
+      '  return a;',
+      '};',
+    ].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 3);
+  });
+
   it('does not count control-flow blocks as functions', () => {
     const src = [
       'if (x) {', '  y();', '}',

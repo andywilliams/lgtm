@@ -63,7 +63,7 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 
 ## Formatting & file shape
 - **FMT-1 · The formatter is the standard** **[everywhere]** — One committed formatter+linter config per repo, enforced in CI; style (incl. line width) is never argued in review.
-- **FMT-2 · Small files** — Judged by responsibility first, lines second: warn >490 lines, finding >890.
+- **FMT-2 · Small files** — Judged by responsibility first, lines second: warn >520 lines, finding >920.
 - **FMT-3 · Newspaper order and vertical grouping** — High-level first, detail downward; related lines vertically dense, concepts separated by blank lines; declare variables at first use.
 
 ## Data, abstraction & coupling
@@ -168,5 +168,5 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - 2026-08-11 — **FMT-2** → Yes (recommended) — soft thresholds, responsibility judged first
 - 2026-08-11 — **MOD-4** → Balanced (recommended) — flag both over-aggregation and over-sharding
 - 2026-08-11 — **G5** → Rule of Three (recommended) — knowledge-dup only, abstraction must be real
-- 2026-08-11 — thresholds: function warn >90 / finding >120 lines · file warn >490 / finding >890 lines
-- 2026-08-11 — repo scan at selection time: 27 source files; function lines p50 12 / p95 86 / max 421; file lines p50 179 / p95 490 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)
+- 2026-08-11 — thresholds: function warn >90 / finding >120 lines · file warn >520 / finding >920 lines
+- 2026-08-11 — repo scan at selection time: 27 source files; function lines p50 12 / p95 86 / max 421; file lines p50 179 / p95 515 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)

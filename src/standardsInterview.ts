@@ -84,6 +84,30 @@ function isFunctionStart(line: string): boolean {
 }
 
 /**
+ * From a closing paren at (startLine, closeIdx), walk BACKWARDS — across earlier
+ * lines when the signature is formatter-wrapped — to the matching '(' and return
+ * the text between them. A wrapped arrow's detected start line is the `) => {`
+ * line itself, so its parameters live entirely on the lines above it.
+ */
+function walkBackParams(lines: string[], startLine: number, closeIdx: number, maxLookbehind = 12): string {
+  const buf: string[] = [];
+  let depth = 0;
+  for (let ln = startLine; ln >= 0 && ln > startLine - maxLookbehind; ln--) {
+    const text = ln === startLine ? lines[ln].slice(0, closeIdx + 1) : lines[ln] + '\n';
+    for (let p = text.length - 1; p >= 0; p--) {
+      const ch = text[p];
+      buf.push(ch);
+      if (ch === ')') depth++;
+      else if (ch === '(') {
+        depth--;
+        if (depth === 0) return buf.reverse().join('').slice(1, -1);
+      }
+    }
+  }
+  return ''; // unbalanced within the lookbehind — skip rather than guess
+}
+
+/**
  * Extract a function's parameter text starting at its detected start line,
  * following a WRAPPED signature across lines until the paren closes — long
  * parameter lists are exactly the ones formatters wrap, so reading only the
@@ -105,15 +129,7 @@ function extractParams(lines: string[], start: number, maxLookahead = 12): strin
     const arrowIdx = line.lastIndexOf('=>');
     let k = arrowIdx - 1;
     while (k >= 0 && /\s/.test(line[k])) k--;
-    if (k >= 0 && line[k] === ')') {
-      let depth = 0;
-      let m = k;
-      for (; m >= 0; m--) {
-        if (line[m] === ')') depth++;
-        else if (line[m] === '(') { depth--; if (depth === 0) break; }
-      }
-      return m >= 0 ? line.slice(m + 1, k) : '';
-    }
+    if (k >= 0 && line[k] === ')') return walkBackParams(lines, start, k);
     const bare = line.slice(0, arrowIdx).match(/([\w$]+)\s*$/);
     return bare ? bare[1] : ''; // unrecognized arrow shape — skip rather than guess
   }
@@ -350,8 +366,14 @@ class AnswerSource {
     const answer = this.scripted(key);
     if (answer !== undefined) {
       const n = parseInt(answer, 10);
-      console.log(chalk.cyan(`   [scripted] ${answer}`));
-      return Number.isFinite(n) && n > 0 ? n : initial;
+      // Validate BEFORE echoing — printing the raw value as "[scripted]" while a
+      // different number lands in the document would misreport an unattended run.
+      if (Number.isFinite(n) && n > 0) {
+        console.log(chalk.cyan(`   [scripted] ${n}`));
+        return n;
+      }
+      console.log(chalk.yellow(`   [scripted] "${answer}" is not a positive integer — using ${initial}`));
+      return initial;
     }
     if (this.neverPrompt || !process.stdin.isTTY) return initial;
     const response = await prompts({ type: 'text', name: 'value', message: `Value (enter for ${initial})` });
@@ -364,7 +386,10 @@ class AnswerSource {
   async textLoop(key: string, question: string): Promise<string[]> {
     console.log(chalk.white('─'.repeat(60)));
     console.log(chalk.bold(question));
-    if (this.map) {
+    // Keyed form: short-circuit only when the key is PRESENT — an absent key falls
+    // through to the interactive loop, consistent with select()/number() where a
+    // missing key still prompts in a TTY run (--yes/non-TTY suppress it below).
+    if (this.map && key in this.map) {
       const v = this.map[key];
       // Coerce a bare string to one rule — every other key takes a scalar, so this
       // is an easy slip, and silently dropping it defeats the unattended-run mode.
