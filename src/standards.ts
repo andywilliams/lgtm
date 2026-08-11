@@ -138,6 +138,29 @@ function substituteThresholds(rule: string, t: StandardsThresholds): string {
     .replaceAll('{fileMax}', String(t.fileMax));
 }
 
+const FN_PLACEHOLDER = /\{fn(?:Warn|Max)\}/;
+const FILE_PLACEHOLDER = /\{file(?:Warn|Max)\}/;
+
+/**
+ * Which threshold families the RESOLVED rule set actually consumes, given the
+ * profile and stance choices. The interview asks a threshold question only when
+ * some chosen rule will render the number — a stance whose rule text carries no
+ * placeholder (e.g. FUN-1 "strict") must not collect numbers it then discards,
+ * and the generated Choices line must not record thresholds nothing uses.
+ */
+export function thresholdsConsumed(profile: RepoProfile, askChoices: Record<string, string>): { fn: boolean; file: boolean } {
+  let fn = false;
+  let file = false;
+  const probe: StandardsSelections = { askChoices, thresholds: DEFAULT_THRESHOLDS, houseRules: [] };
+  for (const e of CATALOG) {
+    const resolved = resolveEntry(e, profile, probe);
+    if (resolved.kind !== 'rule') continue;
+    if (FN_PLACEHOLDER.test(resolved.rawRule)) fn = true;
+    if (FILE_PLACEHOLDER.test(resolved.rawRule)) file = true;
+  }
+  return { fn, file };
+}
+
 /**
  * Resolve what a catalog entry contributes to the generated doc for a given
  * profile + selections: its (possibly stance-chosen) rule line, or a
@@ -147,7 +170,7 @@ function resolveEntry(
   e: CatalogEntry,
   profile: RepoProfile,
   selections: StandardsSelections
-): { kind: 'rule'; line: string } | { kind: 'not-enforced'; reason: string } | { kind: 'skip' } {
+): { kind: 'rule'; line: string; rawRule: string } | { kind: 'not-enforced'; reason: string } | { kind: 'skip' } {
   const profileOverride = e.profiles?.[profile];
   if (profileOverride === 'off') {
     return { kind: 'not-enforced', reason: `Off for the ${profile} profile.` };
@@ -164,7 +187,7 @@ function resolveEntry(
     }
     rule = option.rule;
   }
-  return { kind: 'rule', line: substituteThresholds(rule, selections.thresholds) };
+  return { kind: 'rule', line: substituteThresholds(rule, selections.thresholds), rawRule: rule };
 }
 
 /**
@@ -239,8 +262,15 @@ export function generateStandardsDoc(opts: GenerateOptions): string {
     const option = e.ask!.options.find((o) => o.value === chosen) ?? e.ask!.options[0];
     lines.push(`- ${date} — **${e.id}** → ${option.label}`);
   }
+  // Record only the threshold families some rendered rule actually consumes —
+  // a stance without placeholders must not have numbers attributed to it.
+  const consumed = thresholdsConsumed(profile, selections.askChoices);
   const t = selections.thresholds;
-  lines.push(`- ${date} — thresholds: function warn >${t.fnWarn} / finding >${t.fnMax} lines · file warn >${t.fileWarn} / finding >${t.fileMax} lines`);
+  const thresholdParts = [
+    ...(consumed.fn ? [`function warn >${t.fnWarn} / finding >${t.fnMax} lines`] : []),
+    ...(consumed.file ? [`file warn >${t.fileWarn} / finding >${t.fileMax} lines`] : []),
+  ];
+  if (thresholdParts.length > 0) lines.push(`- ${date} — thresholds: ${thresholdParts.join(' · ')}`);
   if (opts.scanSummary) lines.push(`- ${date} — repo scan at selection time: ${opts.scanSummary}`);
   lines.push('');
 

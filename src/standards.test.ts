@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CATALOG, GROUPS, REJECTED, askEntries } from './standardsCatalog.js';
-import { findStandardsDoc, buildStandardsBlock, generateStandardsDoc, clampThresholds, DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
+import { findStandardsDoc, buildStandardsBlock, generateStandardsDoc, clampThresholds, thresholdsConsumed, DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { measureFunctions, proposeThresholds, type RepoScan } from './standardsInterview.js';
 
 // Guards three promises: the catalog is internally consistent (unique ids, every
@@ -142,6 +142,36 @@ describe('findStandardsDoc / buildStandardsBlock', () => {
     assert.ok(block.length < doc.length);
     assert.match(block, /middle truncated/);
     assert.match(block, /J1 · Wildcard imports/); // tail survived
+  });
+});
+
+describe('thresholdsConsumed', () => {
+  it('default stances consume both threshold families', () => {
+    const s = defaultSelections();
+    assert.deepStrictEqual(thresholdsConsumed('service', s.askChoices), { fn: true, file: true });
+  });
+
+  it('FUN-1 "strict" consumes no function thresholds (its rule has no placeholders)', () => {
+    const s = defaultSelections();
+    s.askChoices['FUN-1'] = 'strict';
+    assert.strictEqual(thresholdsConsumed('service', s.askChoices).fn, false);
+  });
+
+  it('FMT-2 "off" consumes no file thresholds', () => {
+    const s = defaultSelections();
+    s.askChoices['FMT-2'] = 'off';
+    assert.strictEqual(thresholdsConsumed('service', s.askChoices).file, false);
+  });
+
+  it('the generated Choices line records only consumed families', () => {
+    const s = defaultSelections();
+    s.askChoices['FUN-1'] = 'strict';
+    const doc = generateStandardsDoc({ repoName: 'r', profile: 'service', selections: s, date: '2026-08-11' });
+    assert.doesNotMatch(doc, /thresholds: function warn/);
+    assert.match(doc, /thresholds: file warn/);
+    s.askChoices['FMT-2'] = 'off';
+    const doc2 = generateStandardsDoc({ repoName: 'r', profile: 'service', selections: s, date: '2026-08-11' });
+    assert.doesNotMatch(doc2, /— thresholds:/);
   });
 });
 

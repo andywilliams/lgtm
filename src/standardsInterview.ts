@@ -3,8 +3,8 @@ import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { askEntries, catalogEntry, type RepoProfile } from './standardsCatalog.js';
-import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, type StandardsSelections, type StandardsThresholds } from './standards.js';
+import { askEntries, type RepoProfile } from './standardsCatalog.js';
+import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
 
 /**
  * `lgtm standards init` — produce the repo's STANDARDS.md from the catalog.
@@ -82,6 +82,34 @@ function isFunctionStart(line: string): boolean {
   return FN_DECL.test(line) || (METHODISH.test(line) && !CONTROL_KEYWORD.test(line));
 }
 
+/** Count top-level commas only — object/array/generic commas inside nesting don't add parameters. */
+function countTopLevelParams(params: string): number {
+  if (!params.trim()) return 0;
+  let depth = 0;
+  let args = 1;
+  for (const ch of params) {
+    if ('([{<'.includes(ch)) depth++;
+    else if (')]}>'.includes(ch)) depth--;
+    else if (ch === ',' && depth === 0) args++;
+  }
+  return args;
+}
+
+/** Walk brace depth from a function-start line to its matching close; returns the last line index. */
+function findBlockEnd(lines: string[], start: number): number {
+  let depth = 0;
+  let started = false;
+  let j = start;
+  for (; j < lines.length; j++) {
+    for (const ch of lines[j]) {
+      if (ch === '{') { depth++; started = true; }
+      else if (ch === '}') depth--;
+    }
+    if (started && depth <= 0) break;
+  }
+  return j;
+}
+
 /**
  * Approximate function lengths in a source file: detect likely function-start
  * lines, then track brace depth to the matching close. String/comment contents
@@ -93,35 +121,15 @@ export function measureFunctions(source: string): { lengths: number[]; maxArgs: 
   let maxArgs = 0;
   let i = 0;
   while (i < lines.length) {
-    const line = lines[i];
-    if (isFunctionStart(line)) {
-      const params = line.match(/\(([^)]*)\)/)?.[1] ?? '';
-      if (params.trim()) {
-        // Count top-level commas only — object/array/generic commas inside nesting don't add parameters.
-        let depth = 0;
-        let args = 1;
-        for (const ch of params) {
-          if ('([{<'.includes(ch)) depth++;
-          else if (')]}>'.includes(ch)) depth--;
-          else if (ch === ',' && depth === 0) args++;
-        }
-        maxArgs = Math.max(maxArgs, args);
-      }
-      let depth = 0;
-      let started = false;
-      let j = i;
-      for (; j < lines.length; j++) {
-        for (const ch of lines[j]) {
-          if (ch === '{') { depth++; started = true; }
-          else if (ch === '}') depth--;
-        }
-        if (started && depth <= 0) break;
-      }
-      lengths.push(j - i + 1);
-      i = j + 1;
-    } else {
+    if (!isFunctionStart(lines[i])) {
       i++;
+      continue;
     }
+    const params = lines[i].match(/\(([^)]*)\)/)?.[1] ?? '';
+    maxArgs = Math.max(maxArgs, countTopLevelParams(params));
+    const end = findBlockEnd(lines, i);
+    lengths.push(end - i + 1);
+    i = end + 1;
   }
   return { lengths, maxArgs };
 }
@@ -182,7 +190,8 @@ export function scanRepo(repoRoot: string): RepoScan {
     profileEvidence,
     summary:
       `${sources.length} source files; function lines p50 ${fnStats.p50} / p95 ${fnStats.p95} / max ${fnStats.max}; ` +
-      `file lines p50 ${fileStats.p50} / p95 ${fileStats.p95} / max ${fileStats.max} (approximate scan)`,
+      `file lines p50 ${fileStats.p50} / p95 ${fileStats.p95} / max ${fileStats.max}; ` +
+      `max positional args seen ${maxArgs} (F1 caps at 3) (approximate scan)`,
   };
 }
 
@@ -333,15 +342,13 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
       askChoices[e.id] = await answerSource.select(`${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
     }
 
-    // Threshold questions apply only when the chosen stance actually renders a rule —
-    // derived from the option's own (possibly empty) rule, not a hardcoded value name.
-    const stanceHasRule = (id: string): boolean => {
-      const entry = catalogEntry(id);
-      const option = entry?.ask?.options.find((o) => o.value === askChoices[id]);
-      return Boolean(option?.rule.trim());
-    };
+    // Threshold questions apply only when some CHOSEN rule will actually render
+    // the numbers — derived from placeholder consumption across the resolved rule
+    // set, so a stance whose rule text carries no threshold (e.g. FUN-1 "strict")
+    // never collects numbers it would then discard.
+    const consumed = thresholdsConsumed(profile, askChoices);
 
-    if (stanceHasRule('FUN-1')) {
+    if (consumed.fn) {
       console.log(chalk.gray(`   (scan: function lines p95 ${scan.fnLines.p95}, ${scan.fnOver(proposed.fnWarn)} over ${proposed.fnWarn}, ${scan.fnOver(proposed.fnMax)} over ${proposed.fnMax})`));
       const fnWarn = await answerSource.number(`Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
       // Re-propose the finding threshold relative to the warn just entered, so a
@@ -349,7 +356,7 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
       const fnMaxProposal = Math.max(proposed.fnMax, fnWarn + 30);
       thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number(`Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
     }
-    if (stanceHasRule('FMT-2')) {
+    if (consumed.file) {
       console.log(chalk.gray(`   (scan: file lines p95 ${scan.fileLines.p95}, ${scan.filesOver(proposed.fileWarn)} over ${proposed.fileWarn}, ${scan.filesOver(proposed.fileMax)} over ${proposed.fileMax})`));
       const fileWarn = await answerSource.number(`File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
       const fileMaxProposal = Math.max(proposed.fileMax, fileWarn + 400);
