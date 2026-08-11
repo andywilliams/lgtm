@@ -317,7 +317,7 @@ If a repo has no charter file, the URL/DIR brain providers are tried for a `<rep
 
 ## Engineering Standards (`lgtm standards`)
 
-The maintainability altitude's document. `lgtm review` asks *"is this code correct?"*, `lgtm arch` asks *"was this the right thing to build?"* — `STANDARDS.md` answers *"will this code be cheap to change in a year?"* It is the repo's **selection** from a built-in clean-code catalog: ~95 standards distilled from Clean Code (Martin, 2008) and its strongest counterpoint sources (Ousterhout, Fowler, Beck, Google eng-practices, linter conventions), each with a stable id. Full rationale, sources and the contested-positions record: [docs/clean-code-catalog.md](docs/clean-code-catalog.md).
+The maintainability altitude's document. `lgtm review` asks *"is this code correct?"*, `lgtm arch` asks *"was this the right thing to build?"* — `STANDARDS.md` answers *"will this code be cheap to change in a year?"* It is the repo's **selection** from a built-in clean-code catalog: 110+ standards distilled from Clean Code (Martin, 2008) and its strongest counterpoint sources (Ousterhout, Fowler, Beck, Google eng-practices, linter conventions), each with a stable id. Full rationale, sources and the contested-positions record: [docs/clean-code-catalog.md](docs/clean-code-catalog.md).
 
 ```bash
 # Scan the repo, answer the five contested toggles, write STANDARDS.md — no AI call

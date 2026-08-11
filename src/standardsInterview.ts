@@ -99,10 +99,23 @@ function extractParams(lines: string[], start: number, maxLookahead = 12): strin
   // arrow branch returns the callback type's params as the function's.
   const line = lines[start];
   if (!FN_KEYWORD_START.test(line) && !METHODISH.test(line) && line.includes('=>')) {
-    const parenParams = line.match(/\(([^()]*)\)\s*=>/);
-    if (parenParams) return parenParams[1];
-    const bareParam = line.match(/(?:^|[,(=]\s*)([\w$]+)\s*=>/);
-    return bareParam ? bareParam[1] : ''; // unrecognized arrow shape — skip rather than guess
+    // Anchor on the LAST arrow (the function-body one) and walk back over the
+    // balanced paren group before it — a first-match regex would grab an inner
+    // function-TYPED param's arrow instead: `const f = (a, cb: (x) => void) => {`.
+    const arrowIdx = line.lastIndexOf('=>');
+    let k = arrowIdx - 1;
+    while (k >= 0 && /\s/.test(line[k])) k--;
+    if (k >= 0 && line[k] === ')') {
+      let depth = 0;
+      let m = k;
+      for (; m >= 0; m--) {
+        if (line[m] === ')') depth++;
+        else if (line[m] === '(') { depth--; if (depth === 0) break; }
+      }
+      return m >= 0 ? line.slice(m + 1, k) : '';
+    }
+    const bare = line.slice(0, arrowIdx).match(/([\w$]+)\s*$/);
+    return bare ? bare[1] : ''; // unrecognized arrow shape — skip rather than guess
   }
   const open = line.indexOf('(');
   if (open === -1) return '';
@@ -269,8 +282,11 @@ export function proposeThresholds(scan: RepoScan): StandardsThresholds {
 class AnswerSource {
   private queue: string[] = [];
   private map: Record<string, unknown> | null = null;
+  /** --yes: never fall through to a terminal prompt — unanswered questions take their recommendation. */
+  private neverPrompt: boolean;
 
-  constructor(answersFile?: string) {
+  constructor(answersFile?: string, neverPrompt = false) {
+    this.neverPrompt = neverPrompt;
     if (!answersFile) return;
     const parsed = JSON.parse(readFileSync(answersFile, 'utf-8'));
     if (Array.isArray(parsed)) {
@@ -317,7 +333,7 @@ class AnswerSource {
       console.log(chalk.cyan(`   [scripted] ${matched.label}`));
       return matched.value;
     }
-    if (!process.stdin.isTTY) return initial; // scripted answers exhausted — recommendations stand
+    if (this.neverPrompt || !process.stdin.isTTY) return initial; // recommendations stand
     const response = await prompts({
       type: 'select',
       name: 'value',
@@ -337,7 +353,7 @@ class AnswerSource {
       console.log(chalk.cyan(`   [scripted] ${answer}`));
       return Number.isFinite(n) && n > 0 ? n : initial;
     }
-    if (!process.stdin.isTTY) return initial;
+    if (this.neverPrompt || !process.stdin.isTTY) return initial;
     const response = await prompts({ type: 'text', name: 'value', message: `Value (enter for ${initial})` });
     if (response.value === undefined) throw new Error('Interview cancelled');
     const n = parseInt(String(response.value).trim(), 10);
@@ -366,7 +382,7 @@ class AnswerSource {
         collected.push(answer.trim());
         continue;
       }
-      if (!process.stdin.isTTY) return collected;
+      if (this.neverPrompt || !process.stdin.isTTY) return collected;
       const response = await prompts({ type: 'text', name: 'value', message: 'House rule (/done to finish)' });
       if (response.value === undefined) throw new Error('Interview cancelled');
       const answer = String(response.value).trim();
@@ -398,7 +414,11 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
   if (options.profile && !parseProfile(options.profile)) {
     throw new Error(`Invalid --profile "${options.profile}". Use: lib, service, frontend`);
   }
-  const answerSource = new AnswerSource(options.answers);
+  // --yes and --answers COMPOSE through one path: scripted answers are consulted
+  // first, and --yes turns every remaining question into its recommendation
+  // instead of a prompt. (A separate --yes branch once skipped the AnswerSource
+  // entirely — silently ignoring an --answers file passed alongside it.)
+  const answerSource = new AnswerSource(options.answers, options.yes);
   if (!process.stdin.isTTY && !options.yes && !answerSource.hasScripted()) {
     throw new Error('The standards interview needs an interactive terminal (or --yes to accept recommendations, or --answers <file>).');
   }
@@ -411,48 +431,41 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   const proposed = proposeThresholds(scan);
 
-  let profile: RepoProfile;
-  let askChoices: Record<string, string> = {};
-  let thresholds: StandardsThresholds = proposed;
-  let houseRules: string[] = [];
+  if (options.yes) console.log(chalk.gray('\n   --yes: unanswered questions take their recommendation.'));
 
-  if (options.yes) {
-    profile = parseProfile(options.profile) ?? scan.profileGuess;
-    for (const e of askEntries()) askChoices[e.id] = e.ask!.options[0].value;
-    console.log(chalk.gray('\n   --yes: accepting every recommendation.'));
-  } else {
-    profile =
-      parseProfile(options.profile) ??
-      (await answerSource.select('profile', 'Repo profile — sets defaults and thresholds:', PROFILES, scan.profileGuess)) as RepoProfile;
+  const profile: RepoProfile =
+    parseProfile(options.profile) ??
+    (await answerSource.select('profile', 'Repo profile — sets defaults and thresholds:', PROFILES, scan.profileGuess)) as RepoProfile;
 
-    for (const e of askEntries()) {
-      askChoices[e.id] = await answerSource.select(e.id, `${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
-    }
-
-    // Threshold questions apply only when some CHOSEN rule will actually render
-    // the numbers — derived from placeholder consumption across the resolved rule
-    // set, so a stance whose rule text carries no threshold (e.g. FUN-1 "strict")
-    // never collects numbers it would then discard.
-    const consumed = thresholdsConsumed(profile, askChoices);
-
-    if (consumed.fn) {
-      console.log(chalk.gray(`   (scan: function lines p95 ${scan.fnLines.p95}, ${scan.fnOver(proposed.fnWarn)} over ${proposed.fnWarn}, ${scan.fnOver(proposed.fnMax)} over ${proposed.fnMax})`));
-      const fnWarn = await answerSource.number('fnWarn', `Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
-      // Re-propose the finding threshold relative to the warn just entered, so a
-      // custom warn can't sit above a stale proposed finding value.
-      const fnMaxProposal = Math.max(proposed.fnMax, fnWarn + 30);
-      thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number('fnMax', `Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
-    }
-    if (consumed.file) {
-      console.log(chalk.gray(`   (scan: file lines p95 ${scan.fileLines.p95}, ${scan.filesOver(proposed.fileWarn)} over ${proposed.fileWarn}, ${scan.filesOver(proposed.fileMax)} over ${proposed.fileMax})`));
-      const fileWarn = await answerSource.number('fileWarn', `File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
-      const fileMaxProposal = Math.max(proposed.fileMax, fileWarn + 400);
-      thresholds = { ...thresholds, fileWarn, fileMax: await answerSource.number('fileMax', `File-length finding threshold (proposed ${fileMaxProposal}):`, fileMaxProposal) };
-    }
-    thresholds = clampThresholds(thresholds);
-
-    houseRules = await answerSource.textLoop('houseRules', 'House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
+  const askChoices: Record<string, string> = {};
+  for (const e of askEntries()) {
+    askChoices[e.id] = await answerSource.select(e.id, `${e.id} — ${e.ask!.question}`, e.ask!.options, e.ask!.options[0].value);
   }
+
+  // Threshold questions apply only when some CHOSEN rule will actually render
+  // the numbers — derived from placeholder consumption across the resolved rule
+  // set, so a stance whose rule text carries no threshold (e.g. FUN-1 "strict")
+  // never collects numbers it would then discard.
+  const consumed = thresholdsConsumed(profile, askChoices);
+  let thresholds: StandardsThresholds = proposed;
+
+  if (consumed.fn) {
+    console.log(chalk.gray(`   (scan: function lines p95 ${scan.fnLines.p95}, ${scan.fnOver(proposed.fnWarn)} over ${proposed.fnWarn}, ${scan.fnOver(proposed.fnMax)} over ${proposed.fnMax})`));
+    const fnWarn = await answerSource.number('fnWarn', `Function-length warn threshold (proposed ${proposed.fnWarn}):`, proposed.fnWarn);
+    // Re-propose the finding threshold relative to the warn just entered, so a
+    // custom warn can't sit above a stale proposed finding value.
+    const fnMaxProposal = Math.max(proposed.fnMax, fnWarn + 30);
+    thresholds = { ...thresholds, fnWarn, fnMax: await answerSource.number('fnMax', `Function-length finding threshold (proposed ${fnMaxProposal}):`, fnMaxProposal) };
+  }
+  if (consumed.file) {
+    console.log(chalk.gray(`   (scan: file lines p95 ${scan.fileLines.p95}, ${scan.filesOver(proposed.fileWarn)} over ${proposed.fileWarn}, ${scan.filesOver(proposed.fileMax)} over ${proposed.fileMax})`));
+    const fileWarn = await answerSource.number('fileWarn', `File-length warn threshold (proposed ${proposed.fileWarn}):`, proposed.fileWarn);
+    const fileMaxProposal = Math.max(proposed.fileMax, fileWarn + 400);
+    thresholds = { ...thresholds, fileWarn, fileMax: await answerSource.number('fileMax', `File-length finding threshold (proposed ${fileMaxProposal}):`, fileMaxProposal) };
+  }
+  thresholds = clampThresholds(thresholds);
+
+  const houseRules = await answerSource.textLoop('houseRules', 'House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
 
   const selections: StandardsSelections = { askChoices, thresholds, houseRules };
   const doc = generateStandardsDoc({ repoName, profile, selections, scanSummary: scan.summary });

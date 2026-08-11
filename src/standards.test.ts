@@ -249,6 +249,16 @@ describe('measureFunctions (approximate scan)', () => {
     assert.strictEqual(maxArgs, 4);
   });
 
+  it('reads a const-arrow\'s full param list, not an inner function-typed param\'s', () => {
+    const src = [
+      'const f = (a: number, cb: (x: number) => void) => {',
+      '  cb(a);',
+      '};',
+    ].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 2); // not the callback type's 1
+  });
+
   it('does not count control-flow blocks as functions', () => {
     const src = [
       'if (x) {', '  y();', '}',
