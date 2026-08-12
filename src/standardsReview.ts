@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import { basename, join, relative, resolve, extname } from 'node:path';
 import chalk from 'chalk';
 import { reviewPR, type AIProvider } from './review.js';
@@ -38,6 +38,21 @@ export interface StandardsReviewOptions {
   /** Don't run ESLint at all (no gate, no suppression). */
   noLint: boolean;
   maxFiles: number;
+}
+
+/**
+ * Canonical path key for matching our targets against ESLint's reported paths.
+ * `resolve()` alone is not enough: ESLint reports fully-resolved paths, so on a
+ * symlinked prefix (macOS `/tmp` → `/private/tmp`) the two spellings of the same
+ * file never compare equal and every lint finding silently fails to match its
+ * file — losing both the gate and the suppression.
+ */
+function pathKey(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
 }
 
 function tryExec(cmd: string, args: string[], cwd?: string): string {
@@ -148,8 +163,12 @@ export function findCoveringTests(repoRoot: string, absPath: string, maxTests = 
     .trim()
     .split('\n')
     .filter(Boolean);
-  // Filename match is far stronger evidence than a mention in the body.
-  const ranked = hits.sort((a, b) => Number(basename(b).includes(stem)) - Number(basename(a).includes(stem)));
+  // A filename match is far stronger evidence than a mention in the body — but it
+  // must be the WHOLE stem, not a substring: stem `db` should not treat
+  // `olddbcache.test.ts` as its test file, which would throw away the precision
+  // `-w` just bought on the content side.
+  const namesFile = (p: string): boolean => new RegExp(`(^|[./\\-_])${stem}([./\\-_]|$)`).test(basename(p));
+  const ranked = hits.sort((a, b) => Number(namesFile(b)) - Number(namesFile(a)));
   const out: { path: string; content: string }[] = [];
   for (const rel of ranked.slice(0, maxTests)) {
     try {
@@ -208,7 +227,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   // the staleness of judgement findings in another, so it must not block them.
   const structuralByFile = new Map<string, LintFinding[]>();
   for (const f of structural) {
-    const key = resolve(f.file);
+    const key = pathKey(f.file);
     structuralByFile.set(key, [...(structuralByFile.get(key) ?? []), f]);
   }
   const gatedFiles: string[] = [];
@@ -226,7 +245,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
 
     // Structural findings change the shape of THIS file, so any judgement about
     // its internals would be stale on arrival — skip it, but keep going.
-    const fileStructural = structuralByFile.get(resolve(abs)) ?? [];
+    const fileStructural = structuralByFile.get(pathKey(abs)) ?? [];
     if (fileStructural.length > 0 && !skipLintGate) {
       gatedFiles.push(rel);
       log(chalk.yellow(`\n🛑 ${rel}: ${fileStructural.length} structural lint finding(s) outstanding — skipping the AI pass for this file.`));
@@ -252,7 +271,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
 
     log(chalk.blue(`\n🤖 Reviewing ${rel} (${content.split('\n').length} lines${tests.length ? `, ${tests.length} covering test file(s)` : ', NO covering tests found'})...`));
 
-    const fileLint = other.filter((f) => resolve(f.file) === abs);
+    const fileLint = other.filter((f) => pathKey(f.file) === pathKey(abs));
     const result = await reviewPR(diff, `Standards review: ${rel}`, 'Existing production file under retroactive standards review.', 'medium', ai, tests.length ? fileContents : undefined, '', '', '', {
       standards: standards.block,
       charter: charterBlock,
@@ -279,9 +298,16 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
       gatedFiles,
       skippedTooLarge,
       standardsDoc: standards.path ?? null,
-      // `ran: false` means the mechanical quarter was never checked — very different
-      // from it running clean, and a consumer must be able to tell them apart.
-      lint: { ran: lintRan, structural: structural.length, other: other.length, suppressed: other.length },
+      // Three distinct states, not two: the mechanical quarter can be checked,
+      // deliberately skipped, or silently unavailable — and a consumer weighing
+      // how much to trust these findings needs to tell those apart.
+      lint: {
+        ran: lintRan,
+        status: noLint ? 'skipped-by-flag' : lintRan ? 'ran' : 'no-eslint-config',
+        structural: structural.length,
+        other: other.length,
+        suppressed: other.length,
+      },
       commentsFound: allComments.length,
       comments: allComments.map((c) => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
     }));
