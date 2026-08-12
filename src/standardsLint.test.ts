@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
-import { buildWholeFileDiff, collectTargets, lintAsDecided } from './standardsReview.js';
+import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { askEntries } from './standardsCatalog.js';
 
@@ -166,10 +166,26 @@ describe('lint findings feed the gate and the suppression channel', () => {
     assert.strictEqual(decided[0].file, 'src/a.js');
   });
 
-  it('detects flat and legacy eslint configs', () => {
+  it('detects flat, TypeScript-flat and legacy eslint configs', () => {
     assert.strictEqual(hasEslintConfig(dir), false);
     writeFileSync(join(dir, 'eslint.config.js'), 'module.exports = [];');
     assert.strictEqual(hasEslintConfig(dir), true);
+    rmSync(join(dir, 'eslint.config.js'));
+    writeFileSync(join(dir, 'eslint.config.ts'), 'export default [];');
+    assert.strictEqual(hasEslintConfig(dir), true);
+  });
+
+  it('reports no-config rather than a clean run when there is no eslint config', () => {
+    const run = runEslint(dir, [join(dir, 'a.js')]);
+    assert.strictEqual(run.ok, false);
+    if (!run.ok) assert.strictEqual(run.reason, 'no-config');
+  });
+});
+
+describe('repoRootOf', () => {
+  it('throws rather than silently falling back to cwd outside a repo', () => {
+    // A cwd fallback would apply the CURRENT repo's STANDARDS.md to foreign code.
+    assert.throws(() => repoRootOf(dir), /not inside a git repository/);
   });
 });
 
@@ -187,6 +203,18 @@ describe('buildWholeFileDiff', () => {
   it('handles a file with no trailing newline', () => {
     const diff = buildWholeFileDiff(dir, join(dir, 'a.js'), 'only');
     assert.match(diff, /@@ -0,0 \+1,1 @@/);
+  });
+});
+
+describe('findCoveringTests — regex-metachar stems', () => {
+  it('does not throw on a stem containing regex metacharacters', () => {
+    // Same class as the git-grep -F fix: a stem is a filename, not a pattern.
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    for (const name of ['a+b.js', 'x[1].js', 'foo.bar.js']) {
+      const f = join(dir, 'src', name);
+      writeFileSync(f, 'x');
+      assert.doesNotThrow(() => findCoveringTests(dir, f), `threw on stem from ${name}`);
+    }
   });
 });
 

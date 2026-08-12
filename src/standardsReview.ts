@@ -125,10 +125,19 @@ export function buildWholeFileDiff(repoRoot: string, absPath: string, content: s
  * nothing", which matter very differently: in the first case the mechanical
  * quarter of the catalog was never checked at all.
  */
-export function runEslint(repoRoot: string, files: string[]): LintFinding[] | null {
-  if (!hasEslintConfig(repoRoot)) return null;
+export type EslintRun =
+  | { ok: true; findings: LintFinding[] }
+  | { ok: false; reason: 'no-config' | 'failed' };
+
+export function runEslint(repoRoot: string, files: string[]): EslintRun {
+  if (!hasEslintConfig(repoRoot)) return { ok: false, reason: 'no-config' };
   const raw = tryExec('npx', ['--no-install', 'eslint', '--format', 'json', ...files], repoRoot);
-  return raw.trim() ? parseEslintJson(raw) : [];
+  // A successful `--format json` run ALWAYS prints valid JSON — `[]` when there
+  // is nothing to report. Empty output therefore means ESLint could not run at
+  // all (not installed, config threw), which must not be reported as "clean":
+  // that would claim the mechanical quarter was checked when it never was.
+  if (!raw.trim()) return { ok: false, reason: 'failed' };
+  return { ok: true, findings: parseEslintJson(raw) };
 }
 
 /**
@@ -167,7 +176,10 @@ export function findCoveringTests(repoRoot: string, absPath: string, maxTests = 
   // must be the WHOLE stem, not a substring: stem `db` should not treat
   // `olddbcache.test.ts` as its test file, which would throw away the precision
   // `-w` just bought on the content side.
-  const namesFile = (p: string): boolean => new RegExp(`(^|[./\\-_])${stem}([./\\-_]|$)`).test(basename(p));
+  // Escape the stem: it is a filename, not a pattern — the same reason the grep
+  // above uses -F. Stems like `a+b` or `x[1]` would otherwise throw here.
+  const escaped = stem.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const namesFile = (p: string): boolean => new RegExp(`(^|[./\\-_])${escaped}([./\\-_]|$)`).test(basename(p));
   const ranked = hits.sort((a, b) => Number(namesFile(b)) - Number(namesFile(a)));
   const out: { path: string; content: string }[] = [];
   for (const rel of ranked.slice(0, maxTests)) {
@@ -205,18 +217,23 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   log(chalk.gray('   Retroactive altitude: what does this code cost the next person to change it?'));
 
   // --- Deterministic half first -------------------------------------------
-  let lintRan = false;
+  let lintStatus: 'ran' | 'skipped-by-flag' | 'no-eslint-config' | 'eslint-failed' = 'skipped-by-flag';
   let structural: LintFinding[] = [];
   let other: LintFinding[] = [];
   if (!noLint) {
     log(chalk.blue('\n🔧 Running ESLint first (deterministic — nothing here should cost an AI finding)...'));
-    const lintFindings = runEslint(repoRoot, files);
-    if (lintFindings === null) {
-      log(chalk.yellow('⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'));
+    const run = runEslint(repoRoot, files);
+    if (!run.ok) {
+      lintStatus = run.reason === 'no-config' ? 'no-eslint-config' : 'eslint-failed';
+      log(chalk.yellow(
+        run.reason === 'no-config'
+          ? '⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'
+          : '⚠  ESLint produced no output (not installed, or the config threw) — the mechanical standards were NOT checked. Findings below cover only what lint cannot see.'
+      ));
     } else {
-      lintRan = true;
-      ({ structural, other } = partitionStructural(lintFindings));
-      log(chalk.gray(`   ${lintFindings.length} lint finding(s): ${structural.length} structural, ${other.length} other`));
+      lintStatus = 'ran';
+      ({ structural, other } = partitionStructural(run.findings));
+      log(chalk.gray(`   ${run.findings.length} lint finding(s): ${structural.length} structural, ${other.length} other`));
       for (const f of structural) {
         log(chalk.yellow(`   ⚠ ${relative(repoRoot, f.file)}:${f.line}  ${f.rule} — ${f.message}`));
       }
@@ -302,8 +319,8 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
       // deliberately skipped, or silently unavailable — and a consumer weighing
       // how much to trust these findings needs to tell those apart.
       lint: {
-        ran: lintRan,
-        status: noLint ? 'skipped-by-flag' : lintRan ? 'ran' : 'no-eslint-config',
+        ran: lintStatus === 'ran',
+        status: lintStatus,
         structural: structural.length,
         other: other.length,
         suppressed: other.length,
@@ -318,6 +335,8 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   log(chalk.white(`${allComments.length} finding(s) across ${files.length - gatedFiles.length - skippedTooLarge.length} reviewed file(s)`));
   if (gatedFiles.length > 0) log(chalk.yellow(`${gatedFiles.length} file(s) skipped pending structural lint fixes: ${gatedFiles.join(', ')}`));
   if (skippedTooLarge.length > 0) log(chalk.yellow(`${skippedTooLarge.length} file(s) skipped as too large: ${skippedTooLarge.join(', ')}`));
-  if (!lintRan && !noLint) log(chalk.yellow('⚠  ESLint never ran — the mechanical standards were not checked at all.'));
+  if (lintStatus === 'no-eslint-config' || lintStatus === 'eslint-failed') {
+    log(chalk.yellow(`⚠  ESLint never ran (${lintStatus}) — the mechanical standards were not checked at all.`));
+  }
   if (other.length > 0) log(chalk.gray(`(${other.length} lint finding(s) were passed through as already-reported, so no AI slot was spent on them)`));
 }
