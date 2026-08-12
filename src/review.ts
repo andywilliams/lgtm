@@ -74,7 +74,7 @@ export async function reviewPR(
   usageContext?: string,
   expandedContext?: string,
   handbookContext?: string,
-  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string }
+  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean }
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -132,6 +132,22 @@ The charter above is context for ONE extra check only: if this diff (a) contradi
   // The block arrives fully-formed from buildStandardsBlock — instruction included.
   const standardsSection = extra?.standards ?? '';
 
+  // Retro mode: the "diff" is an entire EXISTING file presented as additions. Without
+  // this the model reads it as newly-authored work and miscalibrates — it reports
+  // long-standing intentional behaviour as a defect someone is about to ship, and
+  // recommends tests as though the file were being introduced today.
+  let retroSection = '';
+  if (extra?.retro) {
+    retroSection = `\n## ⚠️ This is EXISTING code, not a proposed change
+The diff above is a whole file from the current codebase, rendered as additions so you can see every line. It was NOT just written — it has been running in production, possibly for years. Adjust accordingly:
+- Ask "what will this cost the next person who has to change it?", NOT "what does this change break?".
+- Behaviour that looks odd may be deliberate and load-bearing. Say so as a question rather than asserting a regression.
+- Reserve "BUG" for a defect you can demonstrate with concrete inputs. Long-standing suboptimal structure is not a bug; it is debt — report it as SUGGESTION with the cost it imposes.
+- Prefer findings whose fix is BOUNDED. A finding nobody can act on without a month of work is worth less than a small one that lands this week.
+- **If a finding asks for a REFACTOR (splitting, extracting, restructuring), first check the provided context for tests covering that code. If there are none, say so IN the finding and make writing characterisation tests the first step** — restructuring code whose behaviour nothing pins is how a cleanup becomes an outage.
+`;
+  }
+
   // Previously-dismissed findings (--decided): don't re-litigate settled points across a fix loop.
   let decidedSection = '';
   if (extra?.decided && extra.decided.length > 0) {
@@ -156,7 +172,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${handbookContextSection}${charterSection}${standardsSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
+${handbookContextSection}${charterSection}${standardsSection}${retroSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path

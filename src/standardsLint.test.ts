@@ -1,0 +1,245 @@
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
+import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
+import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
+import { askEntries } from './standardsCatalog.js';
+
+// Guards the deterministic half: that the emitted rules actually track the
+// STANDARDS.md selections (the whole point — one source, two mechanisms, no
+// drift), that the fragment matches the repo's module system, and that the
+// synthetic whole-file diff keeps line numbers aligned with the real file.
+
+let dir: string;
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'lgtm-lint-test-'));
+});
+
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+function selections(overrides: Partial<StandardsSelections> = {}): StandardsSelections {
+  const askChoices: Record<string, string> = {};
+  for (const e of askEntries()) askChoices[e.id] = e.ask!.options[0].value;
+  return { askChoices, thresholds: DEFAULT_THRESHOLDS, houseRules: [], ...overrides };
+}
+
+describe('deriveRules — the doc drives the config', () => {
+  it('uses the chosen thresholds, not the defaults', () => {
+    const s = selections({ thresholds: { fnWarn: 60, fnMax: 90, fileWarn: 500, fileMax: 900 } });
+    const rules = deriveRules(s);
+    const fn = rules.find((r) => r.name === 'max-lines-per-function')!;
+    assert.strictEqual((fn.value as any[])[1].max, 90);
+    const file = rules.find((r) => r.name === 'max-lines')!;
+    assert.strictEqual((file.value as any[])[1].max, 900);
+  });
+
+  it('FUN-1 "strict" tightens both length and complexity', () => {
+    const s = selections();
+    s.askChoices['FUN-1'] = 'strict';
+    const rules = deriveRules(s);
+    assert.strictEqual(((rules.find((r) => r.name === 'max-lines-per-function')!).value as any[])[1].max, 20);
+    assert.strictEqual(((rules.find((r) => r.name === 'complexity')!).value as any[])[1], 10);
+  });
+
+  it('FUN-1 "off" emits no length or complexity rule at all', () => {
+    const s = selections();
+    s.askChoices['FUN-1'] = 'off';
+    const names = deriveRules(s).map((r) => r.name);
+    assert.ok(!names.includes('max-lines-per-function'));
+    assert.ok(!names.includes('complexity'));
+    assert.ok(names.includes('max-depth')); // unrelated rules survive
+  });
+
+  it('FMT-2 "off" emits no file-length rule', () => {
+    const s = selections();
+    s.askChoices['FMT-2'] = 'off';
+    assert.ok(!deriveRules(s).map((r) => r.name).includes('max-lines'));
+  });
+
+  it('applies the requested severity to every rule', () => {
+    for (const r of deriveRules(selections(), 'error')) {
+      const sev = Array.isArray(r.value) ? r.value[0] : r.value;
+      assert.strictEqual(sev, 'error', `${r.name} did not take the severity`);
+    }
+  });
+
+  it('every rule names the standard it came from', () => {
+    for (const r of deriveRules(selections())) assert.ok(r.from.trim(), `${r.name} has no provenance`);
+  });
+});
+
+describe('generateEslintFragment', () => {
+  it('emits CommonJS by default and ESM when the manifest says so', () => {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x' }));
+    assert.strictEqual(usesEsm(dir), false);
+    const cjs = generateEslintFragment({ repoName: 'x', profile: 'service', selections: selections(), esm: false });
+    assert.match(cjs, /module\.exports = \{ standardsRules \}/);
+    assert.doesNotMatch(cjs, /export default/);
+
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x', type: 'module' }));
+    assert.strictEqual(usesEsm(dir), true);
+    const esm = generateEslintFragment({ repoName: 'x', profile: 'service', selections: selections(), esm: true });
+    assert.match(esm, /export default standardsRules/);
+    assert.match(esm, /export const standardsRules =/);
+  });
+
+  it('is not fooled by an unrelated "type" field elsewhere in the manifest', () => {
+    // A repository block carries `"type": "git"` — grepping for "type" would misread it.
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x', repository: { type: 'git', url: 'u' } }));
+    assert.strictEqual(usesEsm(dir), false);
+  });
+
+  it('treats a missing or unreadable manifest as CommonJS', () => {
+    assert.strictEqual(usesEsm(dir), false);
+    writeFileSync(join(dir, 'package.json'), '{ not json');
+    assert.strictEqual(usesEsm(dir), false);
+  });
+
+  it('carries the new-code CI hint and marks itself generated', () => {
+    const out = generateEslintFragment({ repoName: 'x', profile: 'service', selections: selections(), esm: false, date: '2026-08-12' });
+    assert.match(out, /GENERATED by `lgtm standards init` on 2026-08-12/);
+    assert.match(out, /git diff --name-only/);
+    assert.match(out, /do not edit by hand/);
+  });
+
+  it('lists plugin-dependent rules as comments only, never active', () => {
+    const out = generateEslintFragment({ repoName: 'x', profile: 'service', selections: selections(), esm: false });
+    const active = out.slice(out.indexOf('standardsRules = {'), out.indexOf('};'));
+    assert.doesNotMatch(active, /sonarjs|typescript-eslint|jest\//);
+    assert.match(out, /sonarjs\/cognitive-complexity/); // present, but in the commented block
+  });
+});
+
+describe('jsLiteral — sound serialisation, not regex-munged JSON', () => {
+  it('preserves commas and quotes inside string values', () => {
+    assert.strictEqual(jsLiteral({ argsIgnorePattern: '^(_|a,b)$' }), "{ argsIgnorePattern: '^(_|a,b)$' }");
+    assert.strictEqual(jsLiteral("it's"), "'it\\'s'");
+    assert.strictEqual(jsLiteral({ 'kebab-key': 1 }), "{ 'kebab-key': 1 }");
+  });
+
+  it('round-trips through a real JS parser', () => {
+    const value = ['warn', { max: 90, pattern: '^(a,b)$', nested: [1, true, null] }];
+    // eslint-disable-next-line no-eval
+    assert.deepStrictEqual(eval(`(${jsLiteral(value)})`), value);
+  });
+});
+
+describe('lint findings feed the gate and the suppression channel', () => {
+  it('parses eslint json, skipping rule-less parse errors', () => {
+    const raw = JSON.stringify([
+      { filePath: '/r/a.js', messages: [
+        { ruleId: 'max-params', line: 10, message: 'too many', severity: 1 },
+        { ruleId: null, line: 1, message: 'Parsing error', severity: 2 },
+      ] },
+    ]);
+    const findings = parseEslintJson(raw);
+    assert.strictEqual(findings.length, 1);
+    assert.strictEqual(findings[0].rule, 'max-params');
+    assert.strictEqual(findings[0].severity, 'warning');
+  });
+
+  it('returns [] on unparseable output rather than throwing', () => {
+    assert.deepStrictEqual(parseEslintJson('not json'), []);
+  });
+
+  it('partitions shape-changing rules from the rest', () => {
+    const f = (rule: string): any => ({ file: '/r/a.js', line: 1, rule, message: '', severity: 'warning' });
+    const { structural, other } = partitionStructural([f('max-params'), f('no-unused-vars'), f('complexity'), f('no-negated-condition')]);
+    assert.deepStrictEqual(structural.map((s) => s.rule).sort(), ['complexity', 'max-params']);
+    assert.deepStrictEqual(other.map((s) => s.rule).sort(), ['no-negated-condition', 'no-unused-vars']);
+    for (const r of structural) assert.ok(STRUCTURAL_RULES.has(r.rule));
+  });
+
+  it('converts lint findings into repo-relative already-reported entries', () => {
+    const decided = lintAsDecided('/r', [{ file: '/r/src/a.js', line: 7, rule: 'no-unused-vars', message: "'x' is unused", severity: 'error' }]);
+    assert.strictEqual(decided.length, 1);
+    assert.match(decided[0].title, /no-unused-vars/);
+    assert.match(decided[0].reason, /ESLint/);
+    assert.strictEqual(decided[0].line, 7);
+    // Must match the synthetic diff's repo-relative headers, or the model can't connect them.
+    assert.strictEqual(decided[0].file, 'src/a.js');
+  });
+
+  it('detects flat, TypeScript-flat and legacy eslint configs', () => {
+    assert.strictEqual(hasEslintConfig(dir), false);
+    writeFileSync(join(dir, 'eslint.config.js'), 'module.exports = [];');
+    assert.strictEqual(hasEslintConfig(dir), true);
+    rmSync(join(dir, 'eslint.config.js'));
+    writeFileSync(join(dir, 'eslint.config.ts'), 'export default [];');
+    assert.strictEqual(hasEslintConfig(dir), true);
+  });
+
+  it("reports no-config rather than a clean run when there is no eslint config", () => {
+    const run = runEslint(dir, [join(dir, 'a.js')]);
+    assert.strictEqual(run.ok, false);
+    if (!run.ok) assert.strictEqual(run.status, 'no-eslint-config');
+  });
+});
+
+describe('repoRootOf', () => {
+  it('throws rather than silently falling back to cwd outside a repo', () => {
+    // A cwd fallback would apply the CURRENT repo's STANDARDS.md to foreign code.
+    assert.throws(() => repoRootOf(dir), /not inside a git repository/);
+  });
+});
+
+describe('buildWholeFileDiff', () => {
+  it('renders every line as an addition with line numbers matching the file', () => {
+    const diff = buildWholeFileDiff(dir, join(dir, 'src', 'a.js'), 'const a = 1;\nconst b = 2;\n');
+    assert.match(diff, /^diff --git a\/src\/a\.js b\/src\/a\.js$/m);
+    assert.match(diff, /^@@ -0,0 \+1,2 @@$/m);
+    assert.match(diff, /^\+const a = 1;$/m);
+    assert.match(diff, /^\+const b = 2;$/m);
+    // The trailing newline must not become a phantom third line.
+    assert.strictEqual(diff.split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).length, 2);
+  });
+
+  it('handles a file with no trailing newline', () => {
+    const diff = buildWholeFileDiff(dir, join(dir, 'a.js'), 'only');
+    assert.match(diff, /@@ -0,0 \+1,1 @@/);
+  });
+});
+
+describe('findCoveringTests — regex-metachar stems', () => {
+  it('does not throw on a stem containing regex metacharacters', () => {
+    // Same class as the git-grep -F fix: a stem is a filename, not a pattern.
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    for (const name of ['a+b.js', 'x[1].js', 'foo.bar.js']) {
+      const f = join(dir, 'src', name);
+      writeFileSync(f, 'x');
+      assert.doesNotThrow(() => findCoveringTests(dir, f), `threw on stem from ${name}`);
+    }
+  });
+});
+
+describe('collectTargets', () => {
+  it('returns a single file unchanged', () => {
+    const f = join(dir, 'a.js');
+    writeFileSync(f, 'x');
+    assert.deepStrictEqual(collectTargets(f, 5), [f]);
+  });
+
+  it('walks a directory, skipping tests, node_modules and non-source files', () => {
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    mkdirSync(join(dir, 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(dir, 'src', 'a.ts'), 'x');
+    writeFileSync(join(dir, 'src', 'b.test.ts'), 'x');
+    writeFileSync(join(dir, 'src', 'readme.md'), 'x');
+    writeFileSync(join(dir, 'node_modules', 'pkg', 'c.js'), 'x');
+    const found = collectTargets(join(dir, 'src'), 10).map((p) => p.split('/').pop());
+    assert.deepStrictEqual(found, ['a.ts']);
+  });
+
+  it('honours the file cap and errors on a missing path', () => {
+    mkdirSync(join(dir, 'src'), { recursive: true });
+    for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, 'src', `${n}.js`), 'x');
+    assert.strictEqual(collectTargets(join(dir, 'src'), 2).length, 2);
+    assert.throws(() => collectTargets(join(dir, 'nope'), 5), /No such file or directory/);
+  });
+});
