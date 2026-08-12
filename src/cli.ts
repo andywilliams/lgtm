@@ -11,6 +11,7 @@ import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli,
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
 import { runStandardsInit } from './standardsInterview.js';
+import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
@@ -1668,12 +1669,42 @@ standards
   .option('--answers <file>', 'Scripted answers: JSON object keyed by question id (profile, FUN-1…, fnWarn…, houseRules) — or a positional array')
   .option('--yes', 'Accept every recommendation non-interactively (scan-informed)', false)
   .option('--profile <profile>', 'Repo profile: lib, service, frontend (skips the profile question)')
+  .option('--no-eslint', 'Skip emitting the derived ESLint rules fragment (.lgtm/standards.eslint.js)')
+  .option('--severity <level>', 'Severity for the emitted mechanical rules: warn, error', 'warn')
   .action(async (options) => {
+    if (!['warn', 'error'].includes(options.severity)) {
+      exitWithTextError('Invalid --severity. Use: warn, error');
+    }
     try {
-      await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile });
+      await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile, noEslint: options.eslint === false, severity: options.severity });
     } catch (error: any) {
       console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
       process.exit(1);
+    }
+  });
+
+standards
+  .command('review <target>')
+  .description('Retroactively review an existing file or directory against STANDARDS.md (ESLint first, then the AI pass)')
+  .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .option('--agent', 'Agent mode: read-only JSON to stdout', false)
+  .option('--skip-lint-gate', 'Review even when structural lint findings are outstanding', false)
+  .option('--no-lint', 'Skip the ESLint pass entirely (no gate, no suppression)')
+  .option('--max-files <n>', 'Cap files reviewed when the target is a directory', '5')
+  .action(async (target: string, options) => {
+    const agent = options.agent;
+    function exitWithError(message: string): never {
+      if (agent) console.log(JSON.stringify({ success: false, mode: 'standards-review', error: message, comments: [] }));
+      else console.error(chalk.red(message));
+      process.exit(1);
+    }
+    const maxFiles = parseInt(options.maxFiles, 10);
+    if (isNaN(maxFiles) || maxFiles < 1) exitWithError('--max-files must be a positive integer');
+    const ai = resolveProvider(options.ai, exitWithError);
+    try {
+      await runStandardsReview({ target, ai, agent, skipLintGate: options.skipLintGate, noLint: options.lint === false, maxFiles });
+    } catch (error: any) {
+      exitWithError(error?.message ?? String(error));
     }
   });
 

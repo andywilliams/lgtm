@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
+import { generateEslintFragment, usesEsm, deriveRules } from './standardsLint.js';
 
 /**
  * `lgtm standards init` — produce the repo's STANDARDS.md from the catalog.
@@ -23,6 +24,10 @@ import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsCo
 export interface StandardsInitOptions {
   out?: string;
   force?: boolean;
+  /** Skip emitting the derived ESLint fragment. */
+  noEslint?: boolean;
+  /** Severity for the emitted mechanical rules (default 'warn' — see the fragment header). */
+  severity?: 'warn' | 'error';
   /** JSON file with an array of pre-supplied answers (scripted runs). */
   answers?: string;
   /** Accept every recommendation non-interactively (scan-informed thresholds, default stances). */
@@ -526,6 +531,20 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   writeFileSync(outPath, doc.endsWith('\n') ? doc : doc + '\n');
   console.log(chalk.green(`\n✓ Wrote ${outPath}`));
+
+  // The mechanical half, derived from the same selections so the two can't drift.
+  if (!options.noEslint) {
+    const fragmentDir = join(repoRoot, '.lgtm');
+    const fragmentPath = join(fragmentDir, 'standards.eslint.js');
+    const severity = options.severity ?? 'warn';
+    const fragment = generateEslintFragment({ repoName, profile, selections, esm: usesEsm(repoRoot), severity });
+    mkdirSync(fragmentDir, { recursive: true });
+    writeFileSync(fragmentPath, fragment);
+    const ruleCount = deriveRules(selections, severity).length;
+    console.log(chalk.green(`✓ Wrote ${fragmentPath}`));
+    console.log(chalk.gray(`   ${ruleCount} mechanical rules at "${severity}" — spread \`standardsRules\` into your ESLint config (the file's header shows how).`));
+    console.log(chalk.gray('   Every rule here is one the standards review no longer has to spend a finding on.'));
+  }
   const summaryParts = [`Profile ${profile}`];
   if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);
   if (consumedOut.file) summaryParts.push(`file >${thresholds.fileWarn}/${thresholds.fileMax} lines`);

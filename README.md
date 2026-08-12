@@ -344,6 +344,41 @@ The generated document records four kinds of decision, all yours to edit:
 
 **In normal reviews:** when the repo has a `STANDARDS.md` (root, then `docs/`, then `.lgtm/`), `lgtm review` may raise at most **three** `(standard <id>)`-prefixed SUGGESTION findings, each citing the standard's own line from your document — and never anything the document lists as not-enforced or rejected. Turn it off per run with `--no-standards`.
 
+### The mechanical half: `.lgtm/standards.eslint.js`
+
+About a quarter of the catalogue is mechanical — lengths, counts, nesting, banned constructs — and none of it should ever cost an LLM a finding slot. So `standards init` also emits those as ESLint rules, derived from the same answers, so the prose and the config can't drift:
+
+```js
+// FUN-1 · Function size
+'max-lines-per-function': ['warn', { max: 90, skipBlankLines: true, skipComments: true }],
+// F1 · Few arguments
+'max-params': ['warn', 3],
+```
+
+It's a **fragment to spread**, not a competing config (a generator that clobbers hand-written work gets run once and never again), it matches your repo's module system, and it defaults to `warn` — adopting thresholds on an existing codebase lights up legacy that predates them. Since standards are new-code scoped, lint the diff rather than the world in CI:
+
+```bash
+npx eslint $(git diff --name-only origin/main... | grep -E '\.[jt]sx?$')
+```
+
+Plugin-dependent rules worth having (cognitive complexity, the TypeScript safety rules) are listed as commented suggestions rather than emitted active, since a fragment requiring an uninstalled plugin is a broken config.
+
+### Retroactive review: `lgtm standards review <file|dir>`
+
+Reviews code that **isn't changing** — for improving what's already there.
+
+```bash
+lgtm standards review src/db/annotationsService.js
+lgtm standards review src/db --max-files 5 --agent
+```
+
+The file is rendered as a synthetic whole-file diff (every line an addition), which keeps line anchoring exact, plus a framing paragraph so the model treats it as production code rather than a proposed change. Then:
+
+1. **ESLint runs first.** Deterministic, free, and nothing it catches should cost an AI finding.
+2. **Structural findings gate the AI pass** — length, complexity, nesting, parameter counts. A function about to be split makes any judgement about its internals stale before you read it, so clear those first (`--skip-lint-gate` to override).
+3. **Everything else is passed through as already-reported**, so the capped AI pass spends its slots only on what lint cannot see.
+4. **Covering tests are pulled in as context** — and if a finding asks for a refactor with no tests behind it, writing characterisation tests becomes the first step. Restructuring code whose behaviour nothing pins is how a cleanup becomes an outage.
+
 ## Retrying Failed Uploads
 
 If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:
