@@ -125,12 +125,21 @@ export function buildWholeFileDiff(repoRoot: string, absPath: string, content: s
  * nothing", which matter very differently: in the first case the mechanical
  * quarter of the catalog was never checked at all.
  */
+/** Why the deterministic pass did or didn't happen — four distinct states a consumer must tell apart. */
+export type LintStatus = 'ran' | 'skipped-by-flag' | 'no-eslint-config' | 'eslint-not-installed' | 'eslint-failed';
+
 export type EslintRun =
   | { ok: true; findings: LintFinding[] }
-  | { ok: false; reason: 'no-config' | 'failed' };
+  | { ok: false; reason: 'no-config' | 'not-installed' | 'failed' };
 
 export function runEslint(repoRoot: string, files: string[]): EslintRun {
   if (!hasEslintConfig(repoRoot)) return { ok: false, reason: 'no-config' };
+  // A committed config is weak evidence the binary is present — an un-installed
+  // checkout is the likeliest cause of an empty run, and "ESLint failed" without
+  // saying so sends people looking in the wrong place.
+  if (!tryExec('npx', ['--no-install', 'eslint', '--version'], repoRoot).trim()) {
+    return { ok: false, reason: 'not-installed' };
+  }
   const raw = tryExec('npx', ['--no-install', 'eslint', '--format', 'json', ...files], repoRoot);
   // A successful `--format json` run ALWAYS prints valid JSON — `[]` when there
   // is nothing to report. Empty output therefore means ESLint could not run at
@@ -217,19 +226,21 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   log(chalk.gray('   Retroactive altitude: what does this code cost the next person to change it?'));
 
   // --- Deterministic half first -------------------------------------------
-  let lintStatus: 'ran' | 'skipped-by-flag' | 'no-eslint-config' | 'eslint-failed' = 'skipped-by-flag';
+  let lintStatus: LintStatus = 'skipped-by-flag';
   let structural: LintFinding[] = [];
   let other: LintFinding[] = [];
   if (!noLint) {
     log(chalk.blue('\n🔧 Running ESLint first (deterministic — nothing here should cost an AI finding)...'));
     const run = runEslint(repoRoot, files);
     if (!run.ok) {
-      lintStatus = run.reason === 'no-config' ? 'no-eslint-config' : 'eslint-failed';
-      log(chalk.yellow(
-        run.reason === 'no-config'
-          ? '⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'
-          : '⚠  ESLint produced no output (not installed, or the config threw) — the mechanical standards were NOT checked. Findings below cover only what lint cannot see.'
-      ));
+      const messages: Record<Exclude<EslintRun, { ok: true }>['reason'], [LintStatus, string]> = {
+        'no-config': ['no-eslint-config', '⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'],
+        'not-installed': ['eslint-not-installed', '⚠  ESLint is configured but not installed in this checkout — run `npm install`. The mechanical standards were NOT checked.'],
+        failed: ['eslint-failed', '⚠  ESLint produced no output (the config likely threw) — the mechanical standards were NOT checked. Findings below cover only what lint cannot see.'],
+      };
+      const [status, message] = messages[run.reason];
+      lintStatus = status;
+      log(chalk.yellow(message));
     } else {
       lintStatus = 'ran';
       ({ structural, other } = partitionStructural(run.findings));
@@ -335,7 +346,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   log(chalk.white(`${allComments.length} finding(s) across ${files.length - gatedFiles.length - skippedTooLarge.length} reviewed file(s)`));
   if (gatedFiles.length > 0) log(chalk.yellow(`${gatedFiles.length} file(s) skipped pending structural lint fixes: ${gatedFiles.join(', ')}`));
   if (skippedTooLarge.length > 0) log(chalk.yellow(`${skippedTooLarge.length} file(s) skipped as too large: ${skippedTooLarge.join(', ')}`));
-  if (lintStatus === 'no-eslint-config' || lintStatus === 'eslint-failed') {
+  if (lintStatus !== 'ran' && lintStatus !== 'skipped-by-flag') {
     log(chalk.yellow(`⚠  ESLint never ran (${lintStatus}) — the mechanical standards were not checked at all.`));
   }
   if (other.length > 0) log(chalk.gray(`(${other.length} lint finding(s) were passed through as already-reported, so no AI slot was spent on them)`));

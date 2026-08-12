@@ -1676,9 +1676,9 @@ standards
       exitWithTextError('Invalid --severity. Use: warn, error');
     }
     // --severity only affects the fragment, so pairing it with --no-eslint is a
-    // no-op the user almost certainly didn't intend. Check the option SOURCE so
-    // the default value doesn't trigger a spurious warning.
-    // Anything other than 'default' means the user supplied it (cli, env, config).
+    // no-op the user almost certainly didn't intend. `eslint === false` only
+    // happens when --no-eslint was passed; the source check distinguishes an
+    // explicit --severity from its default.
     if (options.eslint === false && command.getOptionValueSource('severity') !== 'default') {
       console.error(chalk.yellow('⚠  --severity has no effect with --no-eslint (no fragment is emitted).'));
     }
