@@ -1698,8 +1698,10 @@ standards
       else console.error(chalk.red(message));
       process.exit(1);
     }
+    // parseInt('5abc') is 5 — reject malformed input rather than guessing intent.
+    if (!/^\d+$/.test(String(options.maxFiles).trim())) exitWithError('--max-files must be a positive integer');
     const maxFiles = parseInt(options.maxFiles, 10);
-    if (isNaN(maxFiles) || maxFiles < 1) exitWithError('--max-files must be a positive integer');
+    if (maxFiles < 1) exitWithError('--max-files must be a positive integer');
     const ai = resolveProvider(options.ai, exitWithError);
     try {
       await runStandardsReview({ target, ai, agent, skipLintGate: options.skipLintGate, noLint: options.lint === false, maxFiles });

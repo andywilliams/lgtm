@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig } from './standardsLint.js';
+import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
 import { buildWholeFileDiff, collectTargets, lintAsDecided } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { askEntries } from './standardsCatalog.js';
@@ -116,6 +116,20 @@ describe('generateEslintFragment', () => {
   });
 });
 
+describe('jsLiteral — sound serialisation, not regex-munged JSON', () => {
+  it('preserves commas and quotes inside string values', () => {
+    assert.strictEqual(jsLiteral({ argsIgnorePattern: '^(_|a,b)$' }), "{ argsIgnorePattern: '^(_|a,b)$' }");
+    assert.strictEqual(jsLiteral("it's"), "'it\\'s'");
+    assert.strictEqual(jsLiteral({ 'kebab-key': 1 }), "{ 'kebab-key': 1 }");
+  });
+
+  it('round-trips through a real JS parser', () => {
+    const value = ['warn', { max: 90, pattern: '^(a,b)$', nested: [1, true, null] }];
+    // eslint-disable-next-line no-eval
+    assert.deepStrictEqual(eval(`(${jsLiteral(value)})`), value);
+  });
+});
+
 describe('lint findings feed the gate and the suppression channel', () => {
   it('parses eslint json, skipping rule-less parse errors', () => {
     const raw = JSON.stringify([
@@ -142,12 +156,14 @@ describe('lint findings feed the gate and the suppression channel', () => {
     for (const r of structural) assert.ok(STRUCTURAL_RULES.has(r.rule));
   });
 
-  it('converts lint findings into already-reported entries carrying the rule id', () => {
-    const decided = lintAsDecided([{ file: '/r/a.js', line: 7, rule: 'no-unused-vars', message: "'x' is unused", severity: 'error' }]);
+  it('converts lint findings into repo-relative already-reported entries', () => {
+    const decided = lintAsDecided('/r', [{ file: '/r/src/a.js', line: 7, rule: 'no-unused-vars', message: "'x' is unused", severity: 'error' }]);
     assert.strictEqual(decided.length, 1);
     assert.match(decided[0].title, /no-unused-vars/);
     assert.match(decided[0].reason, /ESLint/);
     assert.strictEqual(decided[0].line, 7);
+    // Must match the synthetic diff's repo-relative headers, or the model can't connect them.
+    assert.strictEqual(decided[0].file, 'src/a.js');
   });
 
   it('detects flat and legacy eslint configs', () => {

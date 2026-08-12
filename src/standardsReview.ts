@@ -94,33 +94,51 @@ export function buildWholeFileDiff(repoRoot: string, absPath: string, content: s
   ].join('\n');
 }
 
-/** Run ESLint over the targets, using the repo's own config. Best-effort. */
-export function runEslint(repoRoot: string, files: string[]): LintFinding[] {
-  if (!hasEslintConfig(repoRoot)) return [];
+/**
+ * Run ESLint over the targets using the repo's own config. Returns null when
+ * there is no config — distinguishing "lint never ran" from "lint ran and found
+ * nothing", which matter very differently: in the first case the mechanical
+ * quarter of the catalog was never checked at all.
+ */
+export function runEslint(repoRoot: string, files: string[]): LintFinding[] | null {
+  if (!hasEslintConfig(repoRoot)) return null;
   const raw = tryExec('npx', ['--no-install', 'eslint', '--format', 'json', ...files], repoRoot);
   return raw.trim() ? parseEslintJson(raw) : [];
 }
 
-/** Lint findings become "already reported" entries so the model never re-spends a slot on them. */
-export function lintAsDecided(findings: LintFinding[]): DecidedFinding[] {
+/**
+ * Lint findings become "already reported" entries so the model never re-spends a
+ * slot on them. Paths are made REPO-relative to match the synthetic diff's
+ * headers — a cwd-relative path wouldn't line up when run from a subdirectory,
+ * and the model would fail to connect the two and re-raise what this suppresses.
+ */
+export function lintAsDecided(repoRoot: string, findings: LintFinding[]): DecidedFinding[] {
   return findings.map((f) => ({
-    file: relative(process.cwd(), f.file) || f.file,
+    file: relative(repoRoot, f.file) || f.file,
     line: f.line,
     title: `${f.rule}: ${f.message}`,
     reason: 'Already reported deterministically by ESLint — do not spend a finding on it.',
   }));
 }
 
-/** Test files that reference the target, so the reviewer can see whether a refactor is covered. */
+/**
+ * Test files covering the target. Ranked: a test whose own filename carries the
+ * stem first, then whole-word references. The bare-substring search this replaced
+ * matched almost every test in the repo for a common stem (`db`, `index`,
+ * `utils`) — and since the retro prompt leans on this to judge whether a refactor
+ * is safe, a false "covered" reading is worse than finding nothing.
+ */
 export function findCoveringTests(repoRoot: string, absPath: string, maxTests = 3): { path: string; content: string }[] {
   const stem = basename(absPath).replace(/\.[jt]sx?$/, '');
-  const hits = tryExec('git', ['-C', repoRoot, 'grep', '-l', '-e', stem, '--', '*test*', '*spec*'])
+  if (stem.length < 3) return []; // too generic to attribute coverage from
+  const hits = tryExec('git', ['-C', repoRoot, 'grep', '-l', '-w', '-e', stem, '--', '*test*', '*spec*'])
     .trim()
     .split('\n')
-    .filter(Boolean)
-    .slice(0, maxTests);
+    .filter(Boolean);
+  // Filename match is far stronger evidence than a mention in the body.
+  const ranked = hits.sort((a, b) => Number(basename(b).includes(stem)) - Number(basename(a).includes(stem)));
   const out: { path: string; content: string }[] = [];
-  for (const rel of hits) {
+  for (const rel of ranked.slice(0, maxTests)) {
     try {
       const content = readFileSync(join(repoRoot, rel), 'utf-8');
       out.push({ path: rel, content: content.length > 20000 ? content.slice(0, 20000) + '\n// … (truncated)' : content });
@@ -155,15 +173,16 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   log(chalk.gray('   Retroactive altitude: what does this code cost the next person to change it?'));
 
   // --- Deterministic half first -------------------------------------------
-  let lintFindings: LintFinding[] = [];
+  let lintRan = false;
   let structural: LintFinding[] = [];
   let other: LintFinding[] = [];
   if (!noLint) {
-    if (!hasEslintConfig(repoRoot)) {
-      log(chalk.yellow('\n⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'));
+    log(chalk.blue('\n🔧 Running ESLint first (deterministic — nothing here should cost an AI finding)...'));
+    const lintFindings = runEslint(repoRoot, files);
+    if (lintFindings === null) {
+      log(chalk.yellow('⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'));
     } else {
-      log(chalk.blue('\n🔧 Running ESLint first (deterministic — nothing here should cost an AI finding)...'));
-      lintFindings = runEslint(repoRoot, files);
+      lintRan = true;
       ({ structural, other } = partitionStructural(lintFindings));
       log(chalk.gray(`   ${lintFindings.length} lint finding(s): ${structural.length} structural, ${other.length} other`));
       for (const f of structural) {
@@ -172,22 +191,14 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     }
   }
 
-  // Structural violations gate the judgement pass: splitting a function invalidates
-  // any finding about naming or cohesion inside it.
-  if (structural.length > 0 && !skipLintGate) {
-    log(chalk.yellow(`\n🛑 ${structural.length} structural lint finding(s) outstanding — stopping before the AI pass.`));
-    log(chalk.white('   These change the SHAPE of the code, so judgement findings about it would be stale on arrival.'));
-    log(chalk.white('   Fix them, then re-run. To review anyway: --skip-lint-gate'));
-    if (agent) {
-      console.log(JSON.stringify({
-        success: true, mode: 'standards-review', gated: true,
-        reason: 'structural lint findings outstanding',
-        lint: { structural: structural.length, other: other.length, findings: structural },
-        comments: [],
-      }));
-    }
-    return;
+  // The gate is PER FILE: a structural violation in one file says nothing about
+  // the staleness of judgement findings in another, so it must not block them.
+  const structuralByFile = new Map<string, LintFinding[]>();
+  for (const f of structural) {
+    const key = resolve(f.file);
+    structuralByFile.set(key, [...(structuralByFile.get(key) ?? []), f]);
   }
+  const gatedFiles: string[] = [];
 
   // --- Judgement half ------------------------------------------------------
   const standards = buildStandardsBlock(repoRoot);
@@ -198,10 +209,23 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   const allComments: (ReviewComment & { target: string })[] = [];
   for (const abs of files) {
     const rel = relative(repoRoot, abs);
+
+    // Structural findings change the shape of THIS file, so any judgement about
+    // its internals would be stale on arrival — skip it, but keep going.
+    const fileStructural = structuralByFile.get(resolve(abs)) ?? [];
+    if (fileStructural.length > 0 && !skipLintGate) {
+      gatedFiles.push(rel);
+      log(chalk.yellow(`\n🛑 ${rel}: ${fileStructural.length} structural lint finding(s) outstanding — skipping the AI pass for this file.`));
+      log(chalk.gray('   Fix them and re-run, or pass --skip-lint-gate to review anyway.'));
+      continue;
+    }
+
     const content = readFileSync(abs, 'utf-8');
     const diff = buildWholeFileDiff(repoRoot, abs, content);
+    // Report the FILE's size, not the padded diff's — a user told "52k > 50k"
+    // will measure their file, find 49k, and be rightly confused.
     if (diff.length > MAX_DIFF_CHARS) {
-      log(chalk.yellow(`\n⊘ ${rel} is too large to review whole (${Math.round(diff.length / 1000)}k chars > ${MAX_DIFF_CHARS / 1000}k). Target a smaller unit within it.`));
+      log(chalk.yellow(`\n⊘ ${rel} is too large to review whole (${Math.round(content.length / 1000)}k chars; the limit is ~${MAX_DIFF_CHARS / 1000}k once rendered as a diff). Target a smaller unit within it.`));
       continue;
     }
 
@@ -218,7 +242,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
       standards: standards.block,
       charter: charterBlock,
       retro: true,
-      decided: fileLint.length ? lintAsDecided(fileLint) : undefined,
+      decided: fileLint.length ? lintAsDecided(repoRoot, fileLint) : undefined,
     });
 
     for (const c of result.comments) allComments.push({ ...c, target: rel });
@@ -233,10 +257,13 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     console.log(JSON.stringify({
       success: true,
       mode: 'standards-review',
-      gated: false,
-      filesReviewed: files.length,
+      filesTargeted: files.length,
+      filesReviewed: files.length - gatedFiles.length,
+      gatedFiles,
       standardsDoc: standards.path ?? null,
-      lint: { structural: structural.length, other: other.length, suppressed: other.length },
+      // `ran: false` means the mechanical quarter was never checked — very different
+      // from it running clean, and a consumer must be able to tell them apart.
+      lint: { ran: lintRan, structural: structural.length, other: other.length, suppressed: other.length },
       commentsFound: allComments.length,
       comments: allComments.map((c) => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
     }));
@@ -244,6 +271,8 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   }
 
   log(chalk.white('═'.repeat(60)));
-  log(chalk.white(`${allComments.length} finding(s) across ${files.length} file(s)`));
+  log(chalk.white(`${allComments.length} finding(s) across ${files.length - gatedFiles.length} reviewed file(s)`));
+  if (gatedFiles.length > 0) log(chalk.yellow(`${gatedFiles.length} file(s) skipped pending structural lint fixes: ${gatedFiles.join(', ')}`));
+  if (!lintRan && !noLint) log(chalk.yellow('⚠  ESLint never ran — the mechanical standards were not checked at all.'));
   if (other.length > 0) log(chalk.gray(`(${other.length} lint finding(s) were passed through as already-reported, so no AI slot was spent on them)`));
 }

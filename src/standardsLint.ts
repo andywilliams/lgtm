@@ -93,8 +93,24 @@ export function usesEsm(repoRoot: string): boolean {
   }
 }
 
-function formatValue(v: unknown): string {
-  return JSON.stringify(v).replace(/"([^"]+)":/g, '$1: ').replace(/,(?=\S)/g, ', ').replace(/"/g, "'");
+/**
+ * Serialise a rule value as a JS literal. Written as a real recursive serialiser
+ * rather than regex post-processing of JSON.stringify: blind passes over the
+ * JSON text rewrite commas and quotes INSIDE string literals too, which silently
+ * corrupts any rule carrying a pattern like `'^(_|a,b)$'`.
+ */
+export function jsLiteral(v: unknown): string {
+  if (typeof v === 'string') return `'${v.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+  if (typeof v === 'number' || typeof v === 'boolean' || v === null) return String(v);
+  if (Array.isArray(v)) return `[${v.map(jsLiteral).join(', ')}]`;
+  if (typeof v === 'object') {
+    const entries = Object.entries(v as Record<string, unknown>).map(([k, val]) => {
+      const key = /^[A-Za-z_$][\w$]*$/.test(k) ? k : `'${k.replace(/'/g, "\\'")}'`;
+      return `${key}: ${jsLiteral(val)}`;
+    });
+    return `{ ${entries.join(', ')} }`;
+  }
+  return 'undefined';
 }
 
 /**
@@ -108,6 +124,8 @@ export function generateEslintFragment(opts: {
   esm: boolean;
   severity?: LintSeverity;
   date?: string;
+  /** Fragment location relative to the repo root, so the wiring hint resolves for real. */
+  fragmentRelPath?: string;
 }): string {
   const severity = opts.severity ?? 'warn';
   const date = opts.date ?? new Date().toISOString().slice(0, 10);
@@ -127,15 +145,20 @@ export function generateEslintFragment(opts: {
   lines.push(' * diff rather than the world in CI:');
   lines.push(' *     npx eslint $(git diff --name-only origin/main... | grep -E "\\.[jt]sx?$")');
   lines.push(' *');
-  lines.push(' * Wire it into your existing flat config:');
-  lines.push(` *     ${opts.esm ? "import standardsRules from './.lgtm/standards.eslint.js';" : "const { standardsRules } = require('./.lgtm/standards.eslint.js');"}`);
+  // The hint is relative to the REPO ROOT; a config living in a subdirectory or a
+  // monorepo package must adjust it, so say so rather than emit a path that
+  // silently resolves to nothing.
+  const relPath = opts.fragmentRelPath ?? '.lgtm/standards.eslint.js';
+  lines.push(' * Wire it into your existing flat config (path is relative to the repo root —');
+  lines.push(' * adjust if your ESLint config lives elsewhere, e.g. a monorepo package):');
+  lines.push(` *     ${opts.esm ? `import standardsRules from './${relPath}';` : `const { standardsRules } = require('./${relPath}');`}`);
   lines.push(' *     // then inside your config object:  rules: { ...standardsRules, ...yourOverrides }');
   lines.push(' */');
   lines.push('');
   lines.push(`${exportLine} {`);
   for (const r of rules) {
     lines.push(`  // ${r.from}`);
-    lines.push(`  '${r.name}': ${formatValue(r.value)},`);
+    lines.push(`  '${r.name}': ${jsLiteral(r.value)},`);
   }
   lines.push('};');
   lines.push('');

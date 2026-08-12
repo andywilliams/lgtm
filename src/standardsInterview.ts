@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
@@ -534,10 +534,20 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   // The mechanical half, derived from the same selections so the two can't drift.
   if (!options.noEslint) {
-    const fragmentDir = join(repoRoot, '.lgtm');
+    // The fragment follows the DOCUMENT. With `--out /tmp/draft/STANDARDS.md`
+    // (a preview run), writing the fragment into the real repo would be an
+    // unrequested side effect on the working tree.
+    const fragmentDir = join(dirname(outPath), '.lgtm');
     const fragmentPath = join(fragmentDir, 'standards.eslint.js');
     const severity = options.severity ?? 'warn';
-    const fragment = generateEslintFragment({ repoName, profile, selections, esm: usesEsm(repoRoot), severity });
+    const fragment = generateEslintFragment({
+      repoName,
+      profile,
+      selections,
+      esm: usesEsm(repoRoot),
+      severity,
+      fragmentRelPath: relative(repoRoot, fragmentPath) || 'standards.eslint.js',
+    });
     mkdirSync(fragmentDir, { recursive: true });
     writeFileSync(fragmentPath, fragment);
     const ruleCount = deriveRules(selections, severity).length;
