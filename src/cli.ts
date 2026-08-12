@@ -1671,9 +1671,15 @@ standards
   .option('--profile <profile>', 'Repo profile: lib, service, frontend (skips the profile question)')
   .option('--no-eslint', 'Skip emitting the derived ESLint rules fragment (.lgtm/standards.eslint.js)')
   .option('--severity <level>', 'Severity for the emitted mechanical rules: warn, error', 'warn')
-  .action(async (options) => {
+  .action(async (options, command) => {
     if (!['warn', 'error'].includes(options.severity)) {
       exitWithTextError('Invalid --severity. Use: warn, error');
+    }
+    // --severity only affects the fragment, so pairing it with --no-eslint is a
+    // no-op the user almost certainly didn't intend. Check the option SOURCE so
+    // the default value doesn't trigger a spurious warning.
+    if (options.eslint === false && command?.getOptionValueSource?.('severity') === 'cli') {
+      console.error(chalk.yellow('⚠  --severity has no effect with --no-eslint (no fragment is emitted).'));
     }
     try {
       await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile, noEslint: options.eslint === false, severity: options.severity });

@@ -49,8 +49,18 @@ function tryExec(cmd: string, args: string[], cwd?: string): string {
   }
 }
 
+/**
+ * The git root CONTAINING the target. Throws rather than falling back to cwd:
+ * a silent fallback would load the current repo's STANDARDS.md and apply it to
+ * unrelated code somewhere else on disk — normative rules attributed to a repo
+ * that never adopted them.
+ */
 export function repoRootOf(from: string): string {
-  return tryExec('git', ['-C', from, 'rev-parse', '--show-toplevel']).trim() || process.cwd();
+  const root = tryExec('git', ['-C', from, 'rev-parse', '--show-toplevel']).trim();
+  if (!root) {
+    throw new Error(`${from} is not inside a git repository — standards are per-repo, so there is no document to review against.`);
+  }
+  return root;
 }
 
 /** Expand a target path into the source files to review. */
@@ -131,7 +141,10 @@ export function lintAsDecided(repoRoot: string, findings: LintFinding[]): Decide
 export function findCoveringTests(repoRoot: string, absPath: string, maxTests = 3): { path: string; content: string }[] {
   const stem = basename(absPath).replace(/\.[jt]sx?$/, '');
   if (stem.length < 3) return []; // too generic to attribute coverage from
-  const hits = tryExec('git', ['-C', repoRoot, 'grep', '-l', '-w', '-e', stem, '--', '*test*', '*spec*'])
+  // -F (fixed string): a stem is a filename, not a pattern. `foo.bar` would
+  // otherwise over-match via `.`, and `a+b` / `x[1]` make git reject the regex
+  // outright — which tryExec would swallow into a false "no tests" reading.
+  const hits = tryExec('git', ['-C', repoRoot, 'grep', '-l', '-F', '-w', '-e', stem, '--', '*test*', '*spec*'])
     .trim()
     .split('\n')
     .filter(Boolean);
@@ -199,6 +212,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     structuralByFile.set(key, [...(structuralByFile.get(key) ?? []), f]);
   }
   const gatedFiles: string[] = [];
+  const skippedTooLarge: string[] = [];
 
   // --- Judgement half ------------------------------------------------------
   const standards = buildStandardsBlock(repoRoot);
@@ -225,6 +239,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     // Report the FILE's size, not the padded diff's — a user told "52k > 50k"
     // will measure their file, find 49k, and be rightly confused.
     if (diff.length > MAX_DIFF_CHARS) {
+      skippedTooLarge.push(rel);
       log(chalk.yellow(`\n⊘ ${rel} is too large to review whole (${Math.round(content.length / 1000)}k chars; the limit is ~${MAX_DIFF_CHARS / 1000}k once rendered as a diff). Target a smaller unit within it.`));
       continue;
     }
@@ -258,8 +273,11 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
       success: true,
       mode: 'standards-review',
       filesTargeted: files.length,
-      filesReviewed: files.length - gatedFiles.length,
+      // Every target is accounted for: a file skipped for size must not read as
+      // "reviewed, no findings" — that's the same class of ambiguity as lint.ran.
+      filesReviewed: files.length - gatedFiles.length - skippedTooLarge.length,
       gatedFiles,
+      skippedTooLarge,
       standardsDoc: standards.path ?? null,
       // `ran: false` means the mechanical quarter was never checked — very different
       // from it running clean, and a consumer must be able to tell them apart.
@@ -271,8 +289,9 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   }
 
   log(chalk.white('═'.repeat(60)));
-  log(chalk.white(`${allComments.length} finding(s) across ${files.length - gatedFiles.length} reviewed file(s)`));
+  log(chalk.white(`${allComments.length} finding(s) across ${files.length - gatedFiles.length - skippedTooLarge.length} reviewed file(s)`));
   if (gatedFiles.length > 0) log(chalk.yellow(`${gatedFiles.length} file(s) skipped pending structural lint fixes: ${gatedFiles.join(', ')}`));
+  if (skippedTooLarge.length > 0) log(chalk.yellow(`${skippedTooLarge.length} file(s) skipped as too large: ${skippedTooLarge.join(', ')}`));
   if (!lintRan && !noLint) log(chalk.yellow('⚠  ESLint never ran — the mechanical standards were not checked at all.'));
   if (other.length > 0) log(chalk.gray(`(${other.length} lint finding(s) were passed through as already-reported, so no AI slot was spent on them)`));
 }

@@ -110,7 +110,10 @@ export function jsLiteral(v: unknown): string {
     });
     return `{ ${entries.join(', ')} }`;
   }
-  return 'undefined';
+  // Functions, symbols, bigint and undefined have no faithful literal form here.
+  // This generates a config file — emitting a plausible-looking `undefined` for
+  // them would be silent corruption, so refuse instead.
+  throw new Error(`Cannot serialise ${typeof v} into an ESLint rule value`);
 }
 
 /**
@@ -184,9 +187,14 @@ export interface LintFinding {
 
 /** True when the repo has a flat or legacy ESLint config we can run against. */
 export function hasEslintConfig(repoRoot: string): boolean {
-  return ['eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', '.eslintrc', '.eslintrc.js', '.eslintrc.json', '.eslintrc.cjs'].some((f) =>
-    existsSync(join(repoRoot, f))
-  );
+  return [
+    // Flat config, including the TypeScript forms common in TS repos.
+    'eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs',
+    'eslint.config.ts', 'eslint.config.mts', 'eslint.config.cts',
+    // Legacy.
+    '.eslintrc', '.eslintrc.js', '.eslintrc.cjs', '.eslintrc.json',
+    '.eslintrc.yml', '.eslintrc.yaml',
+  ].some((f) => existsSync(join(repoRoot, f)));
 }
 
 /** Parse `eslint --format json` output into findings. Never throws — lint is best-effort context. */
