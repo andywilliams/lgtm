@@ -175,10 +175,10 @@ describe('lint findings feed the gate and the suppression channel', () => {
     assert.strictEqual(hasEslintConfig(dir), true);
   });
 
-  it('reports no-config rather than a clean run when there is no eslint config', () => {
+  it("reports no-config rather than a clean run when there is no eslint config", () => {
     const run = runEslint(dir, [join(dir, 'a.js')]);
     assert.strictEqual(run.ok, false);
-    if (!run.ok) assert.strictEqual(run.reason, 'no-config');
+    if (!run.ok) assert.strictEqual(run.status, 'no-eslint-config');
   });
 });
 

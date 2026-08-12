@@ -128,25 +128,23 @@ export function buildWholeFileDiff(repoRoot: string, absPath: string, content: s
 /** Why the deterministic pass did or didn't happen — four distinct states a consumer must tell apart. */
 export type LintStatus = 'ran' | 'skipped-by-flag' | 'no-eslint-config' | 'eslint-not-installed' | 'eslint-failed';
 
-export type EslintRun =
-  | { ok: true; findings: LintFinding[] }
-  | { ok: false; reason: 'no-config' | 'not-installed' | 'failed' };
+/** Failure states share the caller's vocabulary, so no hand-written mapping can drift out of sync. */
+export type LintFailure = Exclude<LintStatus, 'ran' | 'skipped-by-flag'>;
+
+export type EslintRun = { ok: true; findings: LintFinding[] } | { ok: false; status: LintFailure };
 
 export function runEslint(repoRoot: string, files: string[]): EslintRun {
-  if (!hasEslintConfig(repoRoot)) return { ok: false, reason: 'no-config' };
-  // A committed config is weak evidence the binary is present — an un-installed
-  // checkout is the likeliest cause of an empty run, and "ESLint failed" without
-  // saying so sends people looking in the wrong place.
-  if (!tryExec('npx', ['--no-install', 'eslint', '--version'], repoRoot).trim()) {
-    return { ok: false, reason: 'not-installed' };
-  }
+  if (!hasEslintConfig(repoRoot)) return { ok: false, status: 'no-eslint-config' };
   const raw = tryExec('npx', ['--no-install', 'eslint', '--format', 'json', ...files], repoRoot);
   // A successful `--format json` run ALWAYS prints valid JSON — `[]` when there
   // is nothing to report. Empty output therefore means ESLint could not run at
-  // all (not installed, config threw), which must not be reported as "clean":
-  // that would claim the mechanical quarter was checked when it never was.
-  if (!raw.trim()) return { ok: false, reason: 'failed' };
-  return { ok: true, findings: parseEslintJson(raw) };
+  // all, which must not be reported as "clean": that would claim the mechanical
+  // quarter was checked when it never was.
+  if (raw.trim()) return { ok: true, findings: parseEslintJson(raw) };
+  // Diagnose only on the failure path, so the happy path pays nothing for a
+  // probe it doesn't need. An un-installed checkout is the likeliest cause.
+  const installed = tryExec('npx', ['--no-install', 'eslint', '--version'], repoRoot).trim();
+  return { ok: false, status: installed ? 'eslint-failed' : 'eslint-not-installed' };
 }
 
 /**
@@ -233,14 +231,13 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     log(chalk.blue('\n🔧 Running ESLint first (deterministic — nothing here should cost an AI finding)...'));
     const run = runEslint(repoRoot, files);
     if (!run.ok) {
-      const messages: Record<Exclude<EslintRun, { ok: true }>['reason'], [LintStatus, string]> = {
-        'no-config': ['no-eslint-config', '⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.'],
-        'not-installed': ['eslint-not-installed', '⚠  ESLint is configured but not installed in this checkout — run `npm install`. The mechanical standards were NOT checked.'],
-        failed: ['eslint-failed', '⚠  ESLint produced no output (the config likely threw) — the mechanical standards were NOT checked. Findings below cover only what lint cannot see.'],
+      const messages: Record<LintFailure, string> = {
+        'no-eslint-config': '⚠  No ESLint config found — skipping the deterministic pass. Run `lgtm standards init` to emit the rules your standards imply.',
+        'eslint-not-installed': '⚠  ESLint is configured but not installed in this checkout — run `npm install`. The mechanical standards were NOT checked.',
+        'eslint-failed': '⚠  ESLint produced no output (the config likely threw) — the mechanical standards were NOT checked. Findings below cover only what lint cannot see.',
       };
-      const [status, message] = messages[run.reason];
-      lintStatus = status;
-      log(chalk.yellow(message));
+      lintStatus = run.status;
+      log(chalk.yellow(messages[run.status]));
     } else {
       lintStatus = 'ran';
       ({ structural, other } = partitionStructural(run.findings));
@@ -260,6 +257,9 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
   }
   const gatedFiles: string[] = [];
   const skippedTooLarge: string[] = [];
+  // Count what was ACTUALLY suppressed: findings in files that never reached the
+  // AI pass (gated or too large) were not suppressed, they were simply unused.
+  let suppressedCount = 0;
 
   // --- Judgement half ------------------------------------------------------
   const standards = buildStandardsBlock(repoRoot);
@@ -300,6 +300,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
     log(chalk.blue(`\n🤖 Reviewing ${rel} (${content.split('\n').length} lines${tests.length ? `, ${tests.length} covering test file(s)` : ', NO covering tests found'})...`));
 
     const fileLint = other.filter((f) => pathKey(f.file) === pathKey(abs));
+    suppressedCount += fileLint.length;
     const result = await reviewPR(diff, `Standards review: ${rel}`, 'Existing production file under retroactive standards review.', 'medium', ai, tests.length ? fileContents : undefined, '', '', '', {
       standards: standards.block,
       charter: charterBlock,
@@ -334,7 +335,7 @@ export async function runStandardsReview(options: StandardsReviewOptions): Promi
         status: lintStatus,
         structural: structural.length,
         other: other.length,
-        suppressed: other.length,
+        suppressed: suppressedCount,
       },
       commentsFound: allComments.length,
       comments: allComments.map((c) => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
