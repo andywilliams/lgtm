@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
@@ -248,11 +248,27 @@ export function scanRepo(repoRoot: string): RepoScan {
   let profileGuess: RepoProfile = 'lib';
   let profileEvidence = 'no framework/platform deps detected';
   const toolingPresent = new Set<RequiredTooling>();
-  const FORMATTER_CONFIGS = ['.prettierrc', '.prettierrc.json', '.prettierrc.js', 'prettier.config.js', '.eslintrc', '.eslintrc.json', '.eslintrc.cjs', '.eslintrc.js', 'eslint.config.js', 'eslint.config.mjs', 'biome.json'];
-  if (FORMATTER_CONFIGS.some((f) => existsSync(join(repoRoot, f)))) toolingPresent.add('formatter');
+  const FORMATTER_CONFIGS = ['.prettierrc', '.prettierrc.json', '.prettierrc.js', 'prettier.config.js', '.eslintrc', '.eslintrc.json', '.eslintrc.cjs', '.eslintrc.js', 'eslint.config.js', 'eslint.config.mjs', 'eslint.config.ts', 'biome.json'];
+  const formatterConfigured = FORMATTER_CONFIGS.some((f) => existsSync(join(repoRoot, f)));
+  // FMT-1 claims the config is "enforced in CI" — so a config FILE is not enough
+  // evidence. A committed config nobody runs is decorative (SPT had one sitting on
+  // 5,030 errors), and marking it adopted would put a claim in the standards doc
+  // that the repo does not honour. Require a lint entry point too.
+  let formatterEnforced = false;
+  try {
+    const workflowDir = join(repoRoot, '.github', 'workflows');
+    formatterEnforced = existsSync(workflowDir) && readdirSync(workflowDir).some((f) => {
+      try { return /\b(eslint|biome|prettier)\b/.test(readFileSync(join(workflowDir, f), 'utf-8')); } catch { return false; }
+    });
+  } catch { /* no workflows — stays false */ }
   try {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
     const deps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
+    const scriptText = Object.entries(pkg.scripts ?? {})
+      .filter(([name]) => /lint|format|check/.test(name))
+      .map(([, v]) => String(v))
+      .join(' ');
+    if (/\b(eslint|biome|prettier)\b/.test(scriptText)) formatterEnforced = true;
     if (deps.some((d) => /^(react|react-dom|next|vue|svelte)$/.test(d))) {
       profileGuess = 'frontend';
       profileEvidence = 'frontend framework in package.json dependencies';
@@ -263,12 +279,12 @@ export function scanRepo(repoRoot: string): RepoScan {
       profileGuess = 'service';
       profileEvidence = 'AWS SDK / serverless tooling in the manifest';
     }
-    if (pkg.prettier || deps.some((d) => /^(prettier|eslint|@biomejs\/biome)$/.test(d))) toolingPresent.add('formatter');
-    const scripts = Object.values(pkg.scripts ?? {}).join(' ');
-    if (/(--coverage|\bc8\b|\bnyc\b|coverage)/.test(scripts) || deps.some((d) => /^(c8|nyc|@vitest\/coverage-v8)$/.test(d))) {
+    const allScripts = Object.values(pkg.scripts ?? {}).join(' ');
+    if (/(--coverage|\bc8\b|\bnyc\b|coverage)/.test(allScripts) || deps.some((d) => /^(c8|nyc|@vitest\/coverage-v8)$/.test(d))) {
       toolingPresent.add('coverage');
     }
   } catch { /* keep the lib default */ }
+  if (formatterConfigured && formatterEnforced) toolingPresent.add('formatter');
 
   const fnStats = stats(fnLengths);
   const fileStats = stats(fileLineCounts);

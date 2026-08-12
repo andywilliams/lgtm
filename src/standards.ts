@@ -139,7 +139,8 @@ export interface GenerateOptions {
 }
 
 const TOOLING_LABELS: Record<RequiredTooling, string> = {
-  formatter: 'no formatter/linter config detected',
+  // FMT-1 asserts CI enforcement, so a config file alone doesn't earn adoption.
+  formatter: 'no formatter/linter config found, or it is not wired to a lint script or CI job',
   coverage: 'no coverage tooling detected',
 };
 
