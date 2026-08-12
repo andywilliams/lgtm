@@ -126,6 +126,12 @@ export interface GenerateOptions {
   selections: StandardsSelections;
   /** One-line human summary of the repo scan, recorded for provenance. */
   scanSummary?: string;
+  /**
+   * Pre-existing violations of the adopted thresholds. Recorded in the document so
+   * a reader can't mistake "adopted" for "already true" — the scan line alone
+   * shows a max far above the threshold and invites exactly that misreading.
+   */
+  legacyViolations?: { functions: number; files: number };
   /** Tooling the scan actually found. Standards presuming absent tooling render as aspirational. */
   toolingPresent?: Set<RequiredTooling>;
   /** Injectable for tests; defaults to today. */
@@ -286,6 +292,13 @@ export function generateStandardsDoc(opts: GenerateOptions): string {
   ];
   if (thresholdParts.length > 0) lines.push(`- ${date} — thresholds: ${thresholdParts.join(' · ')}`);
   if (opts.scanSummary) lines.push(`- ${date} — repo scan at selection time: ${opts.scanSummary}`);
+  const legacy = opts.legacyViolations;
+  if (legacy && legacy.functions + legacy.files > 0) {
+    lines.push(
+      `- ${date} — pre-existing at adoption: ~${legacy.functions} function(s) and ~${legacy.files} file(s) already exceed these thresholds. ` +
+        `Adopted ≠ already true — they become findings only when the code is touched (new-code scope).`
+    );
+  }
   lines.push('');
 
   return lines.join('\n');

@@ -30,7 +30,7 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - **NAM-6 · Nouns for things, verbs for actions** — Types/modules are noun phrases (Manager/Processor/utils names signal responsibility aggregation); functions are verb phrases; is/has for predicates.
 
 ## Functions
-- **FUN-1 · Function size** — Cognitive complexity ≤15 per function is the primary gate (nesting penalized, guard clauses free); length is a backstop: warn >90 lines, finding >120.
+- **FUN-1 · Function size** — Cognitive complexity ≤15 per function is the primary gate (nesting penalized, guard clauses free); length is a backstop: warn >100 lines, finding >130.
 - **FUN-2 · Shallow nesting** — Prefer guard clauses and early returns; nesting deeper than 3 levels (async try/catch counts) is a finding.
 - **G30 · Do one thing** — A function whose body is a series of sections does several things — delegate each; handlers orchestrate only. Test: if you can extract a function whose name is not a restatement, it was doing too much.
 - **G34 · One level of abstraction per function** — Statements sit one level below the function name — no business intent mixed with wire formatting.
@@ -168,5 +168,6 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - 2026-08-12 — **FMT-2** → Yes (recommended) — soft thresholds, responsibility judged first
 - 2026-08-12 — **MOD-4** → Balanced (recommended) — flag both over-aggregation and over-sharding
 - 2026-08-12 — **G5** → Rule of Three (recommended) — knowledge-dup only, abstraction must be real
-- 2026-08-12 — thresholds: function warn >90 / finding >120 lines · file warn >540 / finding >940 lines
-- 2026-08-12 — repo scan at selection time: 27 source files; function lines p50 12 / p95 88 / max 421; file lines p50 179 / p95 535 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)
+- 2026-08-12 — thresholds: function warn >100 / finding >130 lines · file warn >540 / finding >940 lines
+- 2026-08-12 — repo scan at selection time: 27 source files; function lines p50 12 / p95 95 / max 423; file lines p50 179 / p95 539 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)
+- 2026-08-12 — pre-existing at adoption: ~7 function(s) and ~1 file(s) already exceed these thresholds. Adopted ≠ already true — they become findings only when the code is touched (new-code scope).

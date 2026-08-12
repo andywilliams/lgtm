@@ -512,23 +512,27 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   const houseRules = await answerSource.textLoop('houseRules', 'House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
 
+  // Closing output and the document's provenance honor the same gating as the
+  // questions — a stance without thresholds must not be reported (or costed) as
+  // having them.
+  const consumedOut = thresholdsConsumed(profile, askChoices);
+  const legacyViolations = {
+    functions: consumedOut.fn ? scan.fnOver(thresholds.fnMax) : 0,
+    files: consumedOut.file ? scan.filesOver(thresholds.fileMax) : 0,
+  };
+
   const selections: StandardsSelections = { askChoices, thresholds, houseRules };
-  const doc = generateStandardsDoc({ repoName, profile, selections, scanSummary: scan.summary, toolingPresent: scan.toolingPresent });
+  const doc = generateStandardsDoc({ repoName, profile, selections, scanSummary: scan.summary, toolingPresent: scan.toolingPresent, legacyViolations });
 
   writeFileSync(outPath, doc.endsWith('\n') ? doc : doc + '\n');
   console.log(chalk.green(`\n✓ Wrote ${outPath}`));
-  // Closing output honors the same gating as the questions and the document —
-  // a stance without thresholds must not be reported (or costed) as having them.
-  const consumedOut = thresholdsConsumed(profile, askChoices);
   const summaryParts = [`Profile ${profile}`];
   if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);
   if (consumedOut.file) summaryParts.push(`file >${thresholds.fileWarn}/${thresholds.fileMax} lines`);
   summaryParts.push(`${houseRules.length} house rule(s)`);
   console.log(chalk.gray(`   ${summaryParts.join(' · ')}`));
-  const fnCost = consumedOut.fn ? scan.fnOver(thresholds.fnMax) : 0;
-  const fileCost = consumedOut.file ? scan.filesOver(thresholds.fileMax) : 0;
-  if (fnCost + fileCost > 0) {
-    console.log(chalk.yellow(`   Existing-violation cost: ~${fnCost} function(s) and ~${fileCost} file(s) already exceed the finding thresholds — standards apply to NEW code, so these become findings only when touched.`));
+  if (legacyViolations.functions + legacyViolations.files > 0) {
+    console.log(chalk.yellow(`   Existing-violation cost: ~${legacyViolations.functions} function(s) and ~${legacyViolations.files} file(s) already exceed the finding thresholds — standards apply to NEW code, so these become findings only when touched.`));
   }
   console.log(chalk.gray('\nReview the file, edit freely, commit it. `lgtm review` will now cite `(standard <id>)` findings against it (opt out per run with --no-standards).'));
 }

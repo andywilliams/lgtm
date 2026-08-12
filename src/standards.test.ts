@@ -124,6 +124,23 @@ describe('generateStandardsDoc', () => {
     assert.doesNotMatch(doc, /aspirational/);
   });
 
+  it('records pre-existing violations so "adopted" is not misread as "already true"', () => {
+    const doc = generateStandardsDoc({
+      repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11',
+      legacyViolations: { functions: 6, files: 1 },
+    });
+    assert.match(doc, /pre-existing at adoption: ~6 function\(s\) and ~1 file\(s\)/);
+    assert.match(doc, /Adopted ≠ already true/);
+  });
+
+  it('omits the pre-existing line when nothing violates', () => {
+    const doc = generateStandardsDoc({
+      repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11',
+      legacyViolations: { functions: 0, files: 0 },
+    });
+    assert.doesNotMatch(doc, /pre-existing at adoption/);
+  });
+
   it('without a toolingPresent set, nothing is downgraded (callers that do not scan)', () => {
     const doc = generateStandardsDoc({ repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11' });
     assert.doesNotMatch(doc, /aspirational/);
