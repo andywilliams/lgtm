@@ -62,8 +62,8 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - **COM-3 · TODOs carry tickets and get swept** — A TODO is not an excuse to leave bad code; no bare TODOs — link an issue; sweep regularly.
 
 ## Formatting & file shape
-- **FMT-1 · The formatter is the standard** **[everywhere]** — One committed formatter+linter config per repo, enforced in CI; style (incl. line width) is never argued in review.
-- **FMT-2 · Small files** — Judged by responsibility first, lines second: warn >520 lines, finding >920.
+- **FMT-1 · The formatter is the standard** — One committed formatter+linter config per repo, enforced in CI; style (incl. line width) is never argued in review. *(aspirational — no formatter/linter config detected; adopt the tooling or drop this line)*
+- **FMT-2 · Small files** — Judged by responsibility first, lines second: warn >540 lines, finding >940.
 - **FMT-3 · Newspaper order and vertical grouping** — High-level first, detail downward; related lines vertically dense, concepts separated by blank lines; declare variables at first use.
 
 ## Data, abstraction & coupling
@@ -106,7 +106,7 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - **TST-3 · One concept per test** — Minimal asserts per concept — one toEqual on a whole object satisfies it; plain explicit tests beat clever DSL compression.
 - **TST-4 · F.I.R.S.T.** — Fast (in-memory default suite), Independent (no shared state/order), Repeatable (offline, injected clocks), Self-validating (assert values, never eyeballed logs), Timely (spec with the code, forcing testable shape).
 - **T1 · Test what could break — especially boundaries** — "Seems like enough" is not a metric; every boundary condition gets a test (empty inputs, off-by-ones, time edges, pagination seams); validate calculations against known real data.
-- **T2 · Coverage as gap-finder** **[everywhere]** — Coverage runs in CI to find untested branches (uncovered catch bodies especially) — a diagnostic, not a vanity gate.
+- **T2 · Coverage as gap-finder** — Coverage runs in CI to find untested branches (uncovered catch bodies especially) — a diagnostic, not a vanity gate. *(aspirational — no coverage tooling detected; adopt the tooling or drop this line)*
 - **T3 · Don't skip trivial tests** — Documentary value exceeds cost (serializers, mappers, config parsing).
 - **T4 · A skipped test is a question, not a silencer** **[everywhere]** — test.skip/test.todo encode open requirement questions with a reason; skipping a FAILING test is an overridden safety (G4).
 - **T6 · Bugs congregate** — A found bug triggers an exhaustive test battery around that function before the one-line fix ships.
@@ -162,11 +162,11 @@ The repo's adopted maintainability standards, selected from lgtm's clean-code ca
 - **J3 · Enums over int constants** — Already idiom in TS as string-literal unions / as-const objects; the Java form does not apply.
 
 ## Choices
-*The contested-toggle answers from `lgtm standards init` (2026-08-11).*
-- 2026-08-11 — **FUN-1** → Balanced (recommended) — cognitive complexity ≤15 primary, length backstop
-- 2026-08-11 — **COM-1** → Why-comments encouraged (recommended) — code first, rationale welcome
-- 2026-08-11 — **FMT-2** → Yes (recommended) — soft thresholds, responsibility judged first
-- 2026-08-11 — **MOD-4** → Balanced (recommended) — flag both over-aggregation and over-sharding
-- 2026-08-11 — **G5** → Rule of Three (recommended) — knowledge-dup only, abstraction must be real
-- 2026-08-11 — thresholds: function warn >90 / finding >120 lines · file warn >520 / finding >920 lines
-- 2026-08-11 — repo scan at selection time: 27 source files; function lines p50 12 / p95 86 / max 421; file lines p50 179 / p95 515 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)
+*The contested-toggle answers from `lgtm standards init` (2026-08-12).*
+- 2026-08-12 — **FUN-1** → Balanced (recommended) — cognitive complexity ≤15 primary, length backstop
+- 2026-08-12 — **COM-1** → Why-comments encouraged (recommended) — code first, rationale welcome
+- 2026-08-12 — **FMT-2** → Yes (recommended) — soft thresholds, responsibility judged first
+- 2026-08-12 — **MOD-4** → Balanced (recommended) — flag both over-aggregation and over-sharding
+- 2026-08-12 — **G5** → Rule of Three (recommended) — knowledge-dup only, abstraction must be real
+- 2026-08-12 — thresholds: function warn >90 / finding >120 lines · file warn >540 / finding >940 lines
+- 2026-08-12 — repo scan at selection time: 27 source files; function lines p50 12 / p95 88 / max 421; file lines p50 179 / p95 535 / max 1681; max positional args seen 10 (F1 caps at 3) (approximate scan)

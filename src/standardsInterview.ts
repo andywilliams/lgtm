@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile } from './standardsCatalog.js';
+import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
 
 /**
@@ -37,6 +37,8 @@ export interface RepoScan {
   fileCount: number;
   fileLines: Stats;
   fnLines: Stats;
+  /** Tooling actually found in the repo — standards presuming what's absent render as aspirational. */
+  toolingPresent: Set<RequiredTooling>;
   /** Count of functions/files exceeding the would-be thresholds, for the violation-cost line. */
   fnOver: (n: number) => number;
   filesOver: (n: number) => number;
@@ -153,7 +155,11 @@ function extractParams(lines: string[], start: number, maxLookahead = 12): strin
 }
 
 /** Count top-level commas only — object/array/generic commas inside nesting don't add parameters. */
-function countTopLevelParams(params: string): number {
+function countTopLevelParams(rawParams: string): number {
+  // Drop a trailing comma before counting — it introduces no parameter, and it is
+  // Prettier's DEFAULT output for wrapped signatures (trailingComma: "all"), i.e.
+  // exactly the long parameter lists this metric exists to catch.
+  const params = rawParams.replace(/,\s*$/, '');
   if (!params.trim()) return 0;
   let depth = 0;
   let args = 1;
@@ -232,9 +238,13 @@ export function scanRepo(repoRoot: string): RepoScan {
     }
   }
 
-  // Profile inference from the manifest — a guess, surfaced with its evidence.
+  // Profile inference + tooling detection from the manifest — guesses, surfaced
+  // with their evidence.
   let profileGuess: RepoProfile = 'lib';
   let profileEvidence = 'no framework/platform deps detected';
+  const toolingPresent = new Set<RequiredTooling>();
+  const FORMATTER_CONFIGS = ['.prettierrc', '.prettierrc.json', '.prettierrc.js', 'prettier.config.js', '.eslintrc', '.eslintrc.json', '.eslintrc.cjs', '.eslintrc.js', 'eslint.config.js', 'eslint.config.mjs', 'biome.json'];
+  if (FORMATTER_CONFIGS.some((f) => existsSync(join(repoRoot, f)))) toolingPresent.add('formatter');
   try {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf-8'));
     const deps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
@@ -248,6 +258,11 @@ export function scanRepo(repoRoot: string): RepoScan {
       profileGuess = 'service';
       profileEvidence = 'AWS SDK / serverless tooling in the manifest';
     }
+    if (pkg.prettier || deps.some((d) => /^(prettier|eslint|@biomejs\/biome)$/.test(d))) toolingPresent.add('formatter');
+    const scripts = Object.values(pkg.scripts ?? {}).join(' ');
+    if (/(--coverage|\bc8\b|\bnyc\b|coverage)/.test(scripts) || deps.some((d) => /^(c8|nyc|@vitest\/coverage-v8)$/.test(d))) {
+      toolingPresent.add('coverage');
+    }
   } catch { /* keep the lib default */ }
 
   const fnStats = stats(fnLengths);
@@ -256,6 +271,7 @@ export function scanRepo(repoRoot: string): RepoScan {
     fileCount: sources.length,
     fileLines: fileStats,
     fnLines: fnStats,
+    toolingPresent,
     fnOver: (n) => fnLengths.filter((l) => l > n).length,
     filesOver: (n) => fileLineCounts.filter((l) => l > n).length,
     maxPositionalArgs: maxArgs,
@@ -453,6 +469,10 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
   const scan = scanRepo(repoRoot);
   console.log(chalk.gray(`   ${scan.summary}`));
   console.log(chalk.gray(`   Profile guess: ${scan.profileGuess} (${scan.profileEvidence})`));
+  const missingTooling = (['formatter', 'coverage'] as RequiredTooling[]).filter((t) => !scan.toolingPresent.has(t));
+  if (missingTooling.length > 0) {
+    console.log(chalk.gray(`   Tooling not detected: ${missingTooling.join(', ')} — standards presuming it render as aspirational.`));
+  }
 
   const proposed = proposeThresholds(scan);
 
@@ -493,7 +513,7 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
   const houseRules = await answerSource.textLoop('houseRules', 'House rules — repo-specific standards no book wrote (e.g. "every list read paginates"). Add any now:');
 
   const selections: StandardsSelections = { askChoices, thresholds, houseRules };
-  const doc = generateStandardsDoc({ repoName, profile, selections, scanSummary: scan.summary });
+  const doc = generateStandardsDoc({ repoName, profile, selections, scanSummary: scan.summary, toolingPresent: scan.toolingPresent });
 
   writeFileSync(outPath, doc.endsWith('\n') ? doc : doc + '\n');
   console.log(chalk.green(`\n✓ Wrote ${outPath}`));

@@ -19,6 +19,8 @@
 export type StandardDefault = 'on' | 'off' | 'ask';
 export type StandardScope = 'new-code' | 'everywhere';
 export type RepoProfile = 'lib' | 'service' | 'frontend';
+/** Tooling a standard presumes exists. Absent ⇒ the standard renders as aspirational, not adopted. */
+export type RequiredTooling = 'formatter' | 'coverage';
 
 export interface AskOption {
   /** Stable answer value — what an --answers file supplies. */
@@ -42,6 +44,12 @@ export interface CatalogEntry {
   ask?: { question: string; options: AskOption[] };
   /** Per-profile default overrides (e.g. boundary learning-tests off for frontend). */
   profiles?: Partial<Record<RepoProfile, 'on' | 'off'>>;
+  /**
+   * Tooling this standard presumes. When the scan can't find it, the standard is
+   * rendered as aspirational rather than adopted — a doc that claims "enforced in
+   * CI" for a repo with no CI is exactly the drift the charter check exists to stop.
+   */
+  requiresTooling?: RequiredTooling;
 }
 
 /** Ordered groups as they appear in a generated STANDARDS.md. */
@@ -142,7 +150,7 @@ export const CATALOG: CatalogEntry[] = [
   { id: 'COM-3', group: 'comments', title: 'TODOs carry tickets and get swept', rule: 'A TODO is not an excuse to leave bad code; no bare TODOs — link an issue; sweep regularly.', default: 'on', scope: 'new-code' },
 
   // --- Formatting ------------------------------------------------------------
-  { id: 'FMT-1', group: 'formatting', title: 'The formatter is the standard', rule: 'One committed formatter+linter config per repo, enforced in CI; style (incl. line width) is never argued in review.', default: 'on', scope: 'everywhere' },
+  { id: 'FMT-1', group: 'formatting', title: 'The formatter is the standard', rule: 'One committed formatter+linter config per repo, enforced in CI; style (incl. line width) is never argued in review.', default: 'on', scope: 'everywhere', requiresTooling: 'formatter' },
   {
     id: 'FMT-2', group: 'formatting', title: 'Small files', rule: 'Judged by responsibility first, lines second: warn >{fileWarn} lines, finding >{fileMax}.',
     default: 'ask', scope: 'new-code',
@@ -196,7 +204,7 @@ export const CATALOG: CatalogEntry[] = [
   { id: 'TST-3', group: 'tests', title: 'One concept per test', rule: 'Minimal asserts per concept — one toEqual on a whole object satisfies it; plain explicit tests beat clever DSL compression.', default: 'on', scope: 'new-code' },
   { id: 'TST-4', group: 'tests', title: 'F.I.R.S.T.', rule: 'Fast (in-memory default suite), Independent (no shared state/order), Repeatable (offline, injected clocks), Self-validating (assert values, never eyeballed logs), Timely (spec with the code, forcing testable shape).', default: 'on', scope: 'new-code' },
   { id: 'T1', group: 'tests', title: 'Test what could break — especially boundaries', rule: '"Seems like enough" is not a metric; every boundary condition gets a test (empty inputs, off-by-ones, time edges, pagination seams); validate calculations against known real data.', default: 'on', scope: 'new-code' },
-  { id: 'T2', group: 'tests', title: 'Coverage as gap-finder', rule: 'Coverage runs in CI to find untested branches (uncovered catch bodies especially) — a diagnostic, not a vanity gate.', default: 'on', scope: 'everywhere' },
+  { id: 'T2', group: 'tests', title: 'Coverage as gap-finder', rule: 'Coverage runs in CI to find untested branches (uncovered catch bodies especially) — a diagnostic, not a vanity gate.', default: 'on', scope: 'everywhere', requiresTooling: 'coverage' },
   { id: 'T3', group: 'tests', title: 'Don\'t skip trivial tests', rule: 'Documentary value exceeds cost (serializers, mappers, config parsing).', default: 'on', scope: 'new-code' },
   { id: 'T4', group: 'tests', title: 'A skipped test is a question, not a silencer', rule: 'test.skip/test.todo encode open requirement questions with a reason; skipping a FAILING test is an overridden safety (G4).', default: 'on', scope: 'everywhere' },
   { id: 'T6', group: 'tests', title: 'Bugs congregate', rule: 'A found bug triggers an exhaustive test battery around that function before the one-line fix ships.', default: 'on', scope: 'new-code' },

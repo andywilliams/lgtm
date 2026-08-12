@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CATALOG, GROUPS, REJECTED, askEntries } from './standardsCatalog.js';
+import { CATALOG, GROUPS, REJECTED, askEntries, type RequiredTooling } from './standardsCatalog.js';
 import { findStandardsDoc, buildStandardsBlock, generateStandardsDoc, clampThresholds, thresholdsConsumed, DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { measureFunctions, proposeThresholds, type RepoScan } from './standardsInterview.js';
 
@@ -103,6 +103,30 @@ describe('generateStandardsDoc', () => {
   it('marks everywhere-scope standards', () => {
     const doc = generateStandardsDoc({ repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11' });
     assert.match(doc, /C5 · No commented-out code\*\* \*\*\[everywhere\]\*\*/);
+  });
+
+  it('marks tooling-dependent standards aspirational (and drops everywhere scope) when the tooling is absent', () => {
+    const doc = generateStandardsDoc({
+      repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11',
+      toolingPresent: new Set<RequiredTooling>(), // nothing detected
+    });
+    assert.match(doc, /FMT-1 · The formatter is the standard\*\* — .*aspirational — no formatter\/linter config detected/);
+    assert.doesNotMatch(doc, /FMT-1 · The formatter is the standard\*\* \*\*\[everywhere\]\*\*/);
+    assert.match(doc, /T2 · Coverage as gap-finder\*\* — .*aspirational — no coverage tooling detected/);
+  });
+
+  it('keeps tooling-dependent standards fully adopted when the tooling is present', () => {
+    const doc = generateStandardsDoc({
+      repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11',
+      toolingPresent: new Set<RequiredTooling>(['formatter', 'coverage']),
+    });
+    assert.match(doc, /FMT-1 · The formatter is the standard\*\* \*\*\[everywhere\]\*\*/);
+    assert.doesNotMatch(doc, /aspirational/);
+  });
+
+  it('without a toolingPresent set, nothing is downgraded (callers that do not scan)', () => {
+    const doc = generateStandardsDoc({ repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11' });
+    assert.doesNotMatch(doc, /aspirational/);
   });
 });
 
@@ -290,6 +314,12 @@ describe('measureFunctions (approximate scan)', () => {
     const { maxArgs } = measureFunctions(src);
     assert.strictEqual(maxArgs, 2);
   });
+
+  it('does not let a trailing comma (Prettier default) inflate the count', () => {
+    const src = ['function f(', '  a: string,', '  b: number,', ') {', '  return a;', '}'].join('\n');
+    const { maxArgs } = measureFunctions(src);
+    assert.strictEqual(maxArgs, 2);
+  });
 });
 
 describe('proposeThresholds', () => {
@@ -298,6 +328,7 @@ describe('proposeThresholds', () => {
       fileCount: 10,
       fileLines: { p50: 100, p95: fileP95, max: fileP95 * 2 },
       fnLines: { p50: 10, p95: fnP95, max: fnP95 * 2 },
+      toolingPresent: new Set<RequiredTooling>(),
       fnOver: () => 0,
       filesOver: () => 0,
       maxPositionalArgs: 3,

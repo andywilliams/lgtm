@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CATALOG, GROUPS, REJECTED, askEntries, type CatalogEntry, type RepoProfile } from './standardsCatalog.js';
+import { CATALOG, GROUPS, REJECTED, askEntries, type CatalogEntry, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 
 /**
  * The engineering-standards chain — the third review altitude's document.
@@ -126,9 +126,16 @@ export interface GenerateOptions {
   selections: StandardsSelections;
   /** One-line human summary of the repo scan, recorded for provenance. */
   scanSummary?: string;
+  /** Tooling the scan actually found. Standards presuming absent tooling render as aspirational. */
+  toolingPresent?: Set<RequiredTooling>;
   /** Injectable for tests; defaults to today. */
   date?: string;
 }
+
+const TOOLING_LABELS: Record<RequiredTooling, string> = {
+  formatter: 'no formatter/linter config detected',
+  coverage: 'no coverage tooling detected',
+};
 
 function substituteThresholds(rule: string, t: StandardsThresholds): string {
   return rule
@@ -223,8 +230,15 @@ export function generateStandardsDoc(opts: GenerateOptions): string {
     for (const e of entries) {
       const resolved = resolveEntry(e, profile, selections);
       if (resolved.kind === 'rule') {
-        const everywhere = e.scope === 'everywhere' ? ' **[everywhere]**' : '';
-        rendered.push(`- **${e.id} · ${e.title}**${everywhere} — ${resolved.line}`);
+        // A standard whose tooling is absent is an INTENTION, not an adopted rule —
+        // saying "enforced in CI" for a repo with no CI is the drift these docs
+        // exist to prevent. Marked aspirational (and never at everywhere scope,
+        // which would authorize findings against untouched code for a rule that
+        // nothing actually enforces).
+        const toolingMissing = e.requiresTooling && opts.toolingPresent && !opts.toolingPresent.has(e.requiresTooling);
+        const everywhere = e.scope === 'everywhere' && !toolingMissing ? ' **[everywhere]**' : '';
+        const aspirational = toolingMissing ? ` *(aspirational — ${TOOLING_LABELS[e.requiresTooling!]}; adopt the tooling or drop this line)*` : '';
+        rendered.push(`- **${e.id} · ${e.title}**${everywhere} — ${resolved.line}${aspirational}`);
       } else if (resolved.kind === 'not-enforced') {
         notEnforced.push({ id: e.id, title: e.title, reason: resolved.reason });
       }
