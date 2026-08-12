@@ -315,6 +315,35 @@ With a system doc resolved, `arch` also judges **placement** (does this work bel
 
 If a repo has no charter file, the URL/DIR brain providers are tried for a `<repo>-charter` note as a fallback (the `LGTM_BRAIN_CMD` provider is deliberately not used here — its contract answers the *handbook* question, and feeding arbitrary command output in as a *normative* charter is how a review ends up arguing from junk). No charter anywhere? The review still runs and honestly reports `charter-grounded checks` in `skipped_checks`.
 
+## Engineering Standards (`lgtm standards`)
+
+The maintainability altitude's document. `lgtm review` asks *"is this code correct?"*, `lgtm arch` asks *"was this the right thing to build?"* — `STANDARDS.md` answers *"will this code be cheap to change in a year?"* It is the repo's **selection** from a built-in clean-code catalog: 110+ standards distilled from Clean Code (Martin, 2008) and its strongest counterpoint sources (Ousterhout, Fowler, Beck, Google eng-practices, linter conventions), each with a stable id. Full rationale, sources and the contested-positions record: [docs/clean-code-catalog.md](docs/clean-code-catalog.md).
+
+```bash
+# Scan the repo, answer the five contested toggles, write STANDARDS.md — no AI call
+lgtm standards init
+
+# Accept every recommendation non-interactively (thresholds proposed from the scan)
+lgtm standards init --yes
+
+# Scripted run — answers.json is an object keyed by question id (preferred; a
+# positional array also works but must track which questions your stances trigger)
+#   {"profile":"service","FUN-1":"balanced","G5":"rule-of-three","fnWarn":60,
+#    "houseRules":["Every list read paginates or asserts single-page."]}
+lgtm standards init --answers answers.json
+```
+
+`standards init` is deliberately **AI-free and deterministic**: the catalog is the distillation, the questions are fixed — repo profile (`lib` / `service` / `frontend`), five genuinely contested toggles (function size, comment posture, DRY aggressiveness, file size, module granularity), thresholds, house rules — and the same answers always generate the same document. A quick repo scan runs first so threshold questions are asked against measured reality ("your p95 is 74 — propose 80?") and every adoption states its **existing-violation cost**.
+
+The generated document records four kinds of decision, all yours to edit:
+
+- **Adopted standards** by theme, one enforceable line each — `new-code` scope by default (the diff is the gate), `**[everywhere]**` where marked.
+- **House rules** — repo-specific standards no book wrote, same authority as catalog entries.
+- **Not enforced / Rejected** — settled decisions reviews must never re-raise or re-litigate.
+- **Choices** — the dated toggle answers, thresholds and scan provenance.
+
+**In normal reviews:** when the repo has a `STANDARDS.md` (root, then `docs/`, then `.lgtm/`), `lgtm review` may raise at most **three** `(standard <id>)`-prefixed SUGGESTION findings, each citing the standard's own line from your document — and never anything the document lists as not-enforced or rejected. Turn it off per run with `--no-standards`.
+
 ## Retrying Failed Uploads
 
 If the GitHub upload fails after you've selected comments, LGTM saves them locally so you don't lose your work:

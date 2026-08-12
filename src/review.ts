@@ -74,7 +74,7 @@ export async function reviewPR(
   usageContext?: string,
   expandedContext?: string,
   handbookContext?: string,
-  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string }
+  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string }
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -128,6 +128,10 @@ The charter above is context for ONE extra check only: if this diff (a) contradi
 `;
   }
 
+  // In-repo engineering standards (STANDARDS.md, auto-detected): a small capped check.
+  // The block arrives fully-formed from buildStandardsBlock — instruction included.
+  const standardsSection = extra?.standards ?? '';
+
   // Previously-dismissed findings (--decided): don't re-litigate settled points across a fix loop.
   let decidedSection = '';
   if (extra?.decided && extra.decided.length > 0) {
@@ -152,7 +156,7 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${handbookContextSection}${charterSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
+${handbookContextSection}${charterSection}${standardsSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
