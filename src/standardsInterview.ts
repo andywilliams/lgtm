@@ -566,6 +566,18 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
     });
     mkdirSync(fragmentDir, { recursive: true });
     writeFileSync(fragmentPath, fragment);
+
+    // Persist the answers next to the outputs. Both artefacts are GENERATED, so a
+    // hand-edit to either is silently reverted by the next re-run unless the
+    // inputs live somewhere durable and versioned — which is exactly how an
+    // improvement to a house rule can be lost.
+    const answersPath = join(fragmentDir, 'standards.answers.json');
+    writeFileSync(
+      answersPath,
+      JSON.stringify({ profile, ...selections.askChoices, ...selections.thresholds, houseRules: selections.houseRules }, null, 2) + '\n'
+    );
+    console.log(chalk.green(`✓ Wrote ${answersPath}`));
+    console.log(chalk.gray('   Commit it: these documents are generated, so EDIT THE ANSWERS and re-run rather than hand-editing the output.'));
     const ruleCount = deriveRules(selections, severity).length;
     console.log(chalk.green(`✓ Wrote ${fragmentPath}`));
     console.log(chalk.gray(`   ${ruleCount} mechanical rules at "${severity}" — spread \`standardsRules\` into your ESLint config (the file's header shows how).`));

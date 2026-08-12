@@ -165,11 +165,16 @@ export function generateEslintFragment(opts: {
   }
   lines.push('};');
   lines.push('');
-  lines.push('/* Worth adopting, but each needs a plugin this fragment cannot assume is installed:');
+  // Described in prose, not as a pasteable commented-out rule block: C5 ("no
+  // commented-out code") applies to config files too, and a generator should not
+  // emit what the standards it derives from forbid.
+  lines.push('/*');
+  lines.push(' * Worth adopting, but each needs a plugin this fragment cannot assume is installed.');
+  lines.push(' * Add the plugin, then add the rule:');
   for (const s of SUGGESTED) {
-    lines.push(`     '${s.name}': ${s.value},   // ${s.from} — needs ${s.needs}`);
+    lines.push(` *   - ${s.name} at ${s.value.replace(/'/g, '')} — ${s.from}. Requires ${s.needs}.`);
   }
-  lines.push('*/');
+  lines.push(' */');
   lines.push('');
   lines.push(tail);
   return lines.join('\n');
