@@ -110,7 +110,7 @@ describe('generateStandardsDoc', () => {
       repoName: 'r', profile: 'service', selections: defaultSelections(), date: '2026-08-11',
       toolingPresent: new Set<RequiredTooling>(), // nothing detected
     });
-    assert.match(doc, /FMT-1 · The formatter is the standard\*\* — .*aspirational — no formatter\/linter config detected/);
+    assert.match(doc, /FMT-1 · The formatter is the standard\*\* — .*aspirational — no formatter\/linter config found, or it is not wired to a lint script or CI job/);
     assert.doesNotMatch(doc, /FMT-1 · The formatter is the standard\*\* \*\*\[everywhere\]\*\*/);
     assert.match(doc, /T2 · Coverage as gap-finder\*\* — .*aspirational — no coverage tooling detected/);
   });
