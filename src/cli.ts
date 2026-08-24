@@ -11,6 +11,7 @@ import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli,
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
 import { runStandardsInit } from './standardsInterview.js';
+import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
 import { buildStandardsBlock } from './standards.js';
@@ -1714,6 +1715,47 @@ standards
       await runStandardsReview({ target, ai, agent, skipLintGate: options.skipLintGate, noLint: options.lint === false, maxFiles });
     } catch (error: any) {
       exitWithError(error?.message ?? String(error));
+    }
+  });
+
+const quality = program
+  .command('quality')
+  .description('Mutation-testing quality — do the tests actually hold the code down? (Phase 1: baseline + hotspots; no AI call. Ranking is deterministic from the report; the fix-before-harden column reads LIVE tracker state)');
+
+quality
+  .command('baseline')
+  .description('Read the repo\'s Stryker mutation.json and write per-file scores to .lgtm/mutation-baseline.json (committed — the ratchet travels with the repo)')
+  .option('--report <path>', 'Path to mutation.json (default: reports/mutation/mutation.json, .lgtm/mutation.json, mutation.json)')
+  .option('--out <file>', 'Baseline output path (default: .lgtm/mutation-baseline.json)')
+  .option('--force', 'Allow the rewrite to LOWER committed scores (a falling ratchet must be deliberate)', false)
+  .action(async (options) => {
+    try {
+      await runQualityBaseline({ report: options.report, out: options.out, force: options.force });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
+    }
+  });
+
+quality
+  .command('hotspots')
+  .description('Ranked burn-down worklist from mutation.json — (1−score) × mutants × (1+churn), cross-checked against open issues (fix before you harden). No AI call; ranking is deterministic from report+git, the issue column reads live tracker state')
+  .option('--report <path>', 'Path to mutation.json (default: standard locations)')
+  .option('--top <n>', 'How many hotspots to print', '10')
+  .option('--json', 'Structured JSON to stdout', false)
+  .option('--no-issues', 'Skip the open-issue cross-check')
+  .action(async (options) => {
+    // Mirror standards review's two-step check: the regex admits '0', which
+    // would print an empty list that reads as "no hotspots".
+    if (!/^\d+$/.test(String(options.top).trim()) || parseInt(options.top, 10) < 1) {
+      console.error(chalk.red('--top must be a positive integer'));
+      process.exit(1);
+    }
+    try {
+      await runQualityHotspots({ report: options.report, top: parseInt(options.top, 10), json: options.json, noIssues: options.issues === false });
+    } catch (error: any) {
+      console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
+      process.exit(1);
     }
   });
 
