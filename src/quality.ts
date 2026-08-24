@@ -49,7 +49,7 @@ export function resolveRepoRoot(cwd?: string): string {
 export interface FileQuality {
   path: string;
   mutants: number;      // valid mutants (denominator)
-  killed: number;       // includes Timeout — both count as detected
+  detected: number;     // Killed + Timeout — Stryker's own "detected" numerator
   survived: number;
   noCoverage: number;
   score: number;        // 0–100, Stryker definition
@@ -103,25 +103,25 @@ export function parseMutationReport(report: any): FileQuality[] {
   }
   const out: FileQuality[] = [];
   for (const [filePath, entry] of Object.entries<any>(files)) {
-    let killed = 0, survived = 0, noCoverage = 0;
+    let detected = 0, survived = 0, noCoverage = 0;
     for (const m of entry?.mutants ?? []) {
       switch (m?.status) {
         case 'Killed':
-        case 'Timeout': killed += 1; break;
+        case 'Timeout': detected += 1; break;
         case 'Survived': survived += 1; break;
         case 'NoCoverage': noCoverage += 1; break;
         default: break; // Ignored / CompileError / RuntimeError — excluded
       }
     }
-    const valid = killed + survived + noCoverage;
+    const valid = detected + survived + noCoverage;
     if (valid === 0) { continue; }
     out.push({
       path: filePath,
       mutants: valid,
-      killed,
+      detected,
       survived,
       noCoverage,
-      score: (killed / valid) * 100,
+      score: (detected / valid) * 100,
     });
   }
   return out;
@@ -138,7 +138,7 @@ export function buildBaseline(files: FileQuality[], meta: { commit: string | nul
   for (const f of [...files].sort((a, b) => a.path.localeCompare(b.path))) {
     doc.files[f.path] = {
       mutants: f.mutants,
-      killed: f.killed,
+      detected: f.detected,
       survived: f.survived,
       noCoverage: f.noCoverage,
       score: Number(f.score.toFixed(2)),
@@ -163,6 +163,14 @@ export function gitCommit(repoRoot: string): string | null {
  */
 export function churnFor(repoRoot: string, paths: string[]): Map<string, number> {
   const out = new Map<string, number>();
+  // --follow is git's slowest log mode (per-commit rename detection) and this
+  // runs once per file — fine at tens of files, minutes at thousands. Say so
+  // up front rather than letting the silence read as a hang; a single-pass
+  // bulk mode (one `git log --name-only`, --follow reserved for the top N) is
+  // the known optimization if a large repo ever needs it.
+  if (paths.length > 100) {
+    console.log(`   (computing churn for ${paths.length} files — git log --follow per file, this can take a while)`);
+  }
   for (const p of paths) {
     try {
       const log = execFileSync('git', ['log', '--follow', '--format=%H', '--', p], {
@@ -184,6 +192,11 @@ export function churnFor(repoRoot: string, paths: string[]): Map<string, number>
  * unavailable — the ranking still prints; the guard column says it couldn't
  * look, rather than silently claiming nothing blocks.
  */
+/** gh issue fetch cap — the truncation test and the user-facing warning both
+ * derive from this one constant, so raising it cannot silently disarm the
+ * partial-check detection. */
+export const ISSUE_CHECK_LIMIT = 500;
+
 export function crossCheckIssues(
   repoRoot: string,
   paths: string[],
@@ -192,20 +205,42 @@ export function crossCheckIssues(
   let issues: Array<{ number: number; title: string; body: string }>;
   let truncated = false;
   try {
-    const raw = execFileSync('gh', ['issue', 'list', '--state', 'open', '--limit', '500', '--json', 'number,title,body'], {
+    const raw = execFileSync('gh', ['issue', 'list', '--state', 'open', '--limit', String(ISSUE_CHECK_LIMIT), '--json', 'number,title,body'], {
       cwd: repoRoot, encoding: 'utf8',
     });
     issues = JSON.parse(raw);
+    // [SUGGESTION 4] A gh error payload can parse successfully as a non-array
+    // and would otherwise throw .filter out of a function the doc calls
+    // degradable — land it in the same checked:false path as a parse failure.
+    if (!Array.isArray(issues)) { return { byFile, checked: false, truncated: false }; }
     // At the cap we cannot know what we did not see — a truncated check must
     // not report itself as a completed one.
-    truncated = issues.length >= 500;
+    truncated = issues.length >= ISSUE_CHECK_LIMIT;
   } catch {
     return { byFile, checked: false, truncated: false };
   }
+  // Basename matching over-matches badly on common names (index.ts, utils.ts)
+  // and attributes one issue to every same-named file — and a false
+  // fix-before-harden flag steers the burn-down AWAY from work it should do.
+  // So: full-path match always wins; the basename fallback applies only when
+  // the basename is UNIQUE among the scored files, and then only on a
+  // word-ish boundary (regime.ts must not match newregime.ts).
+  const baseCounts = new Map<string, number>();
+  for (const p of paths) {
+    const b = path.basename(p);
+    baseCounts.set(b, (baseCounts.get(b) ?? 0) + 1);
+  }
+  const escapeRe = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   for (const p of paths) {
     const base = path.basename(p);
+    const baseRe = new RegExp(`(^|[^A-Za-z0-9_-])${escapeRe(base)}([^A-Za-z0-9_-]|$)`);
+    const uniqueBase = (baseCounts.get(base) ?? 0) === 1;
     const hits = issues
-      .filter((i) => (i.title ?? '').includes(base) || (i.body ?? '').includes(base))
+      .filter((i) => {
+        const text = `${i.title ?? ''}\n${i.body ?? ''}`;
+        if (text.includes(p)) { return true; }
+        return uniqueBase && baseRe.test(text);
+      })
       .map((i) => ({ number: i.number, title: i.title }));
     if (hits.length > 0) { byFile.set(p, hits); }
   }
@@ -237,6 +272,45 @@ export function rankHotspots(
     .sort((a, b) => b.risk - a.risk);
 }
 
+/**
+ * Committed-score falls between a prior baseline and a new doc. PURE — the
+ * ratchet semantics are unit-testable without a filesystem round-trip.
+ * Both sides normalize to 2dp before comparing: the writer rounds to 2dp,
+ * but the file is committed and diffable — i.e. hand-editable by design — so
+ * a stored 33.333333 re-baselined from the IDENTICAL report must not read as
+ * a fall and demand --force for nothing.
+ */
+export function findRegressions(prior: BaselineDoc | null, doc: BaselineDoc): Array<{ path: string; from: number; to: number }> {
+  const out: Array<{ path: string; from: number; to: number }> = [];
+  if (!prior?.files) { return out; }
+  for (const [fp, entry] of Object.entries(doc.files)) {
+    const before = prior.files[fp];
+    if (!before || typeof before.score !== 'number') { continue; }
+    const from = Number(before.score.toFixed(2));
+    if (entry.score < from) { out.push({ path: fp, from, to: entry.score }); }
+  }
+  return out;
+}
+
+/** Membership deltas between baselines — a rename shows as one of each. PURE. */
+export function membershipChanges(prior: BaselineDoc | null, doc: BaselineDoc): { dropped: string[]; added: string[] } {
+  if (!prior?.files) { return { dropped: [], added: [] }; }
+  const oldPaths = new Set(Object.keys(prior.files));
+  const newPaths = new Set(Object.keys(doc.files));
+  return {
+    dropped: [...oldPaths].filter((p) => !newPaths.has(p)),
+    added: [...newPaths].filter((p) => !oldPaths.has(p)),
+  };
+}
+
+function readReport(reportPath: string): any {
+  try {
+    return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  } catch (e: any) {
+    throw new Error(`Could not read ${reportPath} as JSON (${e?.message ?? e}) — is the Stryker run complete? Re-run the producer or pass --report <path>.`);
+  }
+}
+
 // ── command entry points ─────────────────────────────────────────────
 
 export async function runQualityBaseline(opts: { report?: string; out?: string; cwd?: string; force?: boolean }): Promise<void> {
@@ -248,7 +322,7 @@ export async function runQualityBaseline(opts: { report?: string; out?: string; 
       'Producing the report is the repo\'s job — run Stryker (e.g. `npm run test:mutation`) or pass --report <path>.'
     );
   }
-  const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  const report = readReport(reportPath);
   const files = parseMutationReport(report);
   if (files.length === 0) {
     throw new Error(`Report at ${reportPath} contains no valid mutants — refusing to write an empty baseline.`);
@@ -271,15 +345,7 @@ export async function runQualityBaseline(opts: { report?: string; out?: string; 
   // rewrite freely (that is the ratchet working); falls require --force and
   // are then still listed loudly. Membership changes alone never gate — the
   // DROPPED/NEW reporting below covers them.
-  const regressions: Array<{ path: string; from: number; to: number }> = [];
-  if (prior?.files) {
-    for (const [fp, entry] of Object.entries(doc.files)) {
-      const before = prior.files[fp];
-      if (before && entry.score < before.score) {
-        regressions.push({ path: fp, from: before.score, to: entry.score });
-      }
-    }
-  }
+  const regressions = findRegressions(prior, doc);
   if (regressions.length > 0 && !opts.force) {
     const lines = regressions.map((r) => `   ${r.path}: ${r.from}% → ${r.to}%`).join('\n');
     throw new Error(
@@ -293,14 +359,16 @@ export async function runQualityBaseline(opts: { report?: string; out?: string; 
   }
 
   const total = files.reduce((a, f) => a + f.mutants, 0);
-  const detected = files.reduce((a, f) => a + f.killed, 0);
+  const detected = files.reduce((a, f) => a + f.detected, 0);
   console.log(`✓ Baseline written: ${outPath}`);
-  console.log(`   ${files.length} files · ${total} valid mutants · overall score ${((detected / total) * 100).toFixed(1)}%`);
+  // total>0 is guaranteed today (zero-valid files are dropped, empty list is
+  // guarded above) — but the headline number must not print NaN% if the drop
+  // rule ever changes, so guard it here rather than trusting an invariant two
+  // functions away.
+  const overall = total > 0 ? ((detected / total) * 100).toFixed(1) : '0.0';
+  console.log(`   ${files.length} files · ${total} valid mutants · overall score ${overall}%`);
   if (prior?.files) {
-    const oldPaths = new Set(Object.keys(prior.files));
-    const newPaths = new Set(Object.keys(doc.files));
-    const dropped = [...oldPaths].filter((p) => !newPaths.has(p));
-    const added = [...newPaths].filter((p) => !oldPaths.has(p));
+    const { dropped, added } = membershipChanges(prior, doc);
     for (const p of dropped) { console.log(`   ⚠ baseline entry DROPPED: ${p} (score history shed — was ${prior.files[p].score}%)`); }
     for (const p of added) { console.log(`   ⚠ baseline entry NEW: ${p} (no history; seeded at ${doc.files[p].score}%)`); }
   }
@@ -316,7 +384,7 @@ export async function runQualityHotspots(opts: { report?: string; top?: number; 
       'Run Stryker first (e.g. `npm run test:mutation`) or pass --report <path>.'
     );
   }
-  const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+  const report = readReport(reportPath);
   const files = parseMutationReport(report);
   const churn = churnFor(repoRoot, files.map((f) => f.path));
   const issueCheck = opts.noIssues
@@ -326,7 +394,10 @@ export async function runQualityHotspots(opts: { report?: string; top?: number; 
   const top = ranked.slice(0, opts.top ?? 10);
 
   if (opts.json) {
-    console.log(JSON.stringify({ reportPath, issuesChecked: issueCheck.checked, hotspots: top }, null, 2));
+    // Same rounding treatment as the baseline writer — identical inputs must
+    // produce identical bytes, or piping this to a file makes noisy diffs.
+    const stable = top.map((h) => ({ ...h, score: Number(h.score.toFixed(2)), risk: Number(h.risk.toFixed(2)) }));
+    console.log(JSON.stringify({ reportPath, issuesChecked: issueCheck.checked, issuesTruncated: issueCheck.truncated, hotspots: stable }, null, 2));
     return;
   }
 

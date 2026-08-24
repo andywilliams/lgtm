@@ -1745,7 +1745,9 @@ quality
   .option('--json', 'Structured JSON to stdout', false)
   .option('--no-issues', 'Skip the open-issue cross-check')
   .action(async (options) => {
-    if (!/^\d+$/.test(String(options.top).trim())) {
+    // Mirror standards review's two-step check: the regex admits '0', which
+    // would print an empty list that reads as "no hotspots".
+    if (!/^\d+$/.test(String(options.top).trim()) || parseInt(options.top, 10) < 1) {
       console.error(chalk.red('--top must be a positive integer'));
       process.exit(1);
     }

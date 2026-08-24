@@ -13,7 +13,7 @@ import assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { parseMutationReport, buildBaseline, rankHotspots, runQualityBaseline } from './quality.js';
+import { parseMutationReport, buildBaseline, rankHotspots, runQualityBaseline, findRegressions, membershipChanges } from './quality.js';
 
 const mutant = (status: string) => ({ id: 'm', status, mutatorName: 'X', location: {}, replacement: '' });
 
@@ -36,7 +36,7 @@ test('score is Stryker\'s definition: (Killed+Timeout)/valid, Ignored/CompileErr
   const files = parseMutationReport(report);
   const a = files.find((f) => f.path === 'src/a.ts')!;
   assert.equal(a.mutants, 4);
-  assert.equal(a.killed, 3); // Timeout counts as detected
+  assert.equal(a.detected, 3); // Killed + Timeout
   assert.equal(a.score, 75);
   const b = files.find((f) => f.path === 'src/b.ts')!;
   assert.equal(b.score, 25);
@@ -128,4 +128,32 @@ test('a RISING score rewrites freely — that is the ratchet working, not a rese
   const committed = JSON.parse(fs.readFileSync(path.join(dir, '.lgtm/mutation-baseline.json'), 'utf8'));
   assert.equal(committed.files['src/a.ts'].score, 75);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('findRegressions normalizes BOTH sides to 2dp — a hand-precision baseline re-run on the identical report is NOT a fall', () => {
+  const doc = buildBaseline(parseMutationReport({ schemaVersion: '1.0', files: {
+    'src/x.ts': { language: 'ts', source: '', mutants: [mutant('Killed'), mutant('Survived'), mutant('Survived')] }, // 33.33
+  } }), { commit: null, reportPath: 'r' });
+  // A committed file is hand-editable by design: someone stored full precision.
+  const prior: any = { version: 1, generatedAt: '', commit: null, reportPath: 'r', files: {
+    'src/x.ts': { mutants: 3, detected: 1, survived: 2, noCoverage: 0, score: 33.333333 },
+  } };
+  assert.deepEqual(findRegressions(prior, doc), []);
+  // ...while a REAL fall still registers.
+  prior.files['src/x.ts'].score = 50;
+  assert.equal(findRegressions(prior, doc).length, 1);
+  // ...and a malformed prior entry fails open, never throws.
+  prior.files['src/x.ts'].score = 'not-a-number';
+  assert.deepEqual(findRegressions(prior, doc), []);
+});
+
+test('membershipChanges: a rename is one dropped + one added', () => {
+  const doc = buildBaseline(parseMutationReport(report), { commit: null, reportPath: 'r' });
+  const prior: any = { version: 1, generatedAt: '', commit: null, reportPath: 'r', files: {
+    'src/OLD.ts': { mutants: 1, detected: 1, survived: 0, noCoverage: 0, score: 100 },
+    'src/a.ts': doc.files['src/a.ts'],
+  } };
+  const { dropped, added } = membershipChanges(prior, doc);
+  assert.deepEqual(dropped, ['src/OLD.ts']);
+  assert.deepEqual(added, ['src/b.ts']);
 });
