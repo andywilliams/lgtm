@@ -210,7 +210,7 @@ lgtm rounds --local     # the same for the current branch's working-tree reviews
 lgtm rounds 86 --json
 ```
 
-Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
+Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
 
 ### The loop remembers, so you don't
 

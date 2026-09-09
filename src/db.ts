@@ -353,12 +353,16 @@ export interface StopAdvice {
 }
 
 /**
- * The stopping rule, from data: how many consecutive JUDGING rounds have found no
- * BUG/SECURITY (LoopSummary.cleanRounds), plus the round and last-bug round for the
- * message. Round 1 with nothing found is one clean round, not two; a re-run on the
- * same diff or a salvaged round is not a clean round at all.
+ * The stopping rule, from data. Stop when CLEAN_ROUNDS_TO_STOP consecutive JUDGING
+ * rounds found no BUG/SECURITY (LoopSummary.cleanRounds), OR when the latest judging
+ * round raised nothing at all — there is nothing to fix, so nothing a further round
+ * could verify (and a re-run on the same diff would not count as a round anyway).
+ * A re-run on the same diff or a salvaged round is never a clean round.
  */
-export function stopAdvice(round: number, lastBugRound: number | null, clean: number): StopAdvice {
+export function stopAdvice(round: number, lastBugRound: number | null, clean: number, lastRoundEmpty = false): StopAdvice {
+  if (lastRoundEmpty && clean >= 1) {
+    return { stop: true, reason: `round ${round} found nothing — stop; there is nothing left to verify` };
+  }
   if (clean >= CLEAN_ROUNDS_TO_STOP) {
     return {
       stop: true,
@@ -488,6 +492,8 @@ export interface LoopSummary {
   cleanRounds: number;
   /** Rounds in the current run (both keys) — what the budget is measured against. */
   budgetUsed: number;
+  /** True when the latest round could judge and raised nothing at all — there is nothing left to verify. */
+  lastRoundEmpty: boolean;
   totalCostUsd: number;
 }
 
@@ -545,21 +551,26 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   // backwards from the latest; a BUG/SECURITY ends the count; a round that could not
   // judge (salvaged, or the same diff as the round before) is skipped, not counted.
   const run = runOf(reviews);
+  const judging = (i: number) => {
+    const r = run[i];
+    const prevSha = i > 0 ? run[i - 1].diff_sha : null;
+    return !r.recovered && !(r.diff_sha && prevSha && r.diff_sha === prevSha);
+  };
   let cleanRounds = 0;
   for (let i = run.length - 1; i >= 0; i--) {
-    const r = run[i];
-    const row = byRound.get(`${r.round_key}#${r.round}`)!;
+    const row = byRound.get(`${run[i].round_key}#${run[i].round}`)!;
     if (row.bySeverity.BUG > 0 || row.bySeverity.SECURITY > 0) break;
-    const prevSha = i > 0 ? run[i - 1].diff_sha : null;
-    const couldJudge = !r.recovered && !(r.diff_sha && prevSha && r.diff_sha === prevSha);
-    if (couldJudge) cleanRounds += 1;
+    if (judging(i)) cleanRounds += 1;
   }
+  const lastIdx = run.length - 1;
+  const lastRoundEmpty = lastIdx >= 0 && judging(lastIdx) && byRound.get(`${run[lastIdx].round_key}#${run[lastIdx].round}`)!.findings === 0;
   return {
     roundKey,
     rounds,
     lastBugRound,
     cleanRounds,
     budgetUsed: run.length,
+    lastRoundEmpty,
     totalCostUsd: rounds.reduce((s, r) => s + (r.costUsd ?? 0), 0),
   };
 }

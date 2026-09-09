@@ -351,7 +351,7 @@ function applyLoopMemory(opts: {
   // The budget counts the whole loop — the branch's local rounds and the PR's — since
   // its last 7-day gap; a PR round is not a fresh start after eight local ones.
   if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
-    const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds);
+    const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
     exitWithError(
       `This would be round ${summary.budgetUsed + 1} of the loop behind ${roundKey} (${summary.budgetUsed} used of the ${ROUND_BUDGET}-round budget; ${advice.reason}). ` +
         `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
@@ -562,7 +562,7 @@ function recordReviewMetrics(opts: {
       previous,
       lastBugRound: summary.lastBugRound,
       roundsSinceBug: summary.lastBugRound === null ? null : round - summary.lastBugRound,
-      advice: stopAdvice(round, summary.lastBugRound, summary.cleanRounds),
+      advice: stopAdvice(round, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty),
       budget: { limit: ROUND_BUDGET, overrideReason: overrideReason ?? null },
       findingIds,
     };
@@ -1530,7 +1530,7 @@ program
     console.log('');
     console.log(`Measured cost so far: $${summary.totalCostUsd.toFixed(2)}`);
     if (last > 0) {
-      const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds);
+      const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
       console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);
       console.log(`Budget: ${summary.budgetUsed} of ${ROUND_BUDGET} rounds used in the current loop${summary.budgetUsed >= ROUND_BUDGET ? ' — the next needs --override "<reason>"' : ''}.`);
     }

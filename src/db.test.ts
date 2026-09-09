@@ -182,10 +182,12 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   // Round 8 salvaged: neither.
   logReview({ ...base, reviewedAt: '2026-09-09T13:10:00.000Z', harshness: 'medium', diffSha: 'ccc', recovered: true });
   assert.equal(getLoopSummary(repo, key).cleanRounds, 1);
-  // Round 9, new diff, nothing found: now two.
+  // Round 9, new diff, nothing found: now two — and empty, so there is nothing left to verify.
   logReview({ ...base, reviewedAt: '2026-09-09T13:20:00.000Z', harshness: 'medium', diffSha: 'ddd' });
   assert.equal(getLoopSummary(repo, key).cleanRounds, 2);
   assert.equal(getLoopSummary(repo, key).budgetUsed, 9);
+  assert.equal(getLoopSummary(repo, key).lastRoundEmpty, true);
+  assert.equal(after6.lastRoundEmpty, true, 'round 6 raised nothing on a new diff');
 
   // Eight days later the same PR is reviewed again: a new loop for budget and clean count.
   logReview({ ...base, reviewedAt: '2026-09-17T13:20:00.000Z', harshness: 'medium', diffSha: 'eee' });
@@ -265,6 +267,9 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   assert.match(stopAdvice(6, 4, 2).reason, /last BUG\/SECURITY round 4/);
   assert.match(stopAdvice(3, 3, 0).reason, /2 more clean rounds/, 'clean=0 still needs the full count');
   assert.match(stopAdvice(4, 3, 1).reason, /one more clean round/);
+  assert.equal(stopAdvice(4, 3, 1, true).stop, true, 'a judging round that found nothing ends the loop');
+  assert.match(stopAdvice(4, 3, 1, true).reason, /found nothing/);
+  assert.equal(stopAdvice(3, 3, 0, true).stop, false, 'the round that found the bug is not empty by definition; guard anyway');
 
   // A PR loop inherits the branch's local scope and dismissals when told its branch.
   const lrepo = 'memory/repo';
