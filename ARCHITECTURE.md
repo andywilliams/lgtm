@@ -25,7 +25,7 @@ lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitH
 
 **Depends on**
 - GitHub CLI `gh`, authenticated, for PR fetch and comment posting *(inferred from: README prerequisites; src/github.ts)*.
-- An AI CLI on PATH — `claude` (preferred) or `codex`, auto-detected; Action mode supplies `ANTHROPIC_API_KEY` instead *(inferred from: README prerequisites and workflow snippet)*.
+- An AI CLI on PATH — `claude` (preferred) or `codex`, auto-detected; Action mode supplies `ANTHROPIC_API_KEY` instead *(inferred from: README prerequisites and workflow snippet)*. **Version floor for `claude`: 2.1.x** — the stripped-session flags (`--output-format json`, `--strict-mcp-config`, `--setting-sources`, `--no-session-persistence`, `--effort`) are passed unconditionally (verified against 2.1.266). lgtm also reads, but does not own, `~/.claude/settings.json` (`model`, `effortLevel`, `modelSettings`, and the routing keys it warns about); a renamed key there degrades to the CLI default with a stderr line, never a failure *(src/ai.ts; DWLF-205)*.
 - `git` for repo resolution and `--local` base-ref diffs *(inferred from: src/git.ts; PR titles #20, #25)*.
 - Optionally, a Stryker mutation report (`mutation.json`) in the target repo — **consumed, never produced**: generating it is the repo's job (CI or a local Stryker run). Missing report ⇒ a loud, actionable error on the explicit `quality` commands, and a no-op warning wherever quality later participates in a review (the brain.ts posture) *(src/quality.ts; Phase 0 decision, 24-Aug-2026)*.
 - Optionally, a second brain via env — `LGTM_BRAIN_CMD` → `LGTM_BRAIN_URL` → `LGTM_BRAIN_DIR`, tried in that order, first provider that yields anything wins *(inferred from: src/brain.ts header comment)*.
@@ -57,7 +57,7 @@ lgtm is a single-operator, human-in-the-loop AI PR-review CLI: it fetches a GitH
 
 ## Accepted debt
 - Two overlapping review-history stores: SQLite at `~/.lgtm/reviews.db` (src/db.ts) and cwd-relative `data/reviews.json` (src/metrics/reviewLogger.js) — the latter is also committed to this repo, and being cwd-relative it lands in whatever directory lgtm runs from *(inferred from: src/db.ts `DB_PATH` vs src/metrics/reviewLogger.js `DATA_DIR`; data/reviews.json in git ls-files)*.
-  > ❓ TODO confirm: which review-log store is canonical — is the other legacy to be removed, or do they serve deliberately different purposes?
+  > ✅ Answered 2026-09-09 (DWLF-205), pending Andy's confirmation: **SQLite is canonical** — measured usage and the coming per-finding log (DWLF-151) live there. `src/metrics/*.js` is imported by nothing in `src/` and `data/reviews.json` has been an empty array since March; both are legacy to delete in a tidy-up, not a second store. Deleting them also closes the plain-JS accepted-debt line below.
 - `src/metrics/*.js` are plain JS in an otherwise TypeScript codebase, and reviewLogger.js contains TypeScript-only syntax (`export interface`) inside a `.js` file *(inferred from: file tree; src/metrics/reviewLogger.js head)*.
 - Tests cover parsing, context expansion, the AI-CLI plumbing and the review log (`*.parse.test.ts`, `contextExpander.test.ts`, `github.test.ts`, `ai.test.ts`, `db.test.ts`, `standards*.test.ts`, `quality.test.ts`); CLI orchestration and the brain providers are untested *(from the test files present in the tree)*.
 

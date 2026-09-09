@@ -1277,7 +1277,7 @@ program
     if (stats.measured > 0) {
       console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
       console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);
-      console.log(`Cost:                   $${stats.costUsd.toFixed(2)}`);
+      console.log(`Cost (logged reviews):  $${stats.costUsd.toFixed(2)}`);
     }
     console.log('');
   });
