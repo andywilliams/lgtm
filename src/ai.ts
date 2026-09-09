@@ -116,17 +116,21 @@ export const DEFAULT_LATE_MODEL = 'claude-sonnet-5';
  * full model is one too (`claude-…`); an operator pinned to a Bedrock ARN or Vertex id
  * gets the policy only by naming a late model of their own in LGTM_LATE_MODEL.
  */
-export function lateModel(fullModel: string | undefined = resolveModel()): string | undefined {
+export function lateModel(fullModel: string | undefined = resolveModel()): { model: string | undefined; reason: string } {
   let explicit = process.env.LGTM_LATE_MODEL;
+  let note = '';
   if (explicit !== undefined && explicit.trim().toLowerCase() !== 'off' && !MODEL_ID.test(explicit.trim())) {
     // Junk is treated as unset, so the first-party guard below still applies.
     process.stderr.write(`lgtm: ignoring LGTM_LATE_MODEL=${JSON.stringify(explicit)} (not a model id)\n`);
+    note = ` (LGTM_LATE_MODEL=${JSON.stringify(explicit)} ignored: not a model id)`;
     explicit = undefined;
   }
-  if (explicit === undefined && fullModel !== undefined && !/^claude-/.test(fullModel)) return undefined;
+  if (explicit === undefined && fullModel !== undefined && !/^claude-/.test(fullModel)) {
+    return { model: undefined, reason: `full model is not a first-party id; set LGTM_LATE_MODEL to opt in${note}` };
+  }
   const v = (explicit ?? DEFAULT_LATE_MODEL).trim();
-  if (!v || v.toLowerCase() === 'off') return undefined;
-  return v;
+  if (!v || v.toLowerCase() === 'off') return { model: undefined, reason: 'policy off (LGTM_LATE_MODEL=off)' };
+  return { model: v, reason: explicit === undefined ? `default late model${note}` : 'LGTM_LATE_MODEL' };
 }
 
 /** A change to the reviewed diff bigger than this (added+removed lines vs the last round) re-escalates to the full model. */
@@ -165,13 +169,13 @@ export function pickRoundModel(input: {
   if (provider && provider !== 'claude') return { model: undefined, source: 'provider', reason: `${provider} chooses its own model` };
   if (explicit) return { model: explicit, source: 'explicit', reason: '--model' };
   const late = lateModel(fullModel);
-  if (!late) return policy(process.env.LGTM_LATE_MODEL === undefined ? 'full model is not a first-party id; set LGTM_LATE_MODEL to opt in' : 'policy off (LGTM_LATE_MODEL=off)');
+  if (!late.model) return policy(late.reason);
   if (round < LATE_ROUND) return policy(`round ${round} < ${LATE_ROUND}: full model`);
   if (harshness !== 'chill') return policy(`harshness ${harshness}: full model`);
   if (openBugs > 0) return policy(`${openBugs} BUG/SECURITY finding(s) still open: full model verifies the fix`);
   const delta = lastDiffLines === null ? null : Math.abs(diffLines - lastDiffLines);
   if (delta !== null && delta > RE_ESCALATE_LINES) return policy(`diff changed by ${delta} lines (> ${RE_ESCALATE_LINES}): full model`);
-  return policy(`late chill round ${round}, delta ${delta ?? 'n/a'} lines: cheaper model`, late);
+  return policy(`late chill round ${round}, delta ${delta ?? 'n/a'} lines: cheaper model (${late.reason})`, late.model);
 }
 const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 // Settings that change WHERE or HOW the CLI authenticates; stripping them can break

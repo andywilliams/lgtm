@@ -22,7 +22,7 @@ import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopConte
 import { createHash } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
+import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -375,6 +375,48 @@ function applyLoopMemory(opts: {
     );
   }
   return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines } };
+}
+
+/**
+ * Run the review with its recovery ladder. Every attempt that produces no review is
+ * logged as a failed round — the spend is real and it judges nothing. Ladder: (1) the
+ * same model again with the reply schema enforced (an unparsable reply is what the
+ * schema fixes); (2) if the policy had picked the cheaper model, the full model with the
+ * schema — a cheaper reviewer that cannot answer is not a saving. Anything else rethrows.
+ */
+async function reviewWithRecovery(opts: {
+  review: (enforceSchema?: boolean) => Promise<ReviewResult>;
+  ai: AIProvider;
+  choice: RoundModelChoice;
+  initialChoice: RoundModelChoice;
+  logFailedRound: (why: string) => void;
+  say: (line: string) => void;
+}): Promise<{ result: ReviewResult; choice: RoundModelChoice }> {
+  const { review, ai, initialChoice, logFailedRound, say } = opts;
+  let { choice } = opts;
+  const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
+  try {
+    return { result: await review(), choice };
+  } catch (e: any) {
+    logFailedRound(e?.message ?? String(e));
+    if (!isParseFailure(e) || ai !== 'claude') throw e;
+  }
+  try {
+    say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
+    return { result: await review(true), choice };
+  } catch (e2: any) {
+    logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`);
+    if (!(choice.source === 'policy' && choice.model !== undefined)) throw e2;
+  }
+  choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review twice (${initialChoice.reason})` };
+  setModelOverride(undefined);
+  say(`↺  ${choice.reason}`);
+  try {
+    return { result: await review(true), choice };
+  } catch (e3: any) {
+    logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`);
+    throw e3;
+  }
 }
 
 /** Added + removed lines in a unified diff — the size the round policy compares between rounds. */
@@ -795,37 +837,8 @@ async function runReview(options: RunOptions): Promise<void> {
     filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice, failed: why,
   });
-  // Every attempt that produces no review is logged as a failed round — the spend is
-  // real and it judges nothing. Recovery ladder: (1) the same model again with the reply
-  // schema enforced (an unparsable reply is what the schema fixes); (2) if the policy
-  // had picked the cheaper model, the full model with the schema — a cheaper reviewer
-  // that cannot answer is not a saving.
-  const say = (line: string) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line)));
-  const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
   let result: Awaited<ReturnType<typeof review>>;
-  try {
-    result = await review();
-  } catch (e: any) {
-    logFailedRound(e?.message ?? String(e));
-    if (!isParseFailure(e) || ai !== 'claude') throw e;
-    try {
-      say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
-      result = await review(true);
-    } catch (e2: any) {
-      logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`);
-      const policyPicked = choice.source === 'policy' && choice.model !== undefined;
-      if (!policyPicked) throw e2;
-      choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review twice (${initialChoice.reason})` };
-      setModelOverride(undefined);
-      say(`↺  ${choice.reason}`);
-      try {
-        result = await review(true);
-      } catch (e3: any) {
-        logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`);
-        throw e3;
-      }
-    }
-  }
+  ({ result, choice } = await reviewWithRecovery({ review, ai, choice, initialChoice, logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
 
   log(chalk.gray(`\n${result.summary}\n`));
 

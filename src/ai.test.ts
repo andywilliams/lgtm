@@ -193,7 +193,7 @@ test('pickRoundModel: cheaper model only on a late, chill, settled round with no
   const saved = process.env.LGTM_LATE_MODEL;
   try {
     delete process.env.LGTM_LATE_MODEL;
-    const base = { round: 5, harshness: 'chill', openBugs: 0, diffLines: 400, lastDiffLines: 390 };
+    const base = { round: 5, harshness: 'chill', openBugs: 0, diffLines: 400, lastDiffLines: 390, fullModel: 'claude-fable-5-1[1m]' };
     assert.equal(pickRoundModel(base).model, DEFAULT_LATE_MODEL);
     assert.equal(pickRoundModel({ ...base, explicit: 'claude-opus-5' }).model, 'claude-opus-5', '--model wins');
     assert.equal(pickRoundModel({ ...base, round: 1 }).model, undefined, 'first look is always the full model');
@@ -241,7 +241,9 @@ test('pickRoundModel only assumes the first-party late model when the full model
     assert.match(pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' }).model ?? '', /sonnet/, 'an explicit late model is honoured on any provider');
     process.env.LGTM_LATE_MODEL = 'not a model';
     assert.equal(pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' }).model, undefined, 'junk is treated as unset, so the first-party guard still applies');
-    assert.equal(pickRoundModel({ ...base, fullModel: 'claude-fable-5-1[1m]' }).model, DEFAULT_LATE_MODEL, 'junk on a first-party setup falls back to the default');
+    const junk = pickRoundModel({ ...base, fullModel: 'claude-fable-5-1[1m]' });
+    assert.equal(junk.model, DEFAULT_LATE_MODEL, 'junk on a first-party setup falls back to the default');
+    assert.match(junk.reason, /ignored: not a model id/, 'and the recorded reason says so');
   } finally {
     if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
   }
