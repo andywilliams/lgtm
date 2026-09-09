@@ -93,6 +93,9 @@ const REVIEW_COLUMNS: [string, string][] = [
   // What lgtm ASKED for, independent of how the CLI names it back: 'full' (the operator's
   // default), 'late:<id>' (the policy's cheaper model) or 'explicit:<id>' (--model).
   ['model_role', 'TEXT'],
+  // Prompt tokens of the round's LAST call: the context the session holds after it.
+  // prompt_tokens sums every attempt (a schema retry bills twice), so it over-states.
+  ['context_tokens', 'INTEGER'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -210,7 +213,8 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
     // No role recorded (a row from before the column existed) ⇒ null; planSession then
     // opens a new session rather than guess from the reported id's family name.
-    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas, lastPromptTokens: sessionRow.prompt_tokens };
+    // context_tokens is the last call's prompt; older rows only have the summed prompt_tokens.
+    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas, lastPromptTokens: sessionRow.context_tokens ?? sessionRow.prompt_tokens };
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
@@ -278,13 +282,14 @@ interface RunRow {
   session_id: string | null;
   file_shas: string | null;
   model_role: string | null;
+  context_tokens: number | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -324,9 +329,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -364,7 +369,8 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.failed ? 1 : 0,
     data.sessionId ?? null,
     data.fileShas ? JSON.stringify(data.fileShas) : null,
-    data.modelRole ?? null
+    data.modelRole ?? null,
+    m ? m.lastPromptTokens : null
     );
     return { id: Number(result.lastInsertRowid), round };
   });

@@ -38,6 +38,8 @@ export interface AIUsage {
   /** Distinct model ids the CLI reported (a print run may also use a small helper model). */
   models: string[];
   calls: number;
+  /** Prompt tokens of the LAST call in the window — the context a session actually holds, where the totals above sum every attempt. */
+  lastPromptTokens: number;
   /** False when any call in the window had no envelope to read (codex, or a non-JSON reply). */
   measured: boolean;
 }
@@ -52,6 +54,7 @@ export function emptyUsage(): AIUsage {
     durationMs: 0,
     models: [],
     calls: 0,
+    lastPromptTokens: 0,
     measured: true,
   };
 }
@@ -83,6 +86,7 @@ export function addUsage(u: AIUsage | null): void {
   ledger.outputTokens += u.outputTokens;
   ledger.costUsd += u.costUsd;
   ledger.durationMs += u.durationMs;
+  ledger.lastPromptTokens = promptTokens(u);
   for (const m of u.models) if (!ledger.models.includes(m)) ledger.models.push(m);
 }
 
@@ -315,6 +319,7 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
     durationMs: num(d.duration_ms),
     models: d.modelUsage && typeof d.modelUsage === 'object' ? Object.keys(d.modelUsage) : [],
     calls: 1,
+    lastPromptTokens: num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens),
     measured: Boolean(hasUsage),
   };
   return { text, usage };

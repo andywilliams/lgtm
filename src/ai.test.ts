@@ -159,6 +159,7 @@ test('the ledger sums measured calls and is tainted by any unmeasured one', () =
   assert.equal(promptTokens(window), 2 * (2 + 6592 + 10078));
   assert.equal(window.outputTokens, 8);
   assert.deepEqual(window.models, ['claude-haiku-4-5-20251001', 'claude-fable-5-1']);
+  assert.equal(window.lastPromptTokens, 2 + 6592 + 10078, 'the last call, not the sum');
 
   addUsage(a);
   addUsage(parsePrintEnvelope(JSON.stringify({ result: 'ok' })).usage); // envelope, no usage block
