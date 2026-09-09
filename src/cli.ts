@@ -383,9 +383,72 @@ function applyLoopMemory(opts: {
   return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines, session: ctx.session } };
 }
 
-/** The operator's full model as the log records it (the CLI reports ids without the [1m] suffix). */
-function resolveFullModelId(): string | undefined {
-  return resolveModel()?.replace(/\[.*\]$/, '');
+/** A model id as the log records it: the CLI reports ids without the [1m] suffix. */
+function bareModelId(id: string | undefined): string | undefined {
+  return id?.replace(/\[.*\]$/, '');
+}
+
+interface SessionPlan {
+  /** sha1 of every file's contents as sent this round (changed files and related files). */
+  fileShas: Record<string, string>;
+  /** The session to run in, or null when sessions are off / the provider is not claude. */
+  session: { id: string; resume: boolean; changedSinceLast: Record<string, string>; unchangedFiles: string[] } | null;
+  /** Set when the round continues a session: the model to keep and why. */
+  resumeModel?: string;
+  resumeReason?: string;
+  note?: string;
+}
+
+/**
+ * Decide whether this round continues the loop's session or opens one. Continue when a
+ * session exists, the operator did not ask for --fresh, and the model the round would run
+ * on is the session's model — a cached turn on the full model beats an uncached one on
+ * the cheaper model, but a session running on the cheaper model must not carry a round
+ * the policy says needs the full one (an open BUG, a non-chill round). Otherwise a new
+ * session, with the full prompt. The files the session has seen are compared by sha1 so
+ * a resumed round sends only what moved (related files included — a fix that adds an
+ * import must reach the session too).
+ */
+function planSession(input: {
+  prior: LoopSession | null;
+  contents: Record<string, string>;
+  ai: AIProvider;
+  explicitModel?: string;
+  fresh?: boolean;
+  /** The model the round policy chose (undefined = the full model). */
+  policyModel: string | undefined;
+}): SessionPlan {
+  const { prior, contents, ai, explicitModel, fresh, policyModel } = input;
+  const fileShas: Record<string, string> = {};
+  for (const [path, content] of Object.entries(contents)) fileShas[path] = createHash('sha1').update(content).digest('hex');
+  const sessionsOff = (process.env.LGTM_SESSIONS ?? '').toLowerCase() === 'off';
+  if (sessionsOff || ai !== 'claude') return { fileShas, session: null };
+  const wanted = bareModelId(explicitModel ?? policyModel ?? resolveModel());
+  const sessionModel = bareModelId(prior?.model ?? undefined);
+  const fullModel = bareModelId(resolveModel());
+  const canContinue = prior && !fresh && (
+    // The session's model is what this round wants — or the round would go cheaper and
+    // the session is on the full model, where the cache makes staying the better deal.
+    sessionModel === wanted || (sessionModel === fullModel && !explicitModel)
+  );
+  if (prior && canContinue) {
+    const changedSinceLast: Record<string, string> = {};
+    const unchangedFiles: string[] = [];
+    for (const [path, content] of Object.entries(contents)) {
+      if (prior.fileShas[path] === fileShas[path]) unchangedFiles.push(path); else changedSinceLast[path] = content;
+    }
+    const keep = sessionModel && sessionModel !== fullModel ? sessionModel : undefined;
+    return {
+      fileShas,
+      session: { id: prior.id, resume: true, changedSinceLast, unchangedFiles: unchangedFiles.sort() },
+      resumeModel: keep,
+      resumeReason: `continuing the loop's session on ${sessionModel ?? 'its model'} (prompt cache; ${Object.keys(changedSinceLast).length} file(s) changed since last round)`,
+    };
+  }
+  const note = prior && !fresh
+    ? `⟳  session: not continuing ${prior.id.slice(0, 8)} (it ran on ${sessionModel ?? 'an unknown model'}, this round needs ${wanted ?? 'the full model'}) — opening a new one`
+    : undefined;
+  return { fileShas, session: { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] }, note };
 }
 
 /** Added + removed lines in a unified diff — the size the round policy compares between rounds. */
@@ -791,53 +854,27 @@ async function runReview(options: RunOptions): Promise<void> {
     diffLines,
     lastDiffLines: policy?.lastDiffLines ?? null,
   });
-  // The loop's session, if it can be continued: everything it has already been shown is
-  // a prompt-cache hit, and a cached turn on the full model is cheaper than a fresh turn
-  // on the cheaper one — so a resumed round keeps the session's model.
-  const sessionsOff = (process.env.LGTM_SESSIONS ?? '').toLowerCase() === 'off';
-  const prior = !sessionsOff && !fresh && ai === 'claude' ? policy?.session ?? null : null;
-  const fileShas: Record<string, string> = {};
-  for (const [path, content] of Object.entries(fileContents ?? {})) fileShas[path] = createHash('sha1').update(content).digest('hex');
-  let sessionPlan: { id: string; resume: boolean; changedSinceLast: Record<string, string>; unchangedFiles: string[] } | null = null;
-  if (!sessionsOff && ai === 'claude') {
-    if (prior && (!explicitModel || explicitModel === prior.model)) {
-      const changedSinceLast: Record<string, string> = {};
-      const unchangedFiles: string[] = [];
-      for (const [path, content] of Object.entries(fileContents ?? {})) {
-        if (prior.fileShas[path] === fileShas[path]) unchangedFiles.push(path); else changedSinceLast[path] = content;
-      }
-      sessionPlan = { id: prior.id, resume: true, changedSinceLast, unchangedFiles: unchangedFiles.sort() };
-    } else {
-      sessionPlan = { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] };
-    }
-  }
-  let choice: RoundModelChoice = sessionPlan?.resume
-    ? { model: prior!.model && prior!.model !== resolveFullModelId() ? prior!.model : undefined, source: 'policy', reason: `continuing the loop's session on ${prior!.model ?? 'its model'} (prompt cache; ${Object.keys(sessionPlan.changedSinceLast).length} file(s) changed since last round)` }
+  // The loop's session, if it can be continued (see planSession); the file set covers the
+  // related files too, so a newly discovered import is sent to a resumed session.
+  const contentsSeen: Record<string, string> = { ...(fileContents ?? {}) };
+  for (const f of expanded) if (!(f.path in contentsSeen)) contentsSeen[f.path] = f.content;
+  const plan = planSession({ prior: policy?.session ?? null, contents: contentsSeen, ai, explicitModel, fresh, policyModel: initialChoice.model });
+  const { fileShas } = plan;
+  let sessionPlan = plan.session;
+  let choice: RoundModelChoice = plan.resumeReason
+    ? { model: plan.resumeModel, source: 'policy', reason: plan.resumeReason }
     : initialChoice;
-  // Said even for codex, so `--model` with codex is visibly not applied rather than silently ignored.
-  const modelLine = `🎛  model: ${choice.model ?? (ai === 'claude' ? 'default (full)' : ai)} — ${choice.reason}`;
-  if (auto) console.error(chalk.gray(modelLine)); else log(chalk.gray(modelLine));
-
-  // Review with AI
-  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
-  const contextModes = [harshness + ' mode'];
-  if (fullContext) contextModes.push('full context');
-  if (usageContext && usageContextStr) contextModes.push('usage context');
-  if (relatedFiles && expandedContextStr) contextModes.push('related files');
-  if (handbookContextStr) contextModes.push('handbook');
-  if (charterContextStr) contextModes.push('charter');
-  if (standardsContextStr) contextModes.push('standards');
-  const modeLabel = contextModes.join(' + ');
-  log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
+  if (plan.note) { if (auto) console.error(chalk.gray(plan.note)); else log(chalk.gray(plan.note)); }
   // The model is an argument of each attempt, not hidden state the ladder has to reset;
-  // `fresh` abandons the resumed session for a new one carrying the full prompt.
+  // `fresh` abandons the resumed session for ONE new one (minted once, so the schema retry
+  // and the full-model fallback continue it rather than opening a third and fourth).
   // A holder rather than a `let`: the attempts assign it from inside `review`, and the
   // logging calls below read whichever session the last attempt actually used.
   const sessionUsed: { current: { id: string; resume: boolean } | null } = { current: null };
+  const freshSession = sessionPlan ? { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] } : null;
   const review = (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean } = {}) => {
     if (ai === 'claude') setModelOverride(attempt.model);
-    let session = sessionPlan;
-    if (session && attempt.fresh) session = { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] };
+    const session = attempt.fresh ? freshSession : sessionPlan;
     sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
       scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
@@ -850,6 +887,7 @@ async function runReview(options: RunOptions): Promise<void> {
       : `⟳  session: new ${sessionPlan.id.slice(0, 8)} for this loop`;
     if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
   }
+  void sessionPlan; // reassigned only by planSession; kept mutable for the fresh path above
   // The failed attempt's model choice is passed in, not closed over: the recovery ladder
   // changes the choice between attempts and the row must name the model that actually failed.
   const logFailedRound = (why: string, attempted: RoundModelChoice) => recordReviewMetrics({

@@ -235,7 +235,7 @@ export const VOLATILE_MARKER = '\n## PR Title\n';
  * is told this is a later round of the same change, so it judges the code as it is now.
  */
 export function buildResumePrompt(input: ReviewPromptInput & { round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] }): string {
-  const { diff, prTitle, harshness, extra, round, changedSinceLast, unchangedFiles } = input;
+  const { diff, prTitle, harshness, extra, round, changedSinceLast, unchangedFiles, usageContext } = input;
   const volatileStart = buildReviewPrompt(input).indexOf(VOLATILE_MARKER);
   const volatile = buildReviewPrompt(input).slice(volatileStart); // title, diff, harshness, scope, decided, output format
   const changed = Object.entries(changedSinceLast).sort(([a], [b]) => a.localeCompare(b));
@@ -244,11 +244,13 @@ export function buildResumePrompt(input: ReviewPromptInput & { round: number; ch
       changed.map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``).join('\n\n') + '\n'
     : '## Files changed since the last round\n\n(none — the contents you have already seen are current)\n';
   const unchanged = unchangedFiles.length > 0 ? `Unchanged since the last round (contents already in context): ${unchangedFiles.join(', ')}\n` : '';
+  // Symbol usages are recomputed from the current diff and are small: always current.
+  const usage = usageContext ? `\n${usageContext}\n` : '';
   return `# Review round ${round} of "${prTitle}" — the code has moved on since your last review
 
 This is a later round of the SAME change. Everything you were given before (repo charter, standards, related files, file contents) still applies unless replaced below. Judge the code AS IT IS NOW: a finding from an earlier round that the current code no longer exhibits must not be repeated; a finding that still applies should be raised again. Harshness for this round: ${harshness}.
 
-${changedSection}${unchanged}${volatile}`;
+${changedSection}${unchanged}${usage}${volatile}`;
 }
 
 /**

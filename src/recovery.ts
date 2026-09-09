@@ -45,9 +45,8 @@ export async function reviewWithRecovery(opts: {
         lastError = e2;
       }
     }
-    // A non-parse failure (model unavailable on this plan/region, a gateway error) has
-    // nothing for the schema to fix: go straight to the full model if the policy chose.
-    if (!isParseFailure(e) && !policyPickedCheaper()) throw e;
+    // From here on, decisions and rethrows are about the LATEST failure, not the first.
+    if (!isParseFailure(lastError) && !policyPickedCheaper()) throw lastError;
   }
   if (isParseFailure(lastError)) {
     try {

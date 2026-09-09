@@ -87,3 +87,9 @@ test('a resumed session that cannot be continued gets one fresh full round on th
   assert.equal(r2.freshened, false);
   assert.deepEqual(h2.attempts, [{ model: undefined }, { enforceSchema: true, model: undefined }]);
 });
+
+test('when the fresh session also fails, the error that surfaces is the latest one', async () => {
+  const h = harness([new Error('No conversation found with session ID'), new Error('529 overloaded on the fresh call')], true);
+  await assert.rejects(() => h.run(full), /529 overloaded/);
+  assert.equal(h.failed.length, 2);
+});

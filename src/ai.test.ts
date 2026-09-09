@@ -249,3 +249,15 @@ test('pickRoundModel only assumes the first-party late model when the full model
     if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
   }
 });
+
+test('claudePrintArgs: a loop session persists and is started or resumed by id; a one-off call does not persist', () => {
+  const start = claudePrintArgs('claude-fable-5-1[1m]', 'high', '', undefined, { id: 'abc', resume: false });
+  assert.equal(start[start.indexOf('--session-id') + 1], 'abc');
+  assert.ok(!start.includes('--resume'));
+  assert.ok(!start.includes('--no-session-persistence'));
+  const cont = claudePrintArgs('claude-fable-5-1[1m]', 'high', '', undefined, { id: 'abc', resume: true });
+  assert.equal(cont[cont.indexOf('--resume') + 1], 'abc');
+  assert.ok(!cont.includes('--session-id'));
+  assert.ok(!cont.includes('--no-session-persistence'));
+  assert.ok(claudePrintArgs('claude-fable-5-1[1m]', 'high', '').includes('--no-session-persistence'));
+});
