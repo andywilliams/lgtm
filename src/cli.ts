@@ -19,6 +19,7 @@ import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
 import { logReview } from './db.js';
+import { takeUsage, promptTokens, type AIUsage } from './ai.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility } from './types.js';
 
@@ -94,7 +95,13 @@ program.addHelpText(
     'handbook + related systems. Off unless one of these is set:\n' +
     '  LGTM_BRAIN_CMD   command that prints context for a repo (any brain)\n' +
     '  LGTM_BRAIN_URL   a second-brain HTTP API\n' +
-    '  LGTM_BRAIN_DIR   a second-brain vault on disk\n'
+    '  LGTM_BRAIN_DIR   a second-brain vault on disk\n' +
+    '\nModel calls run `claude --print` as a stripped session (no MCP servers, no settings or\n' +
+    'CLAUDE.md from the cwd, no saved transcript) and record the billed usage per review:\n' +
+    '  LGTM_MODEL                    model id to review with (default: your ~/.claude/settings.json model)\n' +
+    '  LGTM_EFFORT                   low|medium|high|xhigh|max (default: your settings effort for that model)\n' +
+    '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
+    '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
 
 program
@@ -332,10 +339,12 @@ function formatAgentResult(options: {
   comments: AnnotatedComment[];
   relatedFiles?: { path: string; reason: string }[];
   tokenEstimate?: number;
+  usage?: AIUsage;
   recovered?: boolean;
   error?: string;
 }): string {
   const duplicates = options.comments.filter(c => c.duplicate).length;
+  const u = options.usage;
   return JSON.stringify({
     success: options.success,
     mode: 'agent',
@@ -359,6 +368,10 @@ function formatAgentResult(options: {
       maxContext: true,
       relatedFiles: (options.relatedFiles ?? []).map(f => ({ path: f.path, reason: f.reason })),
       tokenEstimate: options.tokenEstimate ?? 0,
+      // What the provider billed for this run — tokenEstimate above is only the diff+context size.
+      usage: u && u.measured && u.calls > 0
+        ? { promptTokens: promptTokens(u), cacheReadTokens: u.cacheReadTokens, outputTokens: u.outputTokens, costUsd: u.costUsd, durationMs: u.durationMs, models: u.models }
+        : null,
     },
     ...(options.error ? { error: options.error } : {}),
   });
@@ -366,7 +379,8 @@ function formatAgentResult(options: {
 
 /**
  * Best-effort metrics logging for a completed review. Returns the rough token
- * estimate (diff + expanded context) so callers can surface it. Never throws.
+ * estimate (diff + expanded context) plus the measured usage drained from the AI
+ * ledger, so callers can surface both. Never throws.
  */
 function recordReviewMetrics(opts: {
   repo?: string;
@@ -376,15 +390,16 @@ function recordReviewMetrics(opts: {
   relatedFiles: boolean;
   ai: AIProvider;
   local?: boolean;
-}): number {
+}): { tokenEstimate: number; usage: AIUsage } {
   const { repo, prNumber, diff, expanded, relatedFiles, ai, local } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
+  const usage = takeUsage();
   // The metrics DB is keyed on GitHub PRs — skip persistence for local reviews (still
-  // return the token estimate so agent-mode output is populated).
-  if (local) return tokenEstimate;
+  // return the estimate and usage so agent-mode output is populated).
+  if (local) return { tokenEstimate, usage };
   try {
     const repoName = repo || getRepoRoot();
     const changedFiles = getChangedFiles(prNumber, repo);
@@ -399,12 +414,13 @@ function recordReviewMetrics(opts: {
       model: ai,
       usedContextExpansion: relatedFiles && expanded.length > 0,
       falseNegative: false,
+      usage,
     });
   } catch (e) {
     // Metrics logging is non-critical — don't fail the review.
     process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
   }
-  return tokenEstimate;
+  return { tokenEstimate, usage };
 }
 
 async function runReview(options: RunOptions): Promise<void> {
@@ -580,7 +596,7 @@ async function runReview(options: RunOptions): Promise<void> {
       duplicate: isDuplicateComment(comment, existingComments),
     }));
 
-    const tokenEstimate = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai, local });
+    const { tokenEstimate, usage } = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai, local });
 
     console.log(formatAgentResult({
       success: true,
@@ -588,6 +604,7 @@ async function runReview(options: RunOptions): Promise<void> {
       comments: annotated,
       relatedFiles: expanded,
       tokenEstimate,
+      usage,
       recovered: result.recovered,
     }));
     return;
@@ -1251,10 +1268,18 @@ program
     const contextCoverage = stats.total > 0 ? ((stats.withContextExpansion / stats.total) * 100).toFixed(1) : '0.0';
     
     console.log(chalk.bold(`\nlgtm Review Metrics — ${month}/${year}\n`));
-    console.log(`PRs Reviewed:           ${stats.total}`);
+    console.log(`Reviews logged:         ${stats.total}`);
     console.log(`False Negatives:        ${stats.falseNegatives}`);
     console.log(`False Negative Rate:    ${falseNegativeRate}%`);
-    console.log(`Context Expansion Used: ${contextCoverage}%\n`);
+    console.log(`Context Expansion Used: ${contextCoverage}%`);
+    // Measured figures cover only rows with a provider envelope; the rest carry the old diff-length estimate.
+    console.log(`Measured reviews:       ${stats.measured} of ${stats.total}`);
+    if (stats.measured > 0) {
+      console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
+      console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);
+      console.log(`Cost:                   $${stats.costUsd.toFixed(2)}`);
+    }
+    console.log('');
   });
 
 // Quiz command: test your understanding of a PR
