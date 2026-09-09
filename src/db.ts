@@ -47,6 +47,7 @@ export interface ReviewLog {
   sessionId?: string;
   /** path → sha1 of the full contents sent this round. */
   fileShas?: Record<string, string>;
+  modelRole?: string;
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -89,6 +90,9 @@ const REVIEW_COLUMNS: [string, string][] = [
   // sha1 of each changed file's contents as sent — so the next round sends only what moved.
   ['session_id', 'TEXT'],
   ['file_shas', 'TEXT'],
+  // What lgtm ASKED for, independent of how the CLI names it back: 'full' (the operator's
+  // default), 'late:<id>' (the policy's cheaper model) or 'explicit:<id>' (--model).
+  ['model_role', 'TEXT'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -172,8 +176,10 @@ export function initDb(): Database.Database {
  */
 export interface LoopSession {
   id: string;
-  /** The model the session has been running on — a resumed turn only caches on the same model. */
+  /** The model the session has been running on, as the CLI reported it. */
   model: string | null;
+  /** What lgtm asked for on the session's latest round: 'full' | 'late:<id>' | 'explicit:<id>' — the comparable thing. */
+  role: string | null;
   /** path → sha1 of the file contents the session has already seen (latest version of each). */
   fileShas: Record<string, string>;
 }
@@ -199,7 +205,10 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
       try { Object.assign(fileShas, JSON.parse(r.file_shas)); } catch { /* ignore a bad row */ }
     }
     const modelRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_id);
-    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, fileShas };
+    const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
+    // Rows logged before model_role existed: infer 'full' unless the reported id is a known cheaper model.
+    const inferred = modelRow?.model_id ? (/sonnet|haiku/i.test(modelRow.model_id) ? `late:${modelRow.model_id}` : 'full') : null;
+    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? inferred, fileShas };
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
@@ -266,13 +275,14 @@ interface RunRow {
   failed: number | null;
   session_id: string | null;
   file_shas: string | null;
+  model_role: string | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -312,9 +322,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -351,7 +361,8 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.modelReason ?? null,
     data.failed ? 1 : 0,
     data.sessionId ?? null,
-    data.fileShas ? JSON.stringify(data.fileShas) : null
+    data.fileShas ? JSON.stringify(data.fileShas) : null,
+    data.modelRole ?? null
     );
     return { id: Number(result.lastInsertRowid), round };
   });
