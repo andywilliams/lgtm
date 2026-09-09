@@ -202,6 +202,8 @@ test('pickRoundModel: cheaper model only on a late, chill, settled round with no
     assert.equal(pickRoundModel({ ...base, openBugs: 1 }).model, undefined, 'an unverified BUG/SECURITY fix keeps the full model, however many rounds ago it was found');
     assert.equal(pickRoundModel({ ...base, provider: 'codex' }).model, undefined, 'codex picks its own model');
     assert.match(pickRoundModel({ ...base, provider: 'codex', explicit: 'claude-opus-5' }).reason, /codex/, 'even with --model');
+    assert.equal(pickRoundModel({ ...base, explicit: 'claude-opus-5' }).source, 'explicit');
+    assert.equal(pickRoundModel(base).source, 'policy');
     assert.equal(pickRoundModel({ ...base, lastDiffLines: 400 - RE_ESCALATE_LINES - 1 }).model, undefined, 'a big change re-escalates');
     assert.equal(pickRoundModel({ ...base, lastDiffLines: null }).model, DEFAULT_LATE_MODEL, 'unknown previous size does not block');
 
@@ -237,6 +239,9 @@ test('pickRoundModel only assumes the first-party late model when the full model
     assert.match(bedrock.reason, /not a first-party id/);
     process.env.LGTM_LATE_MODEL = 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-sonnet-5';
     assert.match(pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' }).model ?? '', /sonnet/, 'an explicit late model is honoured on any provider');
+    process.env.LGTM_LATE_MODEL = 'not a model';
+    assert.equal(pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' }).model, undefined, 'junk is treated as unset, so the first-party guard still applies');
+    assert.equal(pickRoundModel({ ...base, fullModel: 'claude-fable-5-1[1m]' }).model, DEFAULT_LATE_MODEL, 'junk on a first-party setup falls back to the default');
   } finally {
     if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
   }

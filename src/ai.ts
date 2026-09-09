@@ -117,14 +117,15 @@ export const DEFAULT_LATE_MODEL = 'claude-sonnet-5';
  * gets the policy only by naming a late model of their own in LGTM_LATE_MODEL.
  */
 export function lateModel(fullModel: string | undefined = resolveModel()): string | undefined {
-  const explicit = process.env.LGTM_LATE_MODEL;
+  let explicit = process.env.LGTM_LATE_MODEL;
+  if (explicit !== undefined && explicit.trim().toLowerCase() !== 'off' && !MODEL_ID.test(explicit.trim())) {
+    // Junk is treated as unset, so the first-party guard below still applies.
+    process.stderr.write(`lgtm: ignoring LGTM_LATE_MODEL=${JSON.stringify(explicit)} (not a model id)\n`);
+    explicit = undefined;
+  }
   if (explicit === undefined && fullModel !== undefined && !/^claude-/.test(fullModel)) return undefined;
   const v = (explicit ?? DEFAULT_LATE_MODEL).trim();
   if (!v || v.toLowerCase() === 'off') return undefined;
-  if (!MODEL_ID.test(v)) {
-    process.stderr.write(`lgtm: ignoring LGTM_LATE_MODEL=${JSON.stringify(v)} (not a model id)\n`);
-    return DEFAULT_LATE_MODEL;
-  }
   return v;
 }
 
@@ -136,6 +137,8 @@ export const LATE_ROUND = 4;
 export interface RoundModelChoice {
   /** undefined ⇒ the full model (operator default) */
   model: string | undefined;
+  /** Who decided: the caller's --model, the round policy, or a provider that picks its own. */
+  source: 'explicit' | 'policy' | 'provider';
   reason: string;
 }
 
@@ -157,17 +160,18 @@ export function pickRoundModel(input: {
   /** The operator's full model, for the first-party check; defaults to the resolved one. */
   fullModel?: string;
 }): RoundModelChoice {
-  const { explicit, provider, round, harshness, openBugs, diffLines, lastDiffLines } = input;
-  if (provider && provider !== 'claude') return { model: undefined, reason: `${provider} chooses its own model` };
-  if (explicit) return { model: explicit, reason: '--model' };
-  const late = lateModel('fullModel' in input ? input.fullModel : undefined);
-  if (!late) return { model: undefined, reason: process.env.LGTM_LATE_MODEL === undefined ? 'full model is not a first-party id; set LGTM_LATE_MODEL to opt in' : 'policy off (LGTM_LATE_MODEL=off)' };
-  if (round < LATE_ROUND) return { model: undefined, reason: `round ${round} < ${LATE_ROUND}: full model` };
-  if (harshness !== 'chill') return { model: undefined, reason: `harshness ${harshness}: full model` };
-  if (openBugs > 0) return { model: undefined, reason: `${openBugs} BUG/SECURITY finding(s) still open: full model verifies the fix` };
+  const { explicit, provider, round, harshness, openBugs, diffLines, lastDiffLines, fullModel } = input;
+  const policy = (reason: string, model?: string): RoundModelChoice => ({ model, source: 'policy', reason });
+  if (provider && provider !== 'claude') return { model: undefined, source: 'provider', reason: `${provider} chooses its own model` };
+  if (explicit) return { model: explicit, source: 'explicit', reason: '--model' };
+  const late = lateModel(fullModel);
+  if (!late) return policy(process.env.LGTM_LATE_MODEL === undefined ? 'full model is not a first-party id; set LGTM_LATE_MODEL to opt in' : 'policy off (LGTM_LATE_MODEL=off)');
+  if (round < LATE_ROUND) return policy(`round ${round} < ${LATE_ROUND}: full model`);
+  if (harshness !== 'chill') return policy(`harshness ${harshness}: full model`);
+  if (openBugs > 0) return policy(`${openBugs} BUG/SECURITY finding(s) still open: full model verifies the fix`);
   const delta = lastDiffLines === null ? null : Math.abs(diffLines - lastDiffLines);
-  if (delta !== null && delta > RE_ESCALATE_LINES) return { model: undefined, reason: `diff changed by ${delta} lines (> ${RE_ESCALATE_LINES}): full model` };
-  return { model: late, reason: `late chill round ${round}, delta ${delta ?? 'n/a'} lines: cheaper model` };
+  if (delta !== null && delta > RE_ESCALATE_LINES) return policy(`diff changed by ${delta} lines (> ${RE_ESCALATE_LINES}): full model`);
+  return policy(`late chill round ${round}, delta ${delta ?? 'n/a'} lines: cheaper model`, late);
 }
 const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 // Settings that change WHERE or HOW the CLI authenticates; stripping them can break

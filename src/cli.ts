@@ -301,8 +301,10 @@ interface RunOptions {
   explicitModel?: string;
   /** False when -H was not given, so the round policy may lower it on a late, settled round. */
   harshnessExplicit?: boolean;
-  /** What the round policy needs from the log; absent when the log was unavailable. */
-  /** `loopRound` counts the whole current run (local + PR), which is what the model policy keys on. */
+  /**
+   * What the round policy needs from the log; absent when the log was unavailable.
+   * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
+   */
   policy?: { loopRound: number; openBugs: number; lastDiffLines: number | null };
   charterEnabled: boolean;
   standardsEnabled: boolean;
@@ -787,27 +789,42 @@ async function runReview(options: RunOptions): Promise<void> {
   if (standardsContextStr) contextModes.push('standards');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const review = () => reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr });
+  const review = (enforceSchema = false) => reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema });
   const logFailedRound = (why: string) => recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice, failed: why,
   });
+  // Every attempt that produces no review is logged as a failed round — the spend is
+  // real and it judges nothing. Recovery ladder: (1) the same model again with the reply
+  // schema enforced (an unparsable reply is what the schema fixes); (2) if the policy
+  // had picked the cheaper model, the full model with the schema — a cheaper reviewer
+  // that cannot answer is not a saving.
+  const say = (line: string) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line)));
+  const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
   let result: Awaited<ReturnType<typeof review>>;
   try {
     result = await review();
   } catch (e: any) {
-    // The spend was real even though no review came back: log it as a failed round (it
-    // judges nothing). If the policy had chosen the cheaper model, try once more on the
-    // full one before giving up — a cheaper reviewer that cannot answer is not a saving.
     logFailedRound(e?.message ?? String(e));
-    const policyPicked = ai === 'claude' && choice.model !== undefined && choice.reason !== '--model';
-    if (!policyPicked) throw e;
-    choice = { model: undefined, reason: `fell back to the full model after ${choice.model} produced no usable review (${initialChoice.reason})` };
-    setModelOverride(undefined);
-    const line = `↺  ${choice.reason}`;
-    if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
-    result = await review();
+    if (!isParseFailure(e) || ai !== 'claude') throw e;
+    try {
+      say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
+      result = await review(true);
+    } catch (e2: any) {
+      logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`);
+      const policyPicked = choice.source === 'policy' && choice.model !== undefined;
+      if (!policyPicked) throw e2;
+      choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review twice (${initialChoice.reason})` };
+      setModelOverride(undefined);
+      say(`↺  ${choice.reason}`);
+      try {
+        result = await review(true);
+      } catch (e3: any) {
+        logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`);
+        throw e3;
+      }
+    }
   }
 
   log(chalk.gray(`\n${result.summary}\n`));
