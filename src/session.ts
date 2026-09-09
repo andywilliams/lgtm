@@ -14,6 +14,9 @@ export function modelRoleOf(choice: RoundModelChoice): string {
   return 'full';
 }
 
+/** Pseudo-path under which the reviewer's own system prompt is fingerprinted; a change restarts the session. */
+export const SYSTEM_PROMPT_KEY = '@system-prompt';
+
 export interface SessionPlan {
   /** sha1 of every file's contents as sent this round (changed files and related files). */
   fileShas: Record<string, string>;
@@ -52,7 +55,10 @@ export function planSession(input: {
   const sessionRole = prior?.role ?? null;
   const sameRole = sessionRole === wanted;
   const fullBeatsCheaper = sessionRole === 'full' && wanted.startsWith('late:');
-  if (prior && !fresh && (sameRole || fullBeatsCheaper)) {
+  // The reviewer's own rules changed (lgtm upgraded mid-loop): the session's earlier
+  // instructions would contradict this round's — start over.
+  const rulesChanged = Boolean(prior && SYSTEM_PROMPT_KEY in fileShas && prior.fileShas[SYSTEM_PROMPT_KEY] !== undefined && prior.fileShas[SYSTEM_PROMPT_KEY] !== fileShas[SYSTEM_PROMPT_KEY]);
+  if (prior && !fresh && !rulesChanged && (sameRole || fullBeatsCheaper)) {
     const changedSinceLast: Record<string, string> = {};
     const unchangedFiles: string[] = [];
     for (const [path, content] of Object.entries(contents)) {
@@ -64,7 +70,9 @@ export function planSession(input: {
     return { fileShas, session: { id: prior.id, resume: true, changedSinceLast, unchangedFiles: unchangedFiles.sort() }, choice: kept };
   }
   const note = prior && !fresh
-    ? `⟳  session: not continuing ${prior.id.slice(0, 8)} (it ran as ${sessionRole ?? 'unknown'}, this round needs ${wanted}) — opening a new one`
+    ? (rulesChanged
+        ? `⟳  session: not continuing ${prior.id.slice(0, 8)} (the reviewer's system prompt changed since it opened) — opening a new one`
+        : `⟳  session: not continuing ${prior.id.slice(0, 8)} (it ran as ${sessionRole ?? 'unknown'}, this round needs ${wanted}) — opening a new one`)
     : undefined;
   return { fileShas, session: { id: newId(), resume: false, changedSinceLast: {}, unchangedFiles: [] }, choice, note };
 }

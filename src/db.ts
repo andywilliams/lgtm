@@ -206,9 +206,9 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     }
     const modelRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_id);
     const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
-    // Rows logged before model_role existed: infer 'full' unless the reported id is a known cheaper model.
-    const inferred = modelRow?.model_id ? (/sonnet|haiku/i.test(modelRow.model_id) ? `late:${modelRow.model_id}` : 'full') : null;
-    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? inferred, fileShas };
+    // No role recorded (a row from before the column existed) ⇒ null; planSession then
+    // opens a new session rather than guess from the reported id's family name.
+    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas };
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(

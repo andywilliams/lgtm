@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planSession, modelRoleOf } from './session.js';
+import { planSession, modelRoleOf, SYSTEM_PROMPT_KEY } from './session.js';
 import type { RoundModelChoice } from './ai.js';
 import type { LoopSession } from './db.js';
 
@@ -8,7 +8,6 @@ const full: RoundModelChoice = { model: undefined, source: 'policy', reason: 'ro
 const late: RoundModelChoice = { model: 'claude-sonnet-5', source: 'policy', reason: 'late chill round' };
 const explicitSonnet: RoundModelChoice = { model: 'claude-sonnet-5', source: 'explicit', reason: '--model' };
 const contents = { 'a.ts': 'A', 'b.ts': 'B' };
-const shaA = 'e7a8c7c4b7b4e7f2d3ac4d1ff4de4c4e8ea1d4b1'; // not the real sha; tests compare against planSession's own output
 const prior = (over: Partial<LoopSession> = {}): LoopSession => ({ id: 'sess-1', model: 'claude-fable-5-1', role: 'full', fileShas: {}, ...over });
 
 test('modelRoleOf compares what was asked for, suffix-free', () => {
@@ -19,9 +18,10 @@ test('modelRoleOf compares what was asked for, suffix-free', () => {
 
 test('no session when sessions are off or the provider is codex', () => {
   assert.equal(planSession({ prior: null, contents, ai: 'codex', choice: full }).session, null);
+  const saved = process.env.LGTM_SESSIONS;
   process.env.LGTM_SESSIONS = 'off';
   try { assert.equal(planSession({ prior: null, contents, ai: 'claude', choice: full }).session, null); }
-  finally { delete process.env.LGTM_SESSIONS; }
+  finally { if (saved === undefined) delete process.env.LGTM_SESSIONS; else process.env.LGTM_SESSIONS = saved; }
 });
 
 test('first round opens a session with the full prompt', () => {
@@ -65,4 +65,21 @@ test('--fresh always opens a new session', () => {
   const p = planSession({ prior: prior(), contents, ai: 'claude', choice: full, fresh: true, newId: () => 'new-3' });
   assert.equal(p.session?.resume, false);
   assert.equal(p.note, undefined);
+});
+
+test('an unknown session role is never continued', () => {
+  const p = planSession({ prior: prior({ role: null }), contents, ai: 'claude', choice: full, newId: () => 'new-4' });
+  assert.equal(p.session?.resume, false);
+});
+
+test('a changed reviewer system prompt restarts the session; a changed charter is sent as updated context', () => {
+  const withRules = { ...contents, [SYSTEM_PROMPT_KEY]: 'rules v1', '@charter': 'charter v1' };
+  const first = planSession({ prior: null, contents: withRules, ai: 'claude', choice: full });
+  const seen = prior({ fileShas: first.fileShas });
+  const sameRules = planSession({ prior: seen, contents: { ...withRules, '@charter': 'charter v2' }, ai: 'claude', choice: full });
+  assert.ok(sameRules.session?.resume);
+  assert.deepEqual(Object.keys(sameRules.session!.changedSinceLast), ['@charter']);
+  const newRules = planSession({ prior: seen, contents: { ...withRules, [SYSTEM_PROMPT_KEY]: 'rules v2' }, ai: 'claude', choice: full, newId: () => 'new-5' });
+  assert.equal(newRules.session?.resume, false);
+  assert.match(newRules.note ?? '', /system prompt changed/);
 });

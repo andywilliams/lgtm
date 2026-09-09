@@ -4,10 +4,11 @@ import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, relative } from 'node:path';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment, getCurrentRepoSlug } from './github.js';
 import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase, getCurrentBranch } from './git.js';
-import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT, type AIProvider } from './review.js';
+import { SYSTEM_PROMPT_KEY } from './session.js';
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
 import { runStandardsInit } from './standardsInterview.js';
@@ -565,6 +566,11 @@ function recordReviewMetrics(opts: {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
   const usage = takeUsage();
+  // A failure before any model call (a session the CLI could not find) spent nothing:
+  // there is no round to record and no budget slot to charge.
+  if (failed && (usage.calls === 0 || (usage.measured && promptTokens(usage) === 0 && usage.costUsd === 0))) {
+    return { tokenEstimate, usage, loop: null };
+  }
   let loop: LoopState | null = null;
   try {
     // Rows logged before the slug became the key used the path; `rounds` reads both.
@@ -791,8 +797,19 @@ async function runReview(options: RunOptions): Promise<void> {
   });
   // The loop's session, if it can be continued (see planSession); the file set covers the
   // related files too, so a newly discovered import is sent to a resumed session.
+  // Related files come back with absolute paths; key them like the changed files (repo-relative)
+  // or the same file is hashed twice and "changed" forever.
+  const repoRootForKeys = getRepoRoot();
+  const relKey = (p: string) => (p.startsWith('/') ? relative(repoRootForKeys, p) : p);
   const contentsSeen: Record<string, string> = { ...(fileContents ?? {}) };
-  for (const f of expanded) if (!(f.path in contentsSeen)) contentsSeen[f.path] = f.content;
+  for (const f of expanded) { const k = relKey(f.path); if (!(k in contentsSeen)) contentsSeen[k] = f.content; }
+  // The stable prefix is fingerprinted like a file, under pseudo-paths: a charter edited
+  // mid-loop reaches the resumed session as "updated context"; a changed system prompt
+  // (lgtm upgraded) restarts the session, since the reviewer's rules themselves moved.
+  contentsSeen[SYSTEM_PROMPT_KEY] = REVIEW_SYSTEM_PROMPT;
+  if (charterContextStr) contentsSeen['@charter'] = charterContextStr;
+  if (standardsContextStr) contentsSeen['@standards'] = standardsContextStr;
+  if (handbookContextStr) contentsSeen['@handbook'] = handbookContextStr;
   const plan = planSession({ prior: policy?.session ?? null, contents: contentsSeen, ai, fresh, choice: initialChoice });
   const { fileShas } = plan;
   const sessionPlan = plan.session;
@@ -829,7 +846,9 @@ async function runReview(options: RunOptions): Promise<void> {
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(attempted),
   });
   let result: Awaited<ReturnType<typeof review>>;
-  ({ result, choice } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
+  let freshened: boolean | undefined;
+  ({ result, choice, freshened } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
+  if (freshened) choice = { ...choice, reason: `fresh session after the loop's could not be continued (${choice.reason})` };
 
   log(chalk.gray(`\n${result.summary}\n`));
 

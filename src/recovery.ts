@@ -32,7 +32,7 @@ export async function reviewWithRecovery(opts: {
   } catch (e: any) {
     logFailedRound(e?.message ?? String(e), choice);
     lastError = e;
-    if (ai !== 'claude') throw e;
+    if (ai !== 'claude' || /^LGTM_NO_CALL/.test(e?.message ?? '')) throw e; // the debugging sentinel is never recovered
     // A resumed session can be gone (transcript deleted, another machine, CLI upgrade):
     // one fresh full round on the same model before any other rung.
     if (resuming && !isParseFailure(e)) {

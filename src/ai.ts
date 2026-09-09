@@ -440,6 +440,11 @@ function runCodex(prompt: string, label: string): string {
  * Usage for the call (when the provider reports it) lands in the ledger — see takeUsage.
  */
 export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', opts: RunOptions = {}): string {
+  // Debugging aids: LGTM_DUMP_PROMPT=<file> writes the exact prompt; LGTM_NO_CALL=1 then
+  // stops before any model call (the round is not logged — nothing was spent).
+  const dump = process.env.LGTM_DUMP_PROMPT;
+  if (dump) writeFileSync(dump, prompt);
+  if (process.env.LGTM_NO_CALL === '1') throw new Error(`LGTM_NO_CALL: prompt ${dump ? `written to ${dump}` : 'not sent'} (${prompt.length} chars)`);
   try {
     return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {

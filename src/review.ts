@@ -66,7 +66,7 @@ export const REVIEW_SCHEMA = {
   required: ['summary', 'comments'],
 } as const;
 
-const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
+export const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
 
 IMPORTANT RULES:
 - Only comment on lines that are ADDED (start with + in the diff)
@@ -113,7 +113,12 @@ export interface ReviewPromptInput {
  * re-run read 223k tokens from cache and cost a tenth. (DWLF-215)
  */
 export function buildReviewPrompt(input: ReviewPromptInput): string {
-  const { diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, extra } = input;
+  return buildStablePrefix(input) + buildVolatileTail(input);
+}
+
+/** The part of the prompt that is the same within a loop (see buildReviewPrompt). */
+export function buildStablePrefix(input: ReviewPromptInput): string {
+  const { fileContents, usageContext, expandedContext, handbookContext, extra } = input;
 
   // ---- stable within a loop, most stable first -------------------------------------
   const handbookContextSection = handbookContext || '';
@@ -147,6 +152,19 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
   }
 
   const usageContextSection = usageContext || '';
+
+  return `${SYSTEM_PROMPT}
+${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}`;
+}
+
+/**
+ * The part of the prompt that changes every round: title, diff, harshness, scope,
+ * dismissals and the output contract. Built directly — never sliced out of the full
+ * prompt by a marker, because a reviewed file can contain any marker (this repo's own
+ * review.ts does), and a slice would then carry half the stable prefix along.
+ */
+export function buildVolatileTail(input: ReviewPromptInput): string {
+  const { diff, prTitle, prBody, harshness, extra } = input;
 
   // ---- changes every round -----------------------------------------------------------
   // Retro mode: the "diff" is an entire EXISTING file presented as additions. Without
@@ -188,10 +206,7 @@ ${items}
 `;
   }
 
-  const stable = `${SYSTEM_PROMPT}
-${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}`;
-
-  const volatile = `
+  return `
 ## PR Title
 ${prTitle}
 
@@ -220,12 +235,7 @@ Respond with this exact JSON structure:
 
 If no issues found, respond with:
 {"summary": "LGTM — no issues found", "comments": []}`;
-
-  return stable + volatile;
 }
-
-/** Marker the tests use to check the stable/volatile boundary. */
-export const VOLATILE_MARKER = '\n## PR Title\n';
 
 /**
  * The prompt for a round that CONTINUES the loop's session. The session already holds
@@ -235,22 +245,27 @@ export const VOLATILE_MARKER = '\n## PR Title\n';
  * is told this is a later round of the same change, so it judges the code as it is now.
  */
 export function buildResumePrompt(input: ReviewPromptInput & { round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] }): string {
-  const { diff, prTitle, harshness, extra, round, changedSinceLast, unchangedFiles, usageContext } = input;
-  const volatileStart = buildReviewPrompt(input).indexOf(VOLATILE_MARKER);
-  const volatile = buildReviewPrompt(input).slice(volatileStart); // title, diff, harshness, scope, decided, output format
-  const changed = Object.entries(changedSinceLast).sort(([a], [b]) => a.localeCompare(b));
+  const { prTitle, harshness, round, changedSinceLast, unchangedFiles, usageContext } = input;
+  const volatile = buildVolatileTail(input); // title, diff, harshness, scope, decided, output format
+  const entries = Object.entries(changedSinceLast).sort(([a], [b]) => a.localeCompare(b));
+  const context = entries.filter(([p]) => p.startsWith('@'));
+  const changed = entries.filter(([p]) => !p.startsWith('@'));
+  const contextSection = context.length > 0
+    ? `## Repo context updated since the last round (replaces what you were given earlier)\n\n` + context.map(([, block]) => block).join('\n') + '\n'
+    : '';
   const changedSection = changed.length > 0
     ? `## Files changed since the last round — CURRENT contents (these replace the versions you saw earlier)\n\n` +
       changed.map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``).join('\n\n') + '\n'
     : '## Files changed since the last round\n\n(none — the contents you have already seen are current)\n';
-  const unchanged = unchangedFiles.length > 0 ? `Unchanged since the last round (contents already in context): ${unchangedFiles.join(', ')}\n` : '';
+  const unchanged = unchangedFiles.filter((p) => !p.startsWith('@')).length > 0
+    ? `Unchanged since the last round (contents already in context): ${unchangedFiles.filter((p) => !p.startsWith('@')).join(', ')}\n` : '';
   // Symbol usages are recomputed from the current diff and are small: always current.
   const usage = usageContext ? `\n${usageContext}\n` : '';
   return `# Review round ${round} of "${prTitle}" — the code has moved on since your last review
 
 This is a later round of the SAME change. Everything you were given before (repo charter, standards, related files, file contents) still applies unless replaced below. Judge the code AS IT IS NOW: a finding from an earlier round that the current code no longer exhibits must not be repeated; a finding that still applies should be raised again. Harshness for this round: ${harshness}.
 
-${changedSection}${unchanged}${usage}${volatile}`;
+${contextSection}${changedSection}${unchanged}${usage}${volatile}`;
 }
 
 /**
