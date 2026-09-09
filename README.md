@@ -189,6 +189,8 @@ Use `--ai <provider>` to force a specific backend, or let LGTM auto-detect.
 
 Every model call runs `claude --print` as a **stripped session**: no MCP servers, no settings or `CLAUDE.md` from the working directory, no saved transcript, JSON output. That removes roughly 10k tokens of chat-environment boilerplate from every review and returns the billed usage, which lgtm records per review (`~/.lgtm/reviews.db`: `prompt_tokens`, `output_tokens`, `cost_usd`, `model_id`) and prints in agent mode under `context.usage`. `lgtm report` sums it per month.
 
+`cost_usd` is the CLI's `total_cost_usd`: what the call would cost at API list price. On a subscription plan it is a comparison metric (and a proxy for the plan's usage limits), not a bill.
+
 Because settings are not loaded, lgtm pins the model and effort itself:
 
 | variable | default | purpose |

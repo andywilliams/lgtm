@@ -368,7 +368,7 @@ function applyLoopMemory(opts: {
   // The budget counts the whole loop — the branch's local rounds and the PR's — since
   // its last 7-day gap; a PR round is not a fresh start after eight local ones.
   if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
-    const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
+    const advice = stopAdvice(summary.budgetUsed, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
     exitWithError(
       `This would be round ${summary.budgetUsed + 1} of the loop behind ${roundKey} (${summary.budgetUsed} used of the ${ROUND_BUDGET}-round budget; ${advice.reason}). ` +
         `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
@@ -389,7 +389,7 @@ async function reviewWithRecovery(opts: {
   ai: AIProvider;
   choice: RoundModelChoice;
   initialChoice: RoundModelChoice;
-  logFailedRound: (why: string) => void;
+  logFailedRound: (why: string, attempted: RoundModelChoice) => void;
   say: (line: string) => void;
 }): Promise<{ result: ReviewResult; choice: RoundModelChoice }> {
   const { review, ai, initialChoice, logFailedRound, say } = opts;
@@ -398,14 +398,14 @@ async function reviewWithRecovery(opts: {
   try {
     return { result: await review(), choice };
   } catch (e: any) {
-    logFailedRound(e?.message ?? String(e));
+    logFailedRound(e?.message ?? String(e), choice);
     if (!isParseFailure(e) || ai !== 'claude') throw e;
   }
   try {
     say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
     return { result: await review(true), choice };
   } catch (e2: any) {
-    logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`);
+    logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
     if (!(choice.source === 'policy' && choice.model !== undefined)) throw e2;
   }
   choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review twice (${initialChoice.reason})` };
@@ -414,7 +414,7 @@ async function reviewWithRecovery(opts: {
   try {
     return { result: await review(true), choice };
   } catch (e3: any) {
-    logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`);
+    logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
     throw e3;
   }
 }
@@ -832,10 +832,12 @@ async function runReview(options: RunOptions): Promise<void> {
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
   const review = (enforceSchema = false) => reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema });
-  const logFailedRound = (why: string) => recordReviewMetrics({
+  // The failed attempt's model choice is passed in, not closed over: the recovery ladder
+  // changes the choice between attempts and the row must name the model that actually failed.
+  const logFailedRound = (why: string, attempted: RoundModelChoice) => recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
-    branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice, failed: why,
+    branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: attempted, failed: why,
   });
   let result: Awaited<ReturnType<typeof review>>;
   ({ result, choice } = await reviewWithRecovery({ review, ai, choice, initialChoice, logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
@@ -1556,7 +1558,7 @@ program
     if (stats.measured > 0) {
       console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
       console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);
-      console.log(`Cost (logged reviews):  $${stats.costUsd.toFixed(2)}`);
+      console.log(`API-equiv. cost:        $${stats.costUsd.toFixed(2)}  (logged reviews; the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
     }
     console.log('');
   });
@@ -1643,7 +1645,7 @@ program
     const own = summary.rounds.filter((r) => r.key === key);
     const last = own.length > 0 ? own[own.length - 1].round : 0;
     console.log('');
-    console.log(`Measured cost so far: $${summary.totalCostUsd.toFixed(2)}`);
+    console.log(`API-equivalent cost so far: $${summary.totalCostUsd.toFixed(2)}  (the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
     if (last > 0) {
       const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
       console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);
