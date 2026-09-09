@@ -20,7 +20,7 @@ import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } fr
 import { expandContext } from './contextExpander.js';
 import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice } from './db.js';
 import { createHash } from 'node:crypto';
-import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, type AIUsage, type RoundModelChoice } from './ai.js';
+import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
@@ -129,9 +129,11 @@ program
   .option('--no-charter', 'Skip the ARCHITECTURE.md charter conformance context (on by default when the repo has one)')
   .option('--no-standards', 'Skip the STANDARDS.md engineering-standards check (on by default when the repo has one)')
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
-  .action(async (prNumberStr: string | undefined, options) => {
+  .action(async (prNumberStr: string | undefined, options, command) => {
     const agent = options.agent;
     const local = options.local;
+    // Whether -H was given: a late round of a settled loop drops to chill by itself otherwise.
+    const harshnessExplicit = command.getOptionValueSource('harshness') !== 'default';
     // Agent mode is built on top of auto mode: same suppressed-output + JSON-to-stdout
     // machinery, but read-only and with a richer findings-focused payload.
     const auto = options.auto || agent;
@@ -247,6 +249,7 @@ program
         overrideReason,
         pr: memory.pr,
         explicitModel: options.model,
+        harshnessExplicit,
         policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
@@ -296,6 +299,8 @@ interface RunOptions {
   pr?: PRDetails;
   /** `--model`, verbatim. */
   explicitModel?: string;
+  /** False when -H was not given, so the round policy may lower it on a late, settled round. */
+  harshnessExplicit?: boolean;
   /** What the round policy needs from the log; absent when the log was unavailable. */
   /** `loopRound` counts the whole current run (local + PR), which is what the model policy keys on. */
   policy?: { loopRound: number; openBugs: number; lastDiffLines: number | null };
@@ -538,8 +543,10 @@ function recordReviewMetrics(opts: {
   overrideReason?: string;
   diffLines?: number;
   modelChoice?: RoundModelChoice;
+  /** Set when the round produced no review — the error text. The row is logged; nothing is judged. */
+  failed?: string;
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
@@ -572,8 +579,11 @@ function recordReviewMetrics(opts: {
       overrideReason,
       recovered,
       diffLines,
+      modelReason: modelChoice && ai === 'claude' ? modelChoice.reason : undefined,
+      failed: Boolean(failed),
     });
     const round = allocated ?? 1;
+    if (failed) return { tokenEstimate, usage, loop: null };
     const findingIds = logFindings(reviewId, repoName, roundKey, round, comments);
     // The log decides whether this round can judge earlier ones (round 1, salvaged
     // output, unchanged code) — null means it could not.
@@ -599,7 +609,15 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, policy, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, policy, charterEnabled, standardsEnabled } = options;
+  let harshness = options.harshness;
+  // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
+  // asking "is it safe now?", which is chill's question — unless -H said otherwise.
+  if (!harshnessExplicit && policy && policy.loopRound >= LATE_ROUND && policy.openBugs === 0 && harshness !== 'chill') {
+    harshness = 'chill';
+    const line = `↓  harshness: chill — round ${policy.loopRound} of the loop with no BUG/SECURITY open (pass -H to override)`;
+    if (auto) console.error(chalk.gray(line)); else console.log(chalk.gray(line));
+  }
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -743,7 +761,7 @@ async function runReview(options: RunOptions): Promise<void> {
   const diffLines = countDiffLines(diff);
   // The policy's round is the LOOP's round (local + PR rounds in the current run), not
   // the key's ordinal — a PR opened after five local rounds is on round six.
-  const choice: RoundModelChoice = pickRoundModel({
+  const initialChoice: RoundModelChoice = pickRoundModel({
     explicit: explicitModel,
     provider: ai,
     round: policy?.loopRound ?? 1,
@@ -752,6 +770,7 @@ async function runReview(options: RunOptions): Promise<void> {
     diffLines,
     lastDiffLines: policy?.lastDiffLines ?? null,
   });
+  let choice: RoundModelChoice = initialChoice;
   if (ai === 'claude') setModelOverride(choice.model);
   // Said even for codex, so `--model` with codex is visibly not applied rather than silently ignored.
   const modelLine = `🎛  model: ${choice.model ?? (ai === 'claude' ? 'default (full)' : ai)} — ${choice.reason}`;
@@ -768,7 +787,28 @@ async function runReview(options: RunOptions): Promise<void> {
   if (standardsContextStr) contextModes.push('standards');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr });
+  const review = () => reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr });
+  const logFailedRound = (why: string) => recordReviewMetrics({
+    repo, prNumber, diff, expanded, relatedFiles, ai, local,
+    filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
+    branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice, failed: why,
+  });
+  let result: Awaited<ReturnType<typeof review>>;
+  try {
+    result = await review();
+  } catch (e: any) {
+    // The spend was real even though no review came back: log it as a failed round (it
+    // judges nothing). If the policy had chosen the cheaper model, try once more on the
+    // full one before giving up — a cheaper reviewer that cannot answer is not a saving.
+    logFailedRound(e?.message ?? String(e));
+    const policyPicked = ai === 'claude' && choice.model !== undefined && choice.reason !== '--model';
+    if (!policyPicked) throw e;
+    choice = { model: undefined, reason: `fell back to the full model after ${choice.model} produced no usable review (${initialChoice.reason})` };
+    setModelOverride(undefined);
+    const line = `↺  ${choice.reason}`;
+    if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
+    result = await review();
+  }
 
   log(chalk.gray(`\n${result.summary}\n`));
 
@@ -1563,10 +1603,11 @@ program
       const s = r.bySeverity;
       const cost = r.costUsd === null ? '      —' : `$${r.costUsd.toFixed(2)}`.padStart(7);
       const loopCol = mixed ? `${(r.key.startsWith('pr:') ? 'pr' : 'local').padEnd(6)} ` : '';
+      const modelCol = `${r.model ?? '—'}${r.failed ? '  (failed — no review)' : ''}`;
       console.log(
         `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
           `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
-          `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${r.model ?? '—'}`
+          `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${modelCol}`
       );
     }
     const own = summary.rounds.filter((r) => r.key === key);
@@ -1907,7 +1948,6 @@ arch
     }
     if (options.model) {
       try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
-      if (options.ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
     }
 
     const local = options.local;
@@ -1927,6 +1967,7 @@ arch
       }
     }
     const ai = resolveProvider(options.ai, exitWithError);
+    if (options.model && ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
 
     try {
       await runArchReview({
@@ -2038,13 +2079,13 @@ standards
     }
     if (options.model) {
       try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
-      if (options.ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
     }
     // parseInt('5abc') is 5 — reject malformed input rather than guessing intent.
     if (!/^\d+$/.test(String(options.maxFiles).trim())) exitWithError('--max-files must be a positive integer');
     const maxFiles = parseInt(options.maxFiles, 10);
     if (maxFiles < 1) exitWithError('--max-files must be a positive integer');
     const ai = resolveProvider(options.ai, exitWithError);
+    if (options.model && ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
     try {
       await runStandardsReview({ target, ai, agent, skipLintGate: options.skipLintGate, noLint: options.lint === false, maxFiles });
     } catch (error: any) {

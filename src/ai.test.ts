@@ -213,3 +213,31 @@ test('pickRoundModel: cheaper model only on a late, chill, settled round with no
     if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
   }
 });
+
+test('parsePrintEnvelope prefers the schema-validated structured_output over the text', () => {
+  const { text, usage } = parsePrintEnvelope(envelope({ result: 'some prose the model wrote', structured_output: { summary: 'ok', comments: [] } }));
+  assert.equal(text, '{"summary":"ok","comments":[]}');
+  assert.ok(usage?.measured);
+});
+
+test('claudePrintArgs passes a schema through as --json-schema', () => {
+  const args = claudePrintArgs('claude-sonnet-5', 'high', '', { type: 'object' });
+  assert.equal(args[args.indexOf('--json-schema') + 1], '{"type":"object"}');
+  assert.ok(!claudePrintArgs('claude-sonnet-5', 'high', '').includes('--json-schema'));
+});
+
+test('pickRoundModel only assumes the first-party late model when the full model is first-party', () => {
+  const saved = process.env.LGTM_LATE_MODEL;
+  try {
+    delete process.env.LGTM_LATE_MODEL;
+    const base = { round: 5, harshness: 'chill', openBugs: 0, diffLines: 100, lastDiffLines: 100 };
+    assert.equal(pickRoundModel({ ...base, fullModel: 'claude-fable-5-1[1m]' }).model, DEFAULT_LATE_MODEL);
+    const bedrock = pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' });
+    assert.equal(bedrock.model, undefined);
+    assert.match(bedrock.reason, /not a first-party id/);
+    process.env.LGTM_LATE_MODEL = 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-sonnet-5';
+    assert.match(pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' }).model ?? '', /sonnet/, 'an explicit late model is honoured on any provider');
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
+  }
+});

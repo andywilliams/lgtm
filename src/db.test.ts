@@ -184,10 +184,24 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   // Round 8 salvaged: neither.
   logReview({ ...base, reviewedAt: '2026-09-09T13:10:00.000Z', harshness: 'medium', diffSha: 'ccc', recovered: true });
   assert.equal(getLoopSummary(repo, key).cleanRounds, 1);
-  // Round 9, new diff, nothing found: now two — and empty, so there is nothing left to verify.
+  // A failed round (no review came back) is logged for its cost but is not a judging round.
+  logReview({ ...base, reviewedAt: '2026-09-09T13:15:00.000Z', harshness: 'chill', diffSha: 'ccc2', failed: true, modelReason: 'late chill round: cheaper model' });
+  const withFailed = getLoopSummary(repo, key);
+  assert.equal(withFailed.cleanRounds, 1, 'a failed round neither counts nor resets');
+  assert.equal(withFailed.rounds[withFailed.rounds.length - 1].failed, true);
+
+  // The retry after a failed round carries the SAME sha as the failed row; it must still
+  // count as a judging round (compared with the last round that reviewed, 'bbb').
+  const retry = logReview({ ...base, reviewedAt: '2026-09-09T13:16:00.000Z', harshness: 'chill', diffSha: 'ccc2' });
+  assert.equal(retry.round, 10);
+  assert.equal(getLoopSummary(repo, key).cleanRounds, 2, 'the retry is a real clean round, not a re-run of the failed row');
+  assert.deepEqual(disposePreviousRound(repo, key, 10, [], { harshness: 'chill', diffSha: 'ccc2' }), { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 },
+    'nothing open to dispose, but the call must not be short-circuited as an unchanged diff');
+
+  // Round 11, new diff, nothing found: three clean — and empty, so there is nothing left to verify.
   logReview({ ...base, reviewedAt: '2026-09-09T13:20:00.000Z', harshness: 'medium', diffSha: 'ddd' });
-  assert.equal(getLoopSummary(repo, key).cleanRounds, 2);
-  assert.equal(getLoopSummary(repo, key).budgetUsed, 9);
+  assert.equal(getLoopSummary(repo, key).cleanRounds, 3);
+  assert.equal(getLoopSummary(repo, key).budgetUsed, 11, 'the failed round still spent a slot of the budget');
   assert.equal(getLoopSummary(repo, key).lastRoundEmpty, true);
   assert.equal(after6.lastRoundEmpty, true, 'round 6 raised nothing on a new diff');
 
@@ -196,7 +210,7 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   const later = getLoopSummary(repo, key);
   assert.equal(later.budgetUsed, 1, 'a 7-day gap starts the loop over');
   assert.equal(later.cleanRounds, 1);
-  assert.equal(later.rounds.length, 10, 'history is still all there');
+  assert.equal(later.rounds.length, 12, 'history is still all there');
 
   const db = new Database(dbPath, { readonly: true });
   const dismissed = db.prepare("SELECT dismissed_reason, disposed_at_round FROM findings WHERE title LIKE '%unused import%'").get() as any;

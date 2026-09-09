@@ -42,6 +42,8 @@ export interface ReviewLog {
   overrideReason?: string;
   recovered?: boolean;
   diffLines?: number;
+  modelReason?: string;
+  failed?: boolean;
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -75,6 +77,11 @@ const REVIEW_COLUMNS: [string, string][] = [
   // Size of the reviewed diff (added + removed lines): the round policy re-escalates
   // to the full model when it jumps.
   ['diff_lines', 'INTEGER'],
+  // Why the round ran on the model it did (policy reason, or "--model").
+  ['model_reason', 'TEXT'],
+  // 1 when the round produced no review (the model call or its parse failed) — the
+  // spend is real, the round judges nothing.
+  ['failed', 'INTEGER'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -226,13 +233,14 @@ interface RunRow {
   scope: string | null;
   diff_lines: number | null;
   model_id: string | null;
+  failed: number | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -272,9 +280,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -307,7 +315,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.scope ?? null,
     data.overrideReason ?? null,
     data.recovered ? 1 : 0,
-    data.diffLines ?? null
+    data.diffLines ?? null,
+    data.modelReason ?? null,
+    data.failed ? 1 : 0
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -424,8 +434,10 @@ export function disposePreviousRound(
   const db = initDb();
   // Same diff as the round before ⇒ nothing was fixed; only re-raised findings are
   // informative (carried). Absent ones stay open — a re-run is not a fix.
+  // The predecessor is the last round that actually reviewed — a failed row carries
+  // the same sha as the retry that follows it and would make that retry look like a re-run.
   const last = db.prepare(
-    'SELECT diff_sha FROM reviews WHERE repo = ? AND round_key = ? AND round < ? ORDER BY round DESC LIMIT 1'
+    'SELECT diff_sha FROM reviews WHERE repo = ? AND round_key = ? AND round < ? AND (failed IS NULL OR failed = 0) ORDER BY round DESC LIMIT 1'
   ).get(repo, roundKey, round) as { diff_sha: string | null } | undefined;
   const unchanged = Boolean(diffSha && last?.diff_sha && last.diff_sha === diffSha);
   const summary: DispositionSummary = { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 };
@@ -479,6 +491,7 @@ export interface RoundRow {
   costUsd: number | null;
   promptTokens: number | null;
   model: string | null;
+  failed: boolean;
   bySeverity: Record<Severity, number>;
   findings: number;
   fixed: number;
@@ -543,6 +556,7 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     costUsd: r.cost_usd,
     promptTokens: r.prompt_tokens,
     model: r.model_id,
+    failed: Boolean(r.failed),
     bySeverity: { BUG: 0, SECURITY: 0, SUGGESTION: 0, NITPICK: 0 },
     findings: 0,
     fixed: 0,
@@ -571,8 +585,12 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   ).length;
   const judging = (i: number) => {
     const r = run[i];
-    const prevSha = i > 0 ? run[i - 1].diff_sha : null;
-    return !r.recovered && !(r.diff_sha && prevSha && r.diff_sha === prevSha);
+    if (r.failed || r.recovered) return false;
+    // Compare against the last round that reviewed, skipping failed rows (same sha, no verdict).
+    let p = i - 1;
+    while (p >= 0 && run[p].failed) p--;
+    const prevSha = p >= 0 ? run[p].diff_sha : null;
+    return !(r.diff_sha && prevSha && r.diff_sha === prevSha);
   };
   let cleanRounds = 0;
   for (let i = run.length - 1; i >= 0; i--) {

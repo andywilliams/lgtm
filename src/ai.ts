@@ -111,8 +111,15 @@ export function setModelOverride(model: string | undefined): void {
 
 /** The model late chill rounds run on; `off` disables the policy. Default is the current Sonnet. */
 export const DEFAULT_LATE_MODEL = 'claude-sonnet-5';
-export function lateModel(): string | undefined {
-  const v = (process.env.LGTM_LATE_MODEL ?? DEFAULT_LATE_MODEL).trim();
+/**
+ * The default late model is a first-party Anthropic id, so it is only assumed when the
+ * full model is one too (`claude-…`); an operator pinned to a Bedrock ARN or Vertex id
+ * gets the policy only by naming a late model of their own in LGTM_LATE_MODEL.
+ */
+export function lateModel(fullModel: string | undefined = resolveModel()): string | undefined {
+  const explicit = process.env.LGTM_LATE_MODEL;
+  if (explicit === undefined && fullModel !== undefined && !/^claude-/.test(fullModel)) return undefined;
+  const v = (explicit ?? DEFAULT_LATE_MODEL).trim();
   if (!v || v.toLowerCase() === 'off') return undefined;
   if (!MODEL_ID.test(v)) {
     process.stderr.write(`lgtm: ignoring LGTM_LATE_MODEL=${JSON.stringify(v)} (not a model id)\n`);
@@ -147,12 +154,14 @@ export function pickRoundModel(input: {
   openBugs: number;
   diffLines: number;
   lastDiffLines: number | null;
+  /** The operator's full model, for the first-party check; defaults to the resolved one. */
+  fullModel?: string;
 }): RoundModelChoice {
   const { explicit, provider, round, harshness, openBugs, diffLines, lastDiffLines } = input;
   if (provider && provider !== 'claude') return { model: undefined, reason: `${provider} chooses its own model` };
   if (explicit) return { model: explicit, reason: '--model' };
-  const late = lateModel();
-  if (!late) return { model: undefined, reason: 'policy off (LGTM_LATE_MODEL=off)' };
+  const late = lateModel('fullModel' in input ? input.fullModel : undefined);
+  if (!late) return { model: undefined, reason: process.env.LGTM_LATE_MODEL === undefined ? 'full model is not a first-party id; set LGTM_LATE_MODEL to opt in' : 'policy off (LGTM_LATE_MODEL=off)' };
   if (round < LATE_ROUND) return { model: undefined, reason: `round ${round} < ${LATE_ROUND}: full model` };
   if (harshness !== 'chill') return { model: undefined, reason: `harshness ${harshness}: full model` };
   if (openBugs > 0) return { model: undefined, reason: `${openBugs} BUG/SECURITY finding(s) still open: full model verifies the fix` };
@@ -270,7 +279,10 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
   if (!d || typeof d !== 'object' || Array.isArray(d) || !('result' in d || 'is_error' in d || 'usage' in d)) {
     return { text: raw, usage: null };
   }
-  const text = typeof d.result === 'string' ? d.result : '';
+  // With --json-schema the CLI validates the output and returns it parsed in
+  // `structured_output`; hand callers its canonical JSON so the text path is unchanged.
+  const structured = d.structured_output && typeof d.structured_output === 'object' ? JSON.stringify(d.structured_output) : null;
+  const text = structured ?? (typeof d.result === 'string' ? d.result : '');
   const failed = d.is_error === true || (d.terminal_reason && d.terminal_reason !== 'completed');
   // On failure the result is normally a human message — "Not logged in", or
   // "API Error: 529 {...}" with the server's JSON body inline — so surface it. Only a
@@ -324,7 +336,7 @@ export function getAvailableProviders(): AIProvider[] {
 }
 
 /** The argv for a stripped, measured `claude --print` call (execFile form — no shell). */
-export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources()): string[] {
+export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources(), schema?: object): string[] {
   const args = [
     '--print',
     '--output-format', 'json',
@@ -334,12 +346,20 @@ export function claudePrintArgs(model: string | undefined, effort: string | unde
   ];
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
+  // A schema makes the CLI enforce the output shape — no more prose where JSON was asked
+  // for, and no truncated object to repair.
+  if (schema) args.push('--json-schema', JSON.stringify(schema));
   return args;
+}
+
+export interface RunOptions {
+  /** JSON Schema the reply must satisfy (claude only; codex has no equivalent). */
+  schema?: object;
 }
 
 let announcedModel = false;
 
-function runClaude(prompt: string): string {
+function runClaude(prompt: string, opts: RunOptions): string {
   const settings = userSettings();
   const model = resolveModel(settings);
   const effort = resolveEffort(model, settings);
@@ -348,7 +368,7 @@ function runClaude(prompt: string): string {
     announcedModel = true;
     process.stderr.write('lgtm: no model configured (LGTM_MODEL or ~/.claude/settings.json) — the claude CLI will pick its default.\n');
   }
-  const args = claudePrintArgs(model, effort);
+  const args = claudePrintArgs(model, effort, settingSources(), opts.schema);
   try {
     const raw = execFileSync('claude', args, {
       input: prompt,
@@ -400,9 +420,9 @@ function runCodex(prompt: string, label: string): string {
  * `label` only names codex's temp file, to keep concurrent invocations distinct.
  * Usage for the call (when the provider reports it) lands in the ledger — see takeUsage.
  */
-export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt'): string {
+export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', opts: RunOptions = {}): string {
   try {
-    return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt);
+    return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {
     // Only claim "CLI not found" when the binary genuinely isn't runnable NOW —
     // message-sniffing ('not found' / ENOENT) misdiagnoses unrelated failures

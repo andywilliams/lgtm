@@ -42,6 +42,30 @@ Focus on things that are likely to cause problems.`,
 Be thorough but constructive. Every comment should be actionable.`,
 };
 
+/** The shape every review reply must have — enforced by the CLI via --json-schema. */
+export const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    comments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          file: { type: 'string' },
+          line: { type: 'integer' },
+          severity: { type: 'string', enum: ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'] },
+          title: { type: 'string' },
+          body: { type: 'string' },
+          suggestion: { type: 'string' },
+        },
+        required: ['file', 'line', 'severity', 'title', 'body'],
+      },
+    },
+  },
+  required: ['summary', 'comments'],
+} as const;
+
 const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
 
 IMPORTANT RULES:
@@ -190,7 +214,7 @@ If no issues found, respond with:
 
   const fullPrompt = `${SYSTEM_PROMPT}\n\n${userPrompt}`;
 
-  const output = runAIPrompt(fullPrompt, ai, 'review');
+  const output = runAIPrompt(fullPrompt, ai, 'review', { schema: REVIEW_SCHEMA });
   return parseAIResponse(output);
 }
 
