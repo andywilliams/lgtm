@@ -95,6 +95,71 @@ export function takeUsage(): AIUsage {
 
 // Anthropic ids, the [1m] suffix, Vertex `@date` ids and Bedrock ARNs (`/`, `:`).
 const MODEL_ID = /^[\w.:@\/\-\[\]]+$/;
+
+// A per-process model override — set from `--model` or the round policy — outranks
+// LGTM_MODEL and the operator's settings for every call that follows.
+let modelOverride: string | undefined;
+
+export function isModelId(s: string): boolean {
+  return MODEL_ID.test(s);
+}
+
+export function setModelOverride(model: string | undefined): void {
+  if (model !== undefined && !MODEL_ID.test(model)) throw new Error(`not a model id: ${JSON.stringify(model)}`);
+  modelOverride = model;
+}
+
+/** The model late chill rounds run on; `off` disables the policy. Default is the current Sonnet. */
+export const DEFAULT_LATE_MODEL = 'claude-sonnet-5';
+export function lateModel(): string | undefined {
+  const v = (process.env.LGTM_LATE_MODEL ?? DEFAULT_LATE_MODEL).trim();
+  if (!v || v.toLowerCase() === 'off') return undefined;
+  if (!MODEL_ID.test(v)) {
+    process.stderr.write(`lgtm: ignoring LGTM_LATE_MODEL=${JSON.stringify(v)} (not a model id)\n`);
+    return DEFAULT_LATE_MODEL;
+  }
+  return v;
+}
+
+/** A change to the reviewed diff bigger than this (added+removed lines vs the last round) re-escalates to the full model. */
+export const RE_ESCALATE_LINES = 50;
+/** Rounds before which the policy never picks the cheaper model. */
+export const LATE_ROUND = 4;
+
+export interface RoundModelChoice {
+  /** undefined ⇒ the full model (operator default) */
+  model: string | undefined;
+  reason: string;
+}
+
+/**
+ * Which model a review round runs on. The full model reviews every first look; the
+ * cheaper model is allowed only on a late (≥ LATE_ROUND) chill round whose code did
+ * not just change substantially and which does not follow a round that found a
+ * BUG/SECURITY — "is it safe now?" of a small, settled delta is the cheap question.
+ */
+export function pickRoundModel(input: {
+  explicit?: string;
+  provider?: AIProvider;
+  round: number;
+  harshness: string;
+  /** BUG/SECURITY findings from earlier rounds not yet disposed — a fix still awaiting verification. */
+  openBugs: number;
+  diffLines: number;
+  lastDiffLines: number | null;
+}): RoundModelChoice {
+  const { explicit, provider, round, harshness, openBugs, diffLines, lastDiffLines } = input;
+  if (provider && provider !== 'claude') return { model: undefined, reason: `${provider} chooses its own model` };
+  if (explicit) return { model: explicit, reason: '--model' };
+  const late = lateModel();
+  if (!late) return { model: undefined, reason: 'policy off (LGTM_LATE_MODEL=off)' };
+  if (round < LATE_ROUND) return { model: undefined, reason: `round ${round} < ${LATE_ROUND}: full model` };
+  if (harshness !== 'chill') return { model: undefined, reason: `harshness ${harshness}: full model` };
+  if (openBugs > 0) return { model: undefined, reason: `${openBugs} BUG/SECURITY finding(s) still open: full model verifies the fix` };
+  const delta = lastDiffLines === null ? null : Math.abs(diffLines - lastDiffLines);
+  if (delta !== null && delta > RE_ESCALATE_LINES) return { model: undefined, reason: `diff changed by ${delta} lines (> ${RE_ESCALATE_LINES}): full model` };
+  return { model: late, reason: `late chill round ${round}, delta ${delta ?? 'n/a'} lines: cheaper model` };
+}
 const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 // Settings that change WHERE or HOW the CLI authenticates; stripping them can break
 // or reroute a call, so their presence is worth one warning per process. `env` counts
@@ -130,11 +195,13 @@ function userSettings(): Record<string, any> | null {
 }
 
 /**
- * The model to pass to `claude --model`. LGTM_MODEL wins; otherwise the operator's
- * own default from settings, so stripping settings does not change which model
- * reviews the code. Undefined ⇒ the CLI chooses, and stderr says so.
+ * The model to pass to `claude --model`. A `--model`/policy override wins, then
+ * LGTM_MODEL, then the operator's own default from settings, so stripping settings
+ * does not change which model reviews the code. Undefined ⇒ the CLI chooses, and
+ * stderr says so.
  */
 export function resolveModel(settings: Record<string, any> | null = userSettings()): string | undefined {
+  if (modelOverride) return modelOverride;
   const fromEnv = process.env.LGTM_MODEL?.trim();
   if (fromEnv) {
     if (MODEL_ID.test(fromEnv)) return fromEnv;

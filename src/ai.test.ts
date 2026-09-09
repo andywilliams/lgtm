@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -172,4 +172,44 @@ test('the ledger sums measured calls and is tainted by any unmeasured one', () =
   assert.equal(window.measured, false);
 
   assert.equal(takeUsage().calls, 0, 'take resets');
+});
+
+test('setModelOverride outranks LGTM_MODEL and settings, and rejects junk', () => {
+  const saved = process.env.LGTM_MODEL;
+  try {
+    process.env.LGTM_MODEL = 'claude-opus-5';
+    setModelOverride('claude-sonnet-5');
+    assert.equal(resolveModel({ model: 'claude-fable-5-1[1m]' }), 'claude-sonnet-5');
+    setModelOverride(undefined);
+    assert.equal(resolveModel({ model: 'claude-fable-5-1[1m]' }), 'claude-opus-5');
+    assert.throws(() => setModelOverride('rm -rf /'), /not a model id/);
+  } finally {
+    setModelOverride(undefined);
+    if (saved === undefined) delete process.env.LGTM_MODEL; else process.env.LGTM_MODEL = saved;
+  }
+});
+
+test('pickRoundModel: cheaper model only on a late, chill, settled round with no bug just found', () => {
+  const saved = process.env.LGTM_LATE_MODEL;
+  try {
+    delete process.env.LGTM_LATE_MODEL;
+    const base = { round: 5, harshness: 'chill', openBugs: 0, diffLines: 400, lastDiffLines: 390 };
+    assert.equal(pickRoundModel(base).model, DEFAULT_LATE_MODEL);
+    assert.equal(pickRoundModel({ ...base, explicit: 'claude-opus-5' }).model, 'claude-opus-5', '--model wins');
+    assert.equal(pickRoundModel({ ...base, round: 1 }).model, undefined, 'first look is always the full model');
+    assert.equal(pickRoundModel({ ...base, round: 3 }).model, undefined, 'rounds before 4 too');
+    assert.equal(pickRoundModel({ ...base, harshness: 'medium' }).model, undefined, 'only chill rounds');
+    assert.equal(pickRoundModel({ ...base, openBugs: 1 }).model, undefined, 'an unverified BUG/SECURITY fix keeps the full model, however many rounds ago it was found');
+    assert.equal(pickRoundModel({ ...base, provider: 'codex' }).model, undefined, 'codex picks its own model');
+    assert.match(pickRoundModel({ ...base, provider: 'codex', explicit: 'claude-opus-5' }).reason, /codex/, 'even with --model');
+    assert.equal(pickRoundModel({ ...base, lastDiffLines: 400 - RE_ESCALATE_LINES - 1 }).model, undefined, 'a big change re-escalates');
+    assert.equal(pickRoundModel({ ...base, lastDiffLines: null }).model, DEFAULT_LATE_MODEL, 'unknown previous size does not block');
+
+    process.env.LGTM_LATE_MODEL = 'off';
+    assert.equal(pickRoundModel(base).model, undefined, 'policy can be switched off');
+    process.env.LGTM_LATE_MODEL = 'claude-opus-5';
+    assert.equal(pickRoundModel(base).model, 'claude-opus-5', 'and pointed at another model');
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_LATE_MODEL; else process.env.LGTM_LATE_MODEL = saved;
+  }
 });

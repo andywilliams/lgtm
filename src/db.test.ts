@@ -166,6 +166,7 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   logFindings(r5.id, repo, key, 5, [c('BUG', 'Off by one in pager')]);
   assert.deepEqual(disposePreviousRound(repo, key, 5, [c('BUG', 'Off by one in pager')], { harshness: 'medium', diffSha: 'aaa' }),
     { fixed: 0, dismissed: 0, carried: 1, suppressed: 0 }, 'unchanged code: only carried is written');
+  assert.equal(getLoopSummary(repo, key).openBugs, 1, 'the round-5 copy of the bug is still open');
 
   // Round 6 with a changed diff and nothing raised: the still-open suggestion is now genuinely fixed.
   const r6 = logReview({ ...base, reviewedAt: '2026-09-09T12:30:00.000Z', harshness: 'medium', diffSha: 'bbb' });
@@ -174,6 +175,7 @@ test('findings are logged per round and the previous round is disposed: fixed / 
     'round 4 leftover + round 5 carried copy both settle');
   const after6 = getLoopSummary(repo, key);
   assert.equal(after6.lastBugRound, 5);
+  assert.equal(after6.openBugs, 0, 'round 6 settled the carried bug');
   assert.equal(after6.cleanRounds, 1, 'round 6 is one clean judging round after the round-5 bug');
 
   // Round 7 on round 6's identical diff: not a judging round — cleanRounds must not advance.

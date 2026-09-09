@@ -41,6 +41,7 @@ export interface ReviewLog {
   scope?: string;
   overrideReason?: string;
   recovered?: boolean;
+  diffLines?: number;
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -71,6 +72,9 @@ const REVIEW_COLUMNS: [string, string][] = [
   // 1 when the model's JSON was salvaged — such a round judges nothing and is not a
   // "clean" round for the stopping rule either.
   ['recovered', 'INTEGER'],
+  // Size of the reviewed diff (added + removed lines): the round policy re-escalates
+  // to the full model when it jumps.
+  ['diff_lines', 'INTEGER'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -220,13 +224,15 @@ interface RunRow {
   diff_sha: string | null;
   recovered: number | null;
   scope: string | null;
+  diff_lines: number | null;
+  model_id: string | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -266,9 +272,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -300,7 +306,8 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.branch ?? null,
     data.scope ?? null,
     data.overrideReason ?? null,
-    data.recovered ? 1 : 0
+    data.recovered ? 1 : 0,
+    data.diffLines ?? null
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -471,6 +478,7 @@ export interface RoundRow {
   harshness: string | null;
   costUsd: number | null;
   promptTokens: number | null;
+  model: string | null;
   bySeverity: Record<Severity, number>;
   findings: number;
   fixed: number;
@@ -494,6 +502,10 @@ export interface LoopSummary {
   budgetUsed: number;
   /** True when the latest round could judge and raised nothing at all — there is nothing left to verify. */
   lastRoundEmpty: boolean;
+  /** Size (added+removed lines) of the diff the latest round of the run reviewed, if recorded. */
+  lastDiffLines: number | null;
+  /** BUG/SECURITY findings in the run not yet disposed — fixes no later round has verified. */
+  openBugs: number;
   totalCostUsd: number;
 }
 
@@ -520,6 +532,7 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   const findings = db.prepare(
     `SELECT round_key, round, severity, disposition FROM findings WHERE repo = ? AND round_key IN (${marks})`
   ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null }[];
+  const inRun = new Set<string>();
   db.close();
 
   const rounds: RoundRow[] = reviews.map((r) => ({
@@ -529,6 +542,7 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     harshness: r.harshness,
     costUsd: r.cost_usd,
     promptTokens: r.prompt_tokens,
+    model: r.model_id,
     bySeverity: { BUG: 0, SECURITY: 0, SUGGESTION: 0, NITPICK: 0 },
     findings: 0,
     fixed: 0,
@@ -551,6 +565,10 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   // backwards from the latest; a BUG/SECURITY ends the count; a round that could not
   // judge (salvaged, or the same diff as the round before) is skipped, not counted.
   const run = runOf(reviews);
+  for (const r of run) inRun.add(`${r.round_key}#${r.round}`);
+  const openBugs = findings.filter(
+    (f) => inRun.has(`${f.round_key}#${f.round}`) && f.disposition === null && (f.severity === 'BUG' || f.severity === 'SECURITY')
+  ).length;
   const judging = (i: number) => {
     const r = run[i];
     const prevSha = i > 0 ? run[i - 1].diff_sha : null;
@@ -571,6 +589,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     cleanRounds,
     budgetUsed: run.length,
     lastRoundEmpty,
+    lastDiffLines: lastIdx >= 0 ? run[lastIdx].diff_lines : null,
+    openBugs,
     totalCostUsd: rounds.reduce((s, r) => s + (r.costUsd ?? 0), 0),
   };
 }
