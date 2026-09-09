@@ -412,6 +412,12 @@ export interface DisposeOptions {
   diffSha?: string;
   /** This round's list was salvaged from truncated JSON — it may be missing findings, so nothing is disposed. */
   recovered?: boolean;
+  /**
+   * The branch behind a PR round: its `local:<branch>` findings are the first half of
+   * this loop and are disposed by the PR's rounds too — otherwise a BUG raised in the
+   * last local round could never be settled and the PR loop would never read as clean.
+   */
+  branch?: string;
 }
 
 /**
@@ -429,23 +435,26 @@ export function disposePreviousRound(
   current: ReviewComment[],
   options: DisposeOptions = {}
 ): DispositionSummary | null {
-  const { decided = [], harshness: currentHarshness, diffSha, recovered } = options;
-  if (round <= 1 || recovered) return null;
+  const { decided = [], harshness: currentHarshness, diffSha, recovered, branch } = options;
+  const keys = roundKey.startsWith('pr:') && branch ? [roundKey, `local:${branch}`] : [roundKey];
+  // A PR's first round still judges the branch's local rounds; only a loop with nothing before it has nothing to judge.
+  if (recovered || (round <= 1 && keys.length === 1)) return null;
   const db = initDb();
   // Same diff as the round before ⇒ nothing was fixed; only re-raised findings are
   // informative (carried). Absent ones stay open — a re-run is not a fix.
-  // The predecessor is the last round that actually reviewed — a failed row carries
-  // the same sha as the retry that follows it and would make that retry look like a re-run.
+  // The predecessor is the last round that actually reviewed (across both keys) — a
+  // failed row carries the same sha as the retry after it and would read as a re-run.
+  const marks = keys.map(() => '?').join(', ');
   const last = db.prepare(
-    'SELECT diff_sha FROM reviews WHERE repo = ? AND round_key = ? AND round < ? AND (failed IS NULL OR failed = 0) ORDER BY round DESC LIMIT 1'
-  ).get(repo, roundKey, round) as { diff_sha: string | null } | undefined;
+    `SELECT diff_sha FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND NOT (round_key = ? AND round >= ?) AND (failed IS NULL OR failed = 0) ORDER BY reviewed_at DESC, id DESC LIMIT 1`
+  ).get(repo, ...keys, roundKey, round) as { diff_sha: string | null } | undefined;
   const unchanged = Boolean(diffSha && last?.diff_sha && last.diff_sha === diffSha);
   const summary: DispositionSummary = { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 };
   const prev = db.prepare(
     'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, r.harshness FROM findings f ' +
     'JOIN reviews r ON r.id = f.review_id ' +
-    'WHERE f.repo = ? AND f.round_key = ? AND f.round < ? AND f.disposition IS NULL'
-  ).all(repo, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; harshness: string | null }[];
+    `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL`
+  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; harshness: string | null }[];
   if (prev.length === 0) {
     db.close();
     return summary;

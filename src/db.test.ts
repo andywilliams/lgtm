@@ -247,7 +247,7 @@ test('local rounds are keyed on the branch and counted separately from PR rounds
 });
 
 test('loopContext hands the next round its scope and every dismissal; dismissFindings settles by id', async () => {
-  const { logReview, logFindings, loopContext, dismissFindings, stopAdvice, getLoopSummary } = await import('./db.js');
+  const { logReview, logFindings, loopContext, dismissFindings, stopAdvice, getLoopSummary, disposePreviousRound } = await import('./db.js');
   const repo = 'memory/repo';
   const key = 'pr:5';
   const base = { repo, prNumber: 5, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
@@ -304,9 +304,19 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   assert.equal(getLoopSummary(lrepo, 'pr:77', 'feat/w').budgetUsed, 2, 'branch given ⇒ the local rounds count');
   assert.match(prCtx.scopeFrom ?? '', /^local:feat\/w round 1$/);
 
+  // The PR's first round settles the local loop's open findings (the local NITPICK above is
+  // already dismissed; add an open BUG and watch the PR round dispose it).
+  logFindings(logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:15:00.000Z', diffSha: 'L1' }).id,
+    lrepo, 'local:feat/w', 3, [{ severity: 'BUG', title: 'Leaks the handle', file: 'w.ts', line: 7, body: '' }]);
+  assert.equal(getLoopSummary(lrepo, 'pr:77', 'feat/w').openBugs, 1);
+  assert.deepEqual(disposePreviousRound(lrepo, 'pr:77', 1, [], { harshness: 'medium', diffSha: 'P1', branch: 'feat/w' }),
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 0 }, 'PR round 1 judges the local rounds');
+  assert.equal(disposePreviousRound(lrepo, 'pr:77', 1, [], { harshness: 'medium', diffSha: 'P1' }), null, 'without the branch a first round has nothing to judge');
+
   // The budget spans the boundary: two local rounds + the PR's first = 3 used.
   logReview({ ...base, repo: lrepo, prNumber: 77, roundKey: 'pr:77', branch: 'feat/w', reviewedAt: '2026-09-09T14:20:00.000Z' });
-  assert.equal(getLoopSummary(lrepo, 'pr:77').budgetUsed, 3);
+  assert.equal(getLoopSummary(lrepo, 'pr:77').budgetUsed, 4);
+  assert.equal(getLoopSummary(lrepo, 'pr:77').openBugs, 0, 'the local BUG was settled by the PR round');
 
   // Scope ages out with the loop; dismissals do not.
   logReview({ ...base, repo: lrepo, prNumber: 77, roundKey: 'pr:77', branch: 'feat/w', reviewedAt: '2026-10-01T14:20:00.000Z' });

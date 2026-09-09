@@ -379,10 +379,13 @@ function applyLoopMemory(opts: {
 
 /**
  * Run the review with its recovery ladder. Every attempt that produces no review is
- * logged as a failed round — the spend is real and it judges nothing. Ladder: (1) the
- * same model again with the reply schema enforced (an unparsable reply is what the
- * schema fixes); (2) if the policy had picked the cheaper model, the full model with the
- * schema — a cheaper reviewer that cannot answer is not a saving. Anything else rethrows.
+ * logged as a failed round — the spend is real and it judges nothing. Ladder: (1) an
+ * unparsable reply is retried on the same model with the reply schema enforced (that is
+ * what the schema fixes; other failures skip this rung); (2) if the policy had picked the
+ * cheaper model, ANY failure then falls back to the full model with the schema — a
+ * cheaper reviewer that cannot answer, for whatever reason, is not a saving. A failure
+ * on the operator's own model (default or --model) rethrows: there is nothing cheaper
+ * to have chosen wrongly.
  */
 async function reviewWithRecovery(opts: {
   review: (enforceSchema?: boolean) => Promise<ReviewResult>;
@@ -395,20 +398,29 @@ async function reviewWithRecovery(opts: {
   const { review, ai, initialChoice, logFailedRound, say } = opts;
   let { choice } = opts;
   const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
+  const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
+  let lastError: any;
   try {
     return { result: await review(), choice };
   } catch (e: any) {
     logFailedRound(e?.message ?? String(e), choice);
-    if (!isParseFailure(e) || ai !== 'claude') throw e;
+    lastError = e;
+    if (ai !== 'claude') throw e;
+    // A non-parse failure (model unavailable on this plan/region, a gateway error) has
+    // nothing for the schema to fix: go straight to the full model if the policy chose.
+    if (!isParseFailure(e) && !policyPickedCheaper()) throw e;
   }
-  try {
-    say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
-    return { result: await review(true), choice };
-  } catch (e2: any) {
-    logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
-    if (!(choice.source === 'policy' && choice.model !== undefined)) throw e2;
+  if (isParseFailure(lastError)) {
+    try {
+      say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
+      return { result: await review(true), choice };
+    } catch (e2: any) {
+      logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
+      lastError = e2;
+      if (!policyPickedCheaper()) throw e2;
+    }
   }
-  choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review twice (${initialChoice.reason})` };
+  choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review (${lastError?.message ?? lastError}; ${initialChoice.reason})` };
   setModelOverride(undefined);
   say(`↺  ${choice.reason}`);
   try {
@@ -631,7 +643,7 @@ function recordReviewMetrics(opts: {
     const findingIds = logFindings(reviewId, repoName, roundKey, round, comments);
     // The log decides whether this round can judge earlier ones (round 1, salvaged
     // output, unchanged code) — null means it could not.
-    const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered });
+    const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered, branch: local ? undefined : branch });
     const summary = getLoopSummary(repoName, roundKey, branch);
     loop = {
       mode,
