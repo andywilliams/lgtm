@@ -278,6 +278,11 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   assert.deepEqual(prCtx.dismissed.map((d) => d.title), ['Trailing comma']);
   assert.equal(loopContext(lrepo, 'pr:77').lastScope, null, 'without the branch, the PR key stands alone');
 
+  // Before the PR's first round is logged, only the branch tells the budget about the local rounds.
+  assert.equal(getLoopSummary(lrepo, 'pr:77').budgetUsed, 0, 'no PR row yet and no branch given ⇒ blind');
+  assert.equal(getLoopSummary(lrepo, 'pr:77', 'feat/w').budgetUsed, 2, 'branch given ⇒ the local rounds count');
+  assert.match(prCtx.scopeFrom ?? '', /^local:feat\/w round 1$/);
+
   // The budget spans the boundary: two local rounds + the PR's first = 3 used.
   logReview({ ...base, repo: lrepo, prNumber: 77, roundKey: 'pr:77', branch: 'feat/w', reviewedAt: '2026-09-09T14:20:00.000Z' });
   assert.equal(getLoopSummary(lrepo, 'pr:77').budgetUsed, 3);

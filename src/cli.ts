@@ -330,7 +330,7 @@ function applyLoopMemory(opts: {
   }
   if (!scope && ctx.lastScope) {
     scope = ctx.lastScope;
-    console.error(chalk.gray(`↩  --scope inherited from round ${ctx.nextRound - 1}: "${scope.slice(0, 80)}${scope.length > 80 ? '…' : ''}"`));
+    console.error(chalk.gray(`↩  --scope inherited from ${ctx.scopeFrom}: "${scope.slice(0, 80)}${scope.length > 80 ? '…' : ''}"`));
   }
   if (agent && !scope) {
     exitWithError(
@@ -346,7 +346,7 @@ function applyLoopMemory(opts: {
   }
   // The budget counts the whole loop — the branch's local rounds and the PR's — since
   // its last 7-day gap; a PR round is not a fresh start after eight local ones.
-  const summary = getLoopSummary(repoName, roundKey);
+  const summary = getLoopSummary(repoName, roundKey, pr?.headRef);
   if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
     const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds);
     exitWithError(
@@ -551,7 +551,7 @@ function recordReviewMetrics(opts: {
     // The log decides whether this round can judge earlier ones (round 1, salvaged
     // output, unchanged code) — null means it could not.
     const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered });
-    const summary = getLoopSummary(repoName, roundKey);
+    const summary = getLoopSummary(repoName, roundKey, branch);
     loop = {
       mode,
       key: roundKey,

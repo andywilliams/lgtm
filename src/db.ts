@@ -152,7 +152,7 @@ export function initDb(): Database.Database {
  * caller can inherit the scope and hand the reviewer its own dismissals without a file.
  * The ordinal is a preview; the insert allocates the real one.
  */
-export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; dismissed: DecidedFinding[] } {
+export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; scopeFrom: string | null; dismissed: DecidedFinding[] } {
   const db = initDb();
   const nextRound = nextRoundIn(db, repo, roundKey);
   // A PR loop continues the branch's local loop: its scope and dismissals carry over.
@@ -161,7 +161,6 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
   // Scope comes from the current run only — a loop restarted after a gap states its own.
   const run = currentRun(db, repo, keys);
   const scoped = [...run].reverse().find((r) => r.scope);
-  const scopeRow = scoped ? { scope: scoped.scope as string } : undefined;
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
     `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' ORDER BY id`
@@ -175,7 +174,14 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     seen.add(k);
     dismissed.push({ file: r.file, line: r.line, title: r.title, reason: r.dismissed_reason ?? 'dismissed in an earlier round' });
   }
-  return { nextRound, lastScope: scopeRow?.scope ?? null, dismissed };
+  return {
+    nextRound,
+    lastScope: scoped?.scope ?? null,
+    // Where the scope came from: "pr:34 round 2" or "local:feat/x round 5" — so the
+    // inherit message can say so instead of "round 0" on a PR's first round.
+    scopeFrom: scoped ? `${scoped.round_key} round ${scoped.round}` : null,
+    dismissed,
+  };
 }
 
 /**
@@ -487,14 +493,20 @@ export interface LoopSummary {
 
 const SEVERITIES: Severity[] = ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'];
 
-/** Everything the stopping rule needs, per repo + round key, from the log alone. */
-export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
+/**
+ * Everything the stopping rule needs, per repo + round key, from the log alone. Pass
+ * `branch` when it is known (a PR's head): before the PR's first round is logged no row
+ * carries it, and the branch's local rounds would otherwise be invisible to the budget.
+ */
+export function getLoopSummary(repo: string, roundKey: string, branch?: string): LoopSummary {
   const db = initDb();
   // A PR loop is the continuation of the branch's local loop: include those rounds
-  // first (their own key and numbering) when the PR rows name a branch.
+  // first (their own key and numbering) when the branch is known or a PR row names it.
   const keys = [roundKey];
   if (roundKey.startsWith('pr:')) {
-    const b = db.prepare('SELECT branch FROM reviews WHERE repo = ? AND round_key = ? AND branch IS NOT NULL LIMIT 1').get(repo, roundKey) as { branch: string } | undefined;
+    const b = branch
+      ? { branch }
+      : (db.prepare('SELECT branch FROM reviews WHERE repo = ? AND round_key = ? AND branch IS NOT NULL LIMIT 1').get(repo, roundKey) as { branch: string } | undefined);
     if (b?.branch) keys.unshift(`local:${b.branch}`);
   }
   const marks = keys.map(() => '?').join(', ');
