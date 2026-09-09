@@ -234,7 +234,7 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   const key = 'pr:5';
   const base = { repo, prNumber: 5, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
     usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key, harshness: 'medium' };
-  assert.deepEqual(loopContext(repo, key), { nextRound: 1, lastScope: null, dismissed: [] });
+  assert.deepEqual(loopContext(repo, key), { nextRound: 1, lastScope: null, scopeFrom: null, dismissed: [] });
 
   const r1 = logReview({ ...base, reviewedAt: '2026-09-09T13:00:00.000Z', scope: 'add the widget' });
   const ids = logFindings(r1.id, repo, key, 1, [
