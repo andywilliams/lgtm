@@ -172,7 +172,19 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   assert.equal(r6.round, 6);
   assert.deepEqual(disposePreviousRound(repo, key, 6, [], { harshness: 'medium', diffSha: 'bbb' }), { fixed: 2, dismissed: 0, carried: 0, suppressed: 0 },
     'round 4 leftover + round 5 carried copy both settle');
-  assert.equal(getLoopSummary(repo, key).lastBugRound, 5);
+  const after6 = getLoopSummary(repo, key);
+  assert.equal(after6.lastBugRound, 5);
+  assert.equal(after6.cleanRounds, 1, 'round 6 is one clean judging round after the round-5 bug');
+
+  // Round 7 on round 6's identical diff: not a judging round — cleanRounds must not advance.
+  logReview({ ...base, reviewedAt: '2026-09-09T13:00:00.000Z', harshness: 'medium', diffSha: 'bbb' });
+  assert.equal(getLoopSummary(repo, key).cleanRounds, 1, 'a re-run on the same diff is not a clean round');
+  // Round 8 salvaged: neither.
+  logReview({ ...base, reviewedAt: '2026-09-09T13:10:00.000Z', harshness: 'medium', diffSha: 'ccc', recovered: true });
+  assert.equal(getLoopSummary(repo, key).cleanRounds, 1);
+  // Round 9, new diff, nothing found: now two.
+  logReview({ ...base, reviewedAt: '2026-09-09T13:20:00.000Z', harshness: 'medium', diffSha: 'ddd' });
+  assert.equal(getLoopSummary(repo, key).cleanRounds, 2);
 
   const db = new Database(dbPath, { readonly: true });
   const dismissed = db.prepare("SELECT dismissed_reason, disposed_at_round FROM findings WHERE title LIKE '%unused import%'").get() as any;
@@ -206,4 +218,55 @@ test('local rounds are keyed on the branch and counted separately from PR rounds
   assert.equal(pr.lastBugRound, null);
   assert.equal(s.rounds[0].harshness, 'chill');
   assert.equal(s.lastBugRound, null);
+});
+
+test('loopContext hands the next round its scope and every dismissal; dismissFindings settles by id', async () => {
+  const { logReview, logFindings, loopContext, dismissFindings, stopAdvice } = await import('./db.js');
+  const repo = 'memory/repo';
+  const key = 'pr:5';
+  const base = { repo, prNumber: 5, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key, harshness: 'medium' };
+  assert.deepEqual(loopContext(repo, key), { nextRound: 1, lastScope: null, dismissed: [] });
+
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-09T13:00:00.000Z', scope: 'add the widget' });
+  const ids = logFindings(r1.id, repo, key, 1, [
+    { severity: 'SUGGESTION', title: 'Rename widget', file: 'w.ts', line: 3, body: '' },
+    { severity: 'BUG', title: 'Widget leaks', file: 'w.ts', line: 9, body: '' },
+  ]);
+  assert.equal(ids.length, 2);
+
+  const d = dismissFindings([ids[0], 999999], 'name is the domain term');
+  assert.deepEqual(d, { dismissed: [ids[0]], skipped: [999999] });
+  assert.deepEqual(dismissFindings([ids[0]], 'again'), { dismissed: [], skipped: [ids[0]] }, 'already settled ⇒ skipped');
+
+  const ctx = loopContext(repo, key);
+  assert.equal(ctx.nextRound, 2);
+  assert.equal(ctx.lastScope, 'add the widget', 'scope inherited from the last round that stated one');
+  assert.deepEqual(ctx.dismissed, [{ file: 'w.ts', line: 3, title: 'Rename widget', reason: 'name is the domain term' }]);
+
+  // A later round without a scope leaves the inherited one in place.
+  logReview({ ...base, reviewedAt: '2026-09-09T13:30:00.000Z' });
+  assert.equal(loopContext(repo, key).lastScope, 'add the widget');
+
+  // The stopping rule from data: it is the count of clean JUDGING rounds that decides.
+  assert.equal(stopAdvice(1, null, 1).stop, false);
+  assert.equal(stopAdvice(2, null, 2).stop, true, 'two clean rounds from the start');
+  assert.equal(stopAdvice(5, 4, 1).stop, false);
+  assert.equal(stopAdvice(6, 4, 2).stop, true);
+  assert.equal(stopAdvice(6, 4, 1).stop, false, 'two rounds since the bug, but only one could judge');
+  assert.match(stopAdvice(6, 4, 2).reason, /last BUG\/SECURITY round 4/);
+  assert.match(stopAdvice(3, 3, 0).reason, /2 more clean rounds/, 'clean=0 still needs the full count');
+  assert.match(stopAdvice(4, 3, 1).reason, /one more clean round/);
+
+  // A PR loop inherits the branch's local scope and dismissals when told its branch.
+  const lrepo = 'memory/repo';
+  logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:00:00.000Z', scope: 'local scope' });
+  const lid = logFindings(logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:10:00.000Z' }).id,
+    lrepo, 'local:feat/w', 2, [{ severity: 'NITPICK', title: 'Trailing comma', file: 'w.ts', line: 1, body: '' }]);
+  dismissFindings(lid, 'style, not ours');
+  const prCtx = loopContext(lrepo, 'pr:77', 'feat/w');
+  assert.equal(prCtx.nextRound, 1);
+  assert.equal(prCtx.lastScope, 'local scope');
+  assert.deepEqual(prCtx.dismissed.map((d) => d.title), ['Trailing comma']);
+  assert.equal(loopContext(lrepo, 'pr:77').lastScope, null, 'without the branch, the PR key stands alone');
 });
