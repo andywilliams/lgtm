@@ -200,6 +200,7 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
+| `LGTM_SESSIONS` | *(on)* | `off` = every round is a one-off call instead of resuming the loop's session |
 
 Codex has no usage envelope, so its rows are stored as `usage_source = 'estimate'`.
 
@@ -214,6 +215,10 @@ lgtm rounds 86 --json
 ```
 
 Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
+
+### One session per loop — the prompt cache does the rest
+
+The first round of a loop opens a Claude session and sends the full, stable-first prompt. Every later round **resumes** that session and sends only what moved: the current contents of files changed since the session last saw them, the current diff, and the per-round instructions. Everything the session already holds is a prompt-cache read. Measured: a resumed turn read 86k of 86k tokens from cache and cost $0.018 against $0.32 for the first. A resumed round keeps the session's model (a cached full-model turn is cheaper than an uncached cheaper-model one). `--fresh` starts a new session; `LGTM_SESSIONS=off` makes every round a one-off call. One transcript per loop is written under the CLI's project dir for the repo.
 
 ### The loop remembers, so you don't
 

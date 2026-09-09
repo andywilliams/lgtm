@@ -346,14 +346,16 @@ export function getAvailableProviders(): AIProvider[] {
 }
 
 /** The argv for a stripped, measured `claude --print` call (execFile form — no shell). */
-export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources(), schema?: object): string[] {
+export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources(), schema?: object, session?: RunOptions['session']): string[] {
   const args = [
     '--print',
     '--output-format', 'json',
     '--strict-mcp-config',
     '--setting-sources', sources,
-    '--no-session-persistence',
   ];
+  // A loop session must persist to be resumable; a one-off call leaves no transcript.
+  if (session) args.push(session.resume ? '--resume' : '--session-id', session.id);
+  else args.push('--no-session-persistence');
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
   // A schema makes the CLI enforce the output shape — no more prose where JSON was asked
@@ -365,6 +367,13 @@ export function claudePrintArgs(model: string | undefined, effort: string | unde
 export interface RunOptions {
   /** JSON Schema the reply must satisfy (claude only; codex has no equivalent). */
   schema?: object;
+  /**
+   * Run inside a persisted Claude session: `resume: false` starts one with this id,
+   * `resume: true` continues it. A continued session is a prompt-cache hit on everything
+   * said so far, which is how a fix-verify round costs cents instead of dollars. The
+   * transcript is written under the CLI's project dir for the cwd — one file per loop.
+   */
+  session?: { id: string; resume: boolean };
 }
 
 let announcedModel = false;
@@ -378,7 +387,7 @@ function runClaude(prompt: string, opts: RunOptions): string {
     announcedModel = true;
     process.stderr.write('lgtm: no model configured (LGTM_MODEL or ~/.claude/settings.json) — the claude CLI will pick its default.\n');
   }
-  const args = claudePrintArgs(model, effort, settingSources(), opts.schema);
+  const args = claudePrintArgs(model, effort, settingSources(), opts.schema, opts.session);
   try {
     const raw = execFileSync('claude', args, {
       input: prompt,

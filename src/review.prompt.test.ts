@@ -57,3 +57,15 @@ test('changed files render in path order regardless of insertion order', () => {
   assert.equal(a, b);
   assert.ok(a.indexOf('### src/a.ts') < a.indexOf('### src/z.ts'));
 });
+
+test('a resumed round sends only what moved, then the same volatile tail', async () => {
+  const { buildResumePrompt } = await import('./review.js');
+  const p = buildResumePrompt({ ...base, round: 3, changedSinceLast: { 'src/z.ts': 'new z' }, unchangedFiles: ['src/a.ts'] });
+  assert.ok(p.startsWith('# Review round 3 of "feat: thing"'));
+  assert.ok(p.includes('### src/z.ts\n```\nnew z'));
+  assert.ok(!p.includes('invariant 1'), 'repo context is not re-sent');
+  assert.ok(!p.includes('### src/a.ts'), 'unchanged file contents are not re-sent');
+  assert.ok(p.includes('Unchanged since the last round (contents already in context): src/a.ts'));
+  assert.ok(p.indexOf('## Files changed since the last round') < p.indexOf('## PR Title'));
+  for (const v of ['+const a = 1;', 'harshness: medium', 'add the thing', 'dismissed because: domain term', 'OUTPUT FORMAT']) assert.ok(p.includes(v), v);
+});

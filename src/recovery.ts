@@ -12,24 +12,39 @@ import type { ReviewResult } from './types.js';
  * to have chosen wrongly.
  */
 export async function reviewWithRecovery(opts: {
-  review: (attempt: { enforceSchema?: boolean; model?: string }) => Promise<ReviewResult>;
+  review: (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean }) => Promise<ReviewResult>;
   ai: AIProvider;
   choice: RoundModelChoice;
   initialChoice: RoundModelChoice;
+  /** True when the first attempt resumes a loop session — a failure there gets one fresh full round first. */
+  resuming?: boolean;
   logFailedRound: (why: string, attempted: RoundModelChoice) => void;
   say: (line: string) => void;
-}): Promise<{ result: ReviewResult; choice: RoundModelChoice }> {
-  const { review, ai, initialChoice, logFailedRound, say } = opts;
+}): Promise<{ result: ReviewResult; choice: RoundModelChoice; freshened?: boolean }> {
+  const { review, ai, initialChoice, resuming, logFailedRound, say } = opts;
   let { choice } = opts;
   const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
   const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
   let lastError: any;
+  let freshened = false;
   try {
     return { result: await review({ model: choice.model }), choice };
   } catch (e: any) {
     logFailedRound(e?.message ?? String(e), choice);
     lastError = e;
     if (ai !== 'claude') throw e;
+    // A resumed session can be gone (transcript deleted, another machine, CLI upgrade):
+    // one fresh full round on the same model before any other rung.
+    if (resuming && !isParseFailure(e)) {
+      say(`↺  could not continue the loop's session (${e?.message?.split('\n')[0] ?? e}) — starting a fresh one`);
+      try {
+        freshened = true;
+        return { result: await review({ model: choice.model, fresh: true }), choice, freshened };
+      } catch (e2: any) {
+        logFailedRound(`fresh session failed: ${e2?.message ?? String(e2)}`, choice);
+        lastError = e2;
+      }
+    }
     // A non-parse failure (model unavailable on this plan/region, a gateway error) has
     // nothing for the schema to fix: go straight to the full model if the policy chose.
     if (!isParseFailure(e) && !policyPickedCheaper()) throw e;
@@ -37,7 +52,7 @@ export async function reviewWithRecovery(opts: {
   if (isParseFailure(lastError)) {
     try {
       say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
-      return { result: await review({ enforceSchema: true, model: choice.model }), choice };
+      return { result: await review({ enforceSchema: true, model: choice.model, ...(freshened ? { fresh: true } : {}) }), choice, freshened };
     } catch (e2: any) {
       logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
       lastError = e2;
@@ -47,7 +62,7 @@ export async function reviewWithRecovery(opts: {
   choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review (${lastError?.message ?? lastError}; ${initialChoice.reason})` };
   say(`↺  ${choice.reason}`);
   try {
-    return { result: await review({ enforceSchema: true, model: undefined }), choice };
+    return { result: await review({ enforceSchema: true, model: undefined, ...(freshened ? { fresh: true } : {}) }), choice, freshened };
   } catch (e3: any) {
     logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
     throw e3;

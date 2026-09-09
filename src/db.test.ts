@@ -252,7 +252,7 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   const key = 'pr:5';
   const base = { repo, prNumber: 5, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
     usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key, harshness: 'medium' };
-  assert.deepEqual(loopContext(repo, key), { nextRound: 1, lastScope: null, scopeFrom: null, dismissed: [] });
+  assert.deepEqual(loopContext(repo, key), { nextRound: 1, lastScope: null, scopeFrom: null, dismissed: [], session: null });
 
   const r1 = logReview({ ...base, reviewedAt: '2026-09-09T13:00:00.000Z', scope: 'add the widget' });
   const ids = logFindings(r1.id, repo, key, 1, [
@@ -317,6 +317,17 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   logReview({ ...base, repo: lrepo, prNumber: 77, roundKey: 'pr:77', branch: 'feat/w', reviewedAt: '2026-09-09T14:20:00.000Z' });
   assert.equal(getLoopSummary(lrepo, 'pr:77').budgetUsed, 4);
   assert.equal(getLoopSummary(lrepo, 'pr:77').openBugs, 0, 'the local BUG was settled by the PR round');
+
+  // The loop's session: latest round with one, file shas accumulated across its rounds; a PR round finds the local loop's.
+  logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:25:00.000Z', sessionId: 'sess-1', fileShas: { 'a.ts': 'a1', 'b.ts': 'b1' },
+    usage: { inputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 1, costUsd: 0.1, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, measured: true } });
+  logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:26:00.000Z', sessionId: 'sess-1', fileShas: { 'a.ts': 'a2' } });
+  const sess = loopContext(lrepo, 'pr:77', 'feat/w').session;
+  assert.ok(sess);
+  assert.equal(sess.id, 'sess-1');
+  assert.equal(sess.model, 'claude-fable-5-1');
+  assert.deepEqual(sess.fileShas, { 'a.ts': 'a2', 'b.ts': 'b1' }, 'latest sha per file across the session');
+  assert.equal(loopContext(lrepo, 'pr:77').session, null, 'without the branch the PR key has no session yet');
 
   // Scope ages out with the loop; dismissals do not.
   logReview({ ...base, repo: lrepo, prNumber: 77, roundKey: 'pr:77', branch: 'feat/w', reviewedAt: '2026-10-01T14:20:00.000Z' });

@@ -9,8 +9,8 @@ const cheaper: RoundModelChoice = { model: 'claude-sonnet-5', source: 'policy', 
 const full: RoundModelChoice = { model: undefined, source: 'policy', reason: 'round 1 < 4: full model' };
 const explicit: RoundModelChoice = { model: 'claude-opus-5', source: 'explicit', reason: '--model' };
 
-function harness(script: Array<Error | typeof ok>) {
-  const attempts: Array<{ enforceSchema?: boolean; model?: string }> = [];
+function harness(script: Array<Error | typeof ok>, resuming = false) {
+  const attempts: Array<{ enforceSchema?: boolean; model?: string; fresh?: boolean }> = [];
   const failed: Array<{ why: string; model: string | undefined }> = [];
   const said: string[] = [];
   const review = async (attempt: { enforceSchema?: boolean; model?: string }) => {
@@ -20,7 +20,7 @@ function harness(script: Array<Error | typeof ok>) {
     return next ?? ok;
   };
   const run = (choice: RoundModelChoice) =>
-    reviewWithRecovery({ review, ai: 'claude', choice, initialChoice: choice, logFailedRound: (why, c) => failed.push({ why, model: c.model }), say: (l) => said.push(l) });
+    reviewWithRecovery({ review, ai: 'claude', choice, initialChoice: choice, resuming, logFailedRound: (why, c) => failed.push({ why, model: c.model }), say: (l) => said.push(l) });
   return { run, attempts, failed, said };
 }
 
@@ -70,4 +70,20 @@ test('a failure on the operator\'s own model is logged and rethrown — nothing 
   await assert.rejects(() => h.run(full), /parse/);
   assert.deepEqual(h.attempts.map((a) => a.enforceSchema ?? false), [false, true]);
   assert.equal(h.failed.length, 2, 'every failed attempt is a logged round');
+});
+
+test('a resumed session that cannot be continued gets one fresh full round on the same model first', async () => {
+  const h = harness([new Error('No conversation found with session ID'), ok], true);
+  const { choice, freshened } = await h.run(full);
+  assert.equal(freshened, true);
+  assert.equal(choice, full);
+  assert.deepEqual(h.attempts, [{ model: undefined }, { model: undefined, fresh: true }]);
+  assert.equal(h.failed.length, 1);
+  assert.match(h.said[0], /starting a fresh one/);
+
+  // A parse failure on a resumed round is a reply problem, not a session problem: schema rung, still resumed.
+  const h2 = harness([parseError(), ok], true);
+  const r2 = await h2.run(full);
+  assert.equal(r2.freshened, false);
+  assert.deepEqual(h2.attempts, [{ model: undefined }, { enforceSchema: true, model: undefined }]);
 });

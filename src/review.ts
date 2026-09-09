@@ -94,7 +94,11 @@ export interface ReviewPromptInput {
   usageContext?: string;
   expandedContext?: string;
   handbookContext?: string;
-  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean };
+  extra?: {
+    scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean;
+    /** Continue the loop's session instead of starting fresh; only what moved is sent. */
+    session?: { id: string; resume: boolean; round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] };
+  };
 }
 
 /**
@@ -224,6 +228,30 @@ If no issues found, respond with:
 export const VOLATILE_MARKER = '\n## PR Title\n';
 
 /**
+ * The prompt for a round that CONTINUES the loop's session. The session already holds
+ * the system prompt, the repo context and every file it has seen, so this sends only
+ * what moved: the current contents of files changed since the last round (replacing the
+ * versions in context), the current diff, and the per-round instructions. The reviewer
+ * is told this is a later round of the same change, so it judges the code as it is now.
+ */
+export function buildResumePrompt(input: ReviewPromptInput & { round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] }): string {
+  const { diff, prTitle, harshness, extra, round, changedSinceLast, unchangedFiles } = input;
+  const volatileStart = buildReviewPrompt(input).indexOf(VOLATILE_MARKER);
+  const volatile = buildReviewPrompt(input).slice(volatileStart); // title, diff, harshness, scope, decided, output format
+  const changed = Object.entries(changedSinceLast).sort(([a], [b]) => a.localeCompare(b));
+  const changedSection = changed.length > 0
+    ? `## Files changed since the last round — CURRENT contents (these replace the versions you saw earlier)\n\n` +
+      changed.map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``).join('\n\n') + '\n'
+    : '## Files changed since the last round\n\n(none — the contents you have already seen are current)\n';
+  const unchanged = unchangedFiles.length > 0 ? `Unchanged since the last round (contents already in context): ${unchangedFiles.join(', ')}\n` : '';
+  return `# Review round ${round} of "${prTitle}" — the code has moved on since your last review
+
+This is a later round of the SAME change. Everything you were given before (repo charter, standards, related files, file contents) still applies unless replaced below. Judge the code AS IT IS NOW: a finding from an earlier round that the current code no longer exhibits must not be repeated; a finding that still applies should be raised again. Harshness for this round: ${harshness}.
+
+${changedSection}${unchanged}${volatile}`;
+}
+
+/**
  * Review a PR diff using specified AI CLI
  */
 export async function reviewPR(
@@ -238,11 +266,18 @@ export async function reviewPR(
   handbookContext?: string,
   extra?: ReviewPromptInput['extra']
 ): Promise<ReviewResult> {
-  const fullPrompt = buildReviewPrompt({ diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, extra });
+  const input = { diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, extra };
+  const s = extra?.session;
+  const fullPrompt = s?.resume
+    ? buildResumePrompt({ ...input, round: s.round, changedSinceLast: s.changedSinceLast, unchangedFiles: s.unchangedFiles })
+    : buildReviewPrompt(input);
   // The schema is a retry tool, not a default: measured, it adds a second CLI turn that
   // misses the prompt cache (2.3× the cost of a small call), so it is used only when a
   // plain reply failed to parse.
-  const output = runAIPrompt(fullPrompt, ai, 'review', { schema: extra?.enforceSchema ? REVIEW_SCHEMA : undefined });
+  const output = runAIPrompt(fullPrompt, ai, 'review', {
+    schema: extra?.enforceSchema ? REVIEW_SCHEMA : undefined,
+    session: s ? { id: s.id, resume: s.resume } : undefined,
+  });
   return parseAIResponse(output);
 }
 
