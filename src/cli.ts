@@ -6,7 +6,7 @@ import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment, getCurrentRepoSlug } from './github.js';
-import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase } from './git.js';
+import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase, getCurrentBranch } from './git.js';
 import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
@@ -18,7 +18,8 @@ import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
-import { logReview } from './db.js';
+import { logReview, logFindings, disposePreviousRound, getLoopSummary, type DispositionSummary } from './db.js';
+import { createHash } from 'node:crypto';
 import { takeUsage, promptTokens, type AIUsage } from './ai.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility } from './types.js';
@@ -340,6 +341,7 @@ function formatAgentResult(options: {
   relatedFiles?: { path: string; reason: string }[];
   tokenEstimate?: number;
   usage?: AIUsage;
+  loop?: LoopState | null;
   recovered?: boolean;
   error?: string;
 }): string {
@@ -373,14 +375,30 @@ function formatAgentResult(options: {
         ? { promptTokens: promptTokens(u), cacheReadTokens: u.cacheReadTokens, outputTokens: u.outputTokens, costUsd: u.costUsd, durationMs: u.durationMs, models: u.models }
         : null,
     },
+    // Where this run sits in its fix→review loop, from the log: the round number, what
+    // became of last round's findings, and the last round that found a BUG/SECURITY —
+    // the inputs to the stopping rule ("no BUG/SECURITY for two rounds ⇒ stop").
+    loop: options.loop ?? null,
     ...(options.error ? { error: options.error } : {}),
   });
 }
 
+/** The loop facts an agent-mode caller sees; null fields mean the log could not say. */
+interface LoopState {
+  mode: 'pr' | 'local';
+  key: string;
+  round: number;
+  /** What became of last round's findings; null on round 1, or when this round's list was salvaged (truncated) JSON. */
+  previous: DispositionSummary | null;
+  lastBugRound: number | null;
+  roundsSinceBug: number | null;
+}
+
 /**
- * Best-effort metrics logging for a completed review. Returns the rough token
- * estimate (diff + expanded context) plus the measured usage drained from the AI
- * ledger, so callers can surface both. Never throws.
+ * Best-effort metrics logging for a completed review: the review row (with measured
+ * usage drained from the AI ledger), one row per finding, and the disposition of the
+ * previous round's findings now that this round has run. Local rounds are logged too,
+ * keyed on the branch, so a pre-PR loop is as visible as a PR one. Never throws.
  */
 function recordReviewMetrics(opts: {
   repo?: string;
@@ -390,24 +408,36 @@ function recordReviewMetrics(opts: {
   relatedFiles: boolean;
   ai: AIProvider;
   local?: boolean;
-}): { tokenEstimate: number; usage: AIUsage } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local } = opts;
+  /** Deferred so a failing gh/git call lands inside the never-throws guard, not before it. */
+  filesReviewed: () => number;
+  harshness: Harshness;
+  comments: ReviewComment[];
+  decided?: DecidedFinding[];
+  /** True when the model's JSON was salvaged — the list may be missing its tail. */
+  recovered?: boolean;
+  /** The branch under review: the PR's head, or the checkout's for --local. */
+  branch?: string;
+}): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
   const usage = takeUsage();
-  // The metrics DB is keyed on GitHub PRs — skip persistence for local reviews (still
-  // return the estimate and usage so agent-mode output is populated).
-  if (local) return { tokenEstimate, usage };
+  let loop: LoopState | null = null;
   try {
-    const repoName = repo || getRepoRoot();
-    const changedFiles = getChangedFiles(prNumber, repo);
-    logReview({
+    // One identity per repo on the write side: the --repo slug, else the checkout's
+    // slug, else its path (a checkout with no GitHub remote). Rows logged before this
+    // used the path; `rounds` reads both spellings.
+    const repoName = repo || getCurrentRepoSlug() || getRepoRoot();
+    const mode: 'pr' | 'local' = local ? 'local' : 'pr';
+    const roundKey = local ? `local:${getCurrentBranch()}` : `pr:${prNumber}`;
+    const diffSha = createHash('sha1').update(diff).digest('hex');
+    const { id: reviewId, round: allocated } = logReview({
       repo: repoName,
-      prNumber,
+      prNumber: local ? 0 : prNumber,
       reviewedAt: new Date().toISOString(),
-      filesReviewed: changedFiles.length,
+      filesReviewed: filesReviewed(),
       contextFilesAdded: expanded.length,
       contextReasons: JSON.stringify(expanded.map(f => f.reason)),
       tokenCount: tokenEstimate,
@@ -415,12 +445,31 @@ function recordReviewMetrics(opts: {
       usedContextExpansion: relatedFiles && expanded.length > 0,
       falseNegative: false,
       usage,
+      mode,
+      roundKey,
+      harshness,
+      diffSha,
+      branch: branch || (local ? getCurrentBranch() : undefined),
     });
+    const round = allocated ?? 1;
+    logFindings(reviewId, repoName, roundKey, round, comments);
+    // The log decides whether this round can judge earlier ones (round 1, salvaged
+    // output, unchanged code) — null means it could not.
+    const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered });
+    const summary = getLoopSummary(repoName, roundKey);
+    loop = {
+      mode,
+      key: roundKey,
+      round,
+      previous,
+      lastBugRound: summary.lastBugRound,
+      roundsSinceBug: summary.lastBugRound === null ? null : round - summary.lastBugRound,
+    };
   } catch (e) {
     // Metrics logging is non-critical — don't fail the review.
     process.stderr.write(`Warning: metrics logging failed: ${e}\n`);
   }
-  return { tokenEstimate, usage };
+  return { tokenEstimate, usage, loop };
 }
 
 async function runReview(options: RunOptions): Promise<void> {
@@ -578,6 +627,15 @@ async function runReview(options: RunOptions): Promise<void> {
 
   log(chalk.gray(`\n${result.summary}\n`));
 
+  // Log the round NOW, before any output or posting branch: every path below (agent,
+  // local, dry-run, nothing-to-post, cancelled) is a review that happened and costs
+  // the same to have run. Non-critical, never throws.
+  const metrics = recordReviewMetrics({
+    repo, prNumber, diff, expanded, relatedFiles, ai, local,
+    filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
+    branch: local ? undefined : pr.headRef,
+  });
+
   // Agent mode: read-only. Return EVERY finding (flagging duplicates of existing PR
   // comments) and never post. The agent decides what to do with the results.
   if (agent) {
@@ -596,15 +654,14 @@ async function runReview(options: RunOptions): Promise<void> {
       duplicate: isDuplicateComment(comment, existingComments),
     }));
 
-    const { tokenEstimate, usage } = recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai, local });
-
     console.log(formatAgentResult({
       success: true,
       summary: result.summary,
       comments: annotated,
       relatedFiles: expanded,
-      tokenEstimate,
-      usage,
+      tokenEstimate: metrics.tokenEstimate,
+      usage: metrics.usage,
+      loop: metrics.loop,
       recovered: result.recovered,
     }));
     return;
@@ -842,8 +899,6 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));
   }
 
-  // Log review metadata for metrics (non-critical, never throws).
-  recordReviewMetrics({ repo, prNumber, diff, expanded, relatedFiles, ai });
 }
 
 program
@@ -1278,6 +1333,72 @@ program
       console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
       console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);
       console.log(`Cost (logged reviews):  $${stats.costUsd.toFixed(2)}`);
+    }
+    console.log('');
+  });
+
+// Rounds: the fix→review loop for one PR or branch, from the log. This is the
+// stopping rule's evidence — findings per round, what became of them, and the last
+// round that found a BUG/SECURITY.
+program
+  .command('rounds [pr-number]')
+  .description('Show the review rounds logged for a PR (or, with --local, the current branch)')
+  .option('-r, --repo <owner/repo>', 'GitHub repository (default: current repo)')
+  .option('--local', 'Rounds for the current branch (local working-tree reviews)', false)
+  .option('--json', 'Structured JSON to stdout', false)
+  .action((prStr: string | undefined, options: any) => {
+    let key: string;
+    if (options.local) key = `local:${getCurrentBranch()}`;
+    else if (prStr && /^\d+$/.test(prStr)) key = `pr:${parseInt(prStr, 10)}`;
+    else {
+      console.error(chalk.red('Give a PR number, or --local for the current branch.'));
+      process.exit(1);
+    }
+    // The log's repo column is whatever `review` was given: the --repo slug, or the
+    // checkout path when it was run bare. With --repo, look up exactly that; bare,
+    // try the checkout path and then its slug — never another repo's loop.
+    const candidates: string[] = options.repo ? [options.repo] : [];
+    if (!options.repo) {
+      const slug = getCurrentRepoSlug(); // null when the checkout has no GitHub remote
+      if (slug) candidates.push(slug);
+      candidates.push(getRepoRoot()); // rows written before the slug became the key
+    }
+    let summary = getLoopSummary(candidates[0], key);
+    for (const c of candidates.slice(1)) {
+      if (summary.rounds.length > 0) break;
+      summary = getLoopSummary(c, key);
+    }
+    if (options.json) {
+      console.log(JSON.stringify(summary));
+      return;
+    }
+    if (summary.rounds.length === 0) {
+      console.log(`No logged rounds for ${key} in ${candidates.join(' or ')}.`);
+      return;
+    }
+    const mixed = summary.rounds.some((r) => r.key !== key);
+    console.log(chalk.bold(`\nReview rounds — ${key}${mixed ? ' (with the branch\'s local rounds first)' : ''}\n`));
+    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  fixed dism carr supp    cost`);
+    for (const r of summary.rounds) {
+      const when = r.reviewedAt.slice(0, 16).replace('T', ' ');
+      const s = r.bySeverity;
+      const cost = r.costUsd === null ? '      —' : `$${r.costUsd.toFixed(2)}`.padStart(7);
+      const loopCol = mixed ? `${(r.key.startsWith('pr:') ? 'pr' : 'local').padEnd(6)} ` : '';
+      console.log(
+        `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
+          `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
+          `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}`
+      );
+    }
+    const own = summary.rounds.filter((r) => r.key === key);
+    const last = own.length > 0 ? own[own.length - 1].round : 0;
+    const sinceBug = summary.lastBugRound === null ? null : last - summary.lastBugRound;
+    console.log('');
+    console.log(`Last BUG/SECURITY: ${summary.lastBugRound === null ? 'none' : `round ${summary.lastBugRound}`}` +
+      (sinceBug === null ? '' : ` (${sinceBug} round(s) ago)`));
+    console.log(`Measured cost so far: $${summary.totalCostUsd.toFixed(2)}`);
+    if (sinceBug !== null && sinceBug >= 2) {
+      console.log(chalk.yellow('Stopping rule: two or more rounds without a BUG/SECURITY finding — file what is left and stop.'));
     }
     console.log('');
   });

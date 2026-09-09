@@ -200,6 +200,18 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 
 Codex has no usage envelope, so its rows are stored as `usage_source = 'estimate'`.
 
+### Rounds and findings
+
+Every review (PR or `--local`) is logged as a **round** with one row per finding. When the next round runs, the previous round's findings are marked `fixed` (no longer raised), `carried` (raised again), `dismissed` (absent and listed in your `--decided` file, reason kept) or `suppressed` (absent only because this round ran at a lower harshness that does not raise SUGGESTION/NITPICK — not evidence of a fix). Nothing to fill in — the tool infers it.
+
+```bash
+lgtm rounds 86          # the loop for PR 86: findings per round by severity, fixed/dismissed/carried, cost
+lgtm rounds --local     # the same for the current branch's working-tree reviews
+lgtm rounds 86 --json
+```
+
+Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound` and `roundsSinceBug` — the inputs to a stopping rule such as *"no BUG/SECURITY for two rounds ⇒ stop"*.
+
 ## Full Context Mode
 
 By default, LGTM only sends the PR diff to the AI. This is fast but can miss pattern violations — cases where new code doesn't follow established patterns in the file.
