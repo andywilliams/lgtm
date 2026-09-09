@@ -706,6 +706,9 @@ async function runReview(options: RunOptions): Promise<void> {
       maxFiles: 20,
       importDepth: 3,
     });
+    // Path order, not discovery order: the same set of files must render identically
+    // from one round to the next or the prompt cache never matches past this point.
+    expanded.sort((a, b) => a.path.localeCompare(b.path));
 
     if (expanded.length > 0) {
       log(chalk.gray(`   Found ${expanded.length} context file(s):`));
