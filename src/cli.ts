@@ -344,11 +344,13 @@ function applyLoopMemory(opts: {
     decided = [...(decided ?? []), ...extra];
     if (extra.length > 0) console.error(chalk.gray(`↩  ${extra.length} dismissal(s) from earlier rounds injected`));
   }
-  if (ctx.nextRound > ROUND_BUDGET && !overrideReason) {
-    const summary = getLoopSummary(repoName, roundKey);
+  // The budget counts the whole loop — the branch's local rounds and the PR's — since
+  // its last 7-day gap; a PR round is not a fresh start after eight local ones.
+  const summary = getLoopSummary(repoName, roundKey);
+  if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
     const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds);
     exitWithError(
-      `Round ${ctx.nextRound} of ${roundKey} exceeds the ${ROUND_BUDGET}-round budget (${advice.reason}). ` +
+      `This would be round ${summary.budgetUsed + 1} of the loop behind ${roundKey} (${summary.budgetUsed} used of the ${ROUND_BUDGET}-round budget; ${advice.reason}). ` +
         `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
     );
   }
@@ -1527,7 +1529,7 @@ program
     if (last > 0) {
       const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds);
       console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);
-      if (last >= ROUND_BUDGET) console.log(chalk.yellow(`Budget: ${last} of ${ROUND_BUDGET} rounds used — the next needs --override "<reason>".`));
+      console.log(`Budget: ${summary.budgetUsed} of ${ROUND_BUDGET} rounds used in the current loop${summary.budgetUsed >= ROUND_BUDGET ? ' — the next needs --override "<reason>"' : ''}.`);
     }
     console.log('');
   });

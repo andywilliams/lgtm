@@ -75,6 +75,13 @@ const REVIEW_COLUMNS: [string, string][] = [
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
 export const ROUND_BUDGET = 8;
+/**
+ * What ends a loop: a gap of this many days between rounds. PR numbers are never
+ * reused, but branch names are and PRs reopen months later — rounds after the last
+ * gap are "the loop" for scope, budget and the stopping rule. Dismissals never age
+ * out: they are decisions about the code, not about the loop.
+ */
+export const LOOP_GAP_DAYS = 7;
 /** Consecutive rounds without a BUG/SECURITY finding after which the tool says stop. */
 export const CLEAN_ROUNDS_TO_STOP = 2;
 
@@ -151,13 +158,10 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
   // A PR loop continues the branch's local loop: its scope and dismissals carry over.
   // The PR's own rounds win where both have spoken.
   const keys = roundKey.startsWith('pr:') && branch ? [roundKey, `local:${branch}`] : [roundKey];
-  let scopeRow: { scope: string } | undefined;
-  for (const k of keys) {
-    scopeRow = db.prepare(
-      'SELECT scope FROM reviews WHERE repo = ? AND round_key = ? AND scope IS NOT NULL ORDER BY round DESC LIMIT 1'
-    ).get(repo, k) as { scope: string } | undefined;
-    if (scopeRow) break;
-  }
+  // Scope comes from the current run only — a loop restarted after a gap states its own.
+  const run = currentRun(db, repo, keys);
+  const scoped = [...run].reverse().find((r) => r.scope);
+  const scopeRow = scoped ? { scope: scoped.scope as string } : undefined;
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
     `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' ORDER BY id`
@@ -197,6 +201,41 @@ export function dismissFindings(ids: number[], reason: string): { dismissed: num
   tx();
   db.close();
   return out;
+}
+
+interface RunRow {
+  id: number;
+  round_key: string;
+  round: number;
+  reviewed_at: string;
+  harshness: string | null;
+  cost_usd: number | null;
+  prompt_tokens: number | null;
+  diff_sha: string | null;
+  recovered: number | null;
+  scope: string | null;
+}
+
+/** Every round under the keys, oldest first. */
+function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
+  const marks = keys.map(() => '?').join(', ');
+  return db.prepare(
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+  ).all(repo, ...keys) as RunRow[];
+}
+
+/** The rounds after the last LOOP_GAP_DAYS gap — the loop as it currently stands. */
+export function runOf<T extends { reviewed_at: string }>(rows: T[], gapDays = LOOP_GAP_DAYS): T[] {
+  const gapMs = gapDays * 86_400_000;
+  let start = 0;
+  for (let i = 1; i < rows.length; i++) {
+    if (Date.parse(rows[i].reviewed_at) - Date.parse(rows[i - 1].reviewed_at) > gapMs) start = i;
+  }
+  return rows.slice(start);
+}
+
+function currentRun(db: Database.Database, repo: string, keys: string[]): RunRow[] {
+  return runOf(roundsFor(db, repo, keys));
 }
 
 /** The round ordinal the next review under this key will get (1 for the first). */
@@ -436,10 +475,13 @@ export interface LoopSummary {
   /** Round of the most recent BUG or SECURITY finding, or null if none ever. */
   lastBugRound: number | null;
   /**
-   * Consecutive trailing rounds (of the requested key) that found no BUG/SECURITY AND
-   * could judge — a salvaged round or one on an unchanged diff neither counts nor resets.
+   * Consecutive trailing rounds of the current run — the branch's local rounds and the
+   * PR's together — that found no BUG/SECURITY AND could judge; a salvaged round or one
+   * on an unchanged diff neither counts nor resets.
    */
   cleanRounds: number;
+  /** Rounds in the current run (both keys) — what the budget is measured against. */
+  budgetUsed: number;
   totalCostUsd: number;
 }
 
@@ -456,9 +498,7 @@ export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
     if (b?.branch) keys.unshift(`local:${b.branch}`);
   }
   const marks = keys.map(() => '?').join(', ');
-  const reviews = db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at`
-  ).all(repo, ...keys) as { id: number; round_key: string; round: number; reviewed_at: string; harshness: string | null; cost_usd: number | null; prompt_tokens: number | null; diff_sha: string | null; recovered: number | null }[];
+  const reviews = roundsFor(db, repo, keys);
   const findings = db.prepare(
     `SELECT round_key, round, severity, disposition FROM findings WHERE repo = ? AND round_key IN (${marks})`
   ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null }[];
@@ -489,15 +529,16 @@ export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
     if (f.disposition) row[f.disposition] += 1;
     if (f.round_key === roundKey && (f.severity === 'BUG' || f.severity === 'SECURITY') && (lastBugRound === null || f.round > lastBugRound)) lastBugRound = f.round;
   }
-  // Clean rounds: walk the requested key's rounds backwards from the latest; a round
-  // with a BUG/SECURITY ends the run; a round that could not judge is skipped.
-  const own = reviews.filter((r) => r.round_key === roundKey);
+  // The loop as it stands: the current run across both keys. Clean rounds walk it
+  // backwards from the latest; a BUG/SECURITY ends the count; a round that could not
+  // judge (salvaged, or the same diff as the round before) is skipped, not counted.
+  const run = runOf(reviews);
   let cleanRounds = 0;
-  for (let i = own.length - 1; i >= 0; i--) {
-    const r = own[i];
+  for (let i = run.length - 1; i >= 0; i--) {
+    const r = run[i];
     const row = byRound.get(`${r.round_key}#${r.round}`)!;
     if (row.bySeverity.BUG > 0 || row.bySeverity.SECURITY > 0) break;
-    const prevSha = i > 0 ? own[i - 1].diff_sha : null;
+    const prevSha = i > 0 ? run[i - 1].diff_sha : null;
     const couldJudge = !r.recovered && !(r.diff_sha && prevSha && r.diff_sha === prevSha);
     if (couldJudge) cleanRounds += 1;
   }
@@ -506,6 +547,7 @@ export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
     rounds,
     lastBugRound,
     cleanRounds,
+    budgetUsed: run.length,
     totalCostUsd: rounds.reduce((s, r) => s + (r.costUsd ?? 0), 0),
   };
 }
