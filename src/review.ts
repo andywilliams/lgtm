@@ -42,6 +42,30 @@ Focus on things that are likely to cause problems.`,
 Be thorough but constructive. Every comment should be actionable.`,
 };
 
+/** The shape every review reply must have — enforced by the CLI via --json-schema. */
+export const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    comments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          file: { type: 'string' },
+          line: { type: 'integer' },
+          severity: { type: 'string', enum: ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'] },
+          title: { type: 'string' },
+          body: { type: 'string' },
+          suggestion: { type: 'string' },
+        },
+        required: ['file', 'line', 'severity', 'title', 'body'],
+      },
+    },
+  },
+  required: ['summary', 'comments'],
+} as const;
+
 const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
 
 IMPORTANT RULES:
@@ -74,7 +98,7 @@ export async function reviewPR(
   usageContext?: string,
   expandedContext?: string,
   handbookContext?: string,
-  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean }
+  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean }
 ): Promise<ReviewResult> {
   // Build file context section if provided
   let fileContextSection = '';
@@ -190,7 +214,10 @@ If no issues found, respond with:
 
   const fullPrompt = `${SYSTEM_PROMPT}\n\n${userPrompt}`;
 
-  const output = runAIPrompt(fullPrompt, ai, 'review');
+  // The schema is a retry tool, not a default: measured, it adds a second CLI turn that
+  // misses the prompt cache (2.3× the cost of a small call), so it is used only when a
+  // plain reply failed to parse.
+  const output = runAIPrompt(fullPrompt, ai, 'review', { schema: extra?.enforceSchema ? REVIEW_SCHEMA : undefined });
   return parseAIResponse(output);
 }
 

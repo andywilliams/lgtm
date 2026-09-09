@@ -189,12 +189,15 @@ Use `--ai <provider>` to force a specific backend, or let LGTM auto-detect.
 
 Every model call runs `claude --print` as a **stripped session**: no MCP servers, no settings or `CLAUDE.md` from the working directory, no saved transcript, JSON output. That removes roughly 10k tokens of chat-environment boilerplate from every review and returns the billed usage, which lgtm records per review (`~/.lgtm/reviews.db`: `prompt_tokens`, `output_tokens`, `cost_usd`, `model_id`) and prints in agent mode under `context.usage`. `lgtm report` sums it per month.
 
+`cost_usd` is the CLI's `total_cost_usd`: what the call would cost at API list price. On a subscription plan it is a comparison metric (and a proxy for the plan's usage limits), not a bill.
+
 Because settings are not loaded, lgtm pins the model and effort itself:
 
 | variable | default | purpose |
 |---|---|---|
 | `LGTM_MODEL` | your `~/.claude/settings.json` `model` | model id to review with |
 | `LGTM_EFFORT` | your settings' effort for that model | `low`/`medium`/`high`/`xhigh`/`max` |
+| `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 
@@ -216,6 +219,7 @@ Agent-mode output carries the same under `loop`: `round`, `previous` (what becam
 
 - **Scope is inherited.** `--scope` is required on the first agent-mode round of a loop and remembered; later rounds inherit it unless you pass a new one.
 - **Dismissals are injected.** Every finding in agent output carries an `id`. `lgtm dismiss <id> [<id>…] --reason "<why>"` settles it, and every later round hands the reviewer that dismissal automatically — no `--decided` file to maintain (the flag still works, and merges).
+- **Late chill rounds run on a cheaper model.** Round 4 or later at `-H chill` — "is it safe now?" of a settled delta — runs on `LGTM_LATE_MODEL` (default `claude-sonnet-5`, 5× cheaper per input token than the full model) **unless** a BUG/SECURITY finding from an earlier round is still unverified (the fix is verified on the full model) or the diff changed by more than 50 lines since the last round. Round 1 and any non-chill round always use the full model. On a late round with nothing unverified, harshness drops to `chill` by itself unless you pass `-H`. `--model <id>` overrides everything; each round prints `🎛 model: … — <reason>` and the log records the model and the reason per row. A reply that is not valid JSON is retried with the reply schema enforced (`--json-schema`), then on the full model if the policy had picked the cheaper one; every attempt that produced no review is logged as a failed round.
 - **There is a round budget.** After 8 rounds on one PR or branch the next review is refused until you pass `--override "<why this loop must continue>"`; the reason is recorded on the round. `lgtm rounds <pr>` shows where you are.
 
 ## Full Context Mode

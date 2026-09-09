@@ -20,9 +20,10 @@ import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } fr
 import { expandContext } from './contextExpander.js';
 import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice } from './db.js';
 import { createHash } from 'node:crypto';
-import { takeUsage, promptTokens, type AIUsage } from './ai.js';
+import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
+import { reviewWithRecovery } from './recovery.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
+import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -101,6 +102,7 @@ program.addHelpText(
     'CLAUDE.md from the cwd, no saved transcript) and record the billed usage per review:\n' +
     '  LGTM_MODEL                    model id to review with (default: your ~/.claude/settings.json model)\n' +
     '  LGTM_EFFORT                   low|medium|high|xhigh|max (default: your settings effort for that model)\n' +
+    '  LGTM_LATE_MODEL               model for late (round 4+) chill review rounds (default claude-sonnet-5; "off" = always the full model)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -114,6 +116,7 @@ program
   .option('--scope <text>', 'What this change is meant to do — out-of-scope quality issues become SUGGESTION follow-ups (genuine bugs/security are still flagged)')
   .option('--decided <file>', 'JSON file of previously-dismissed findings ({file?,line?,title,reason}[]) the reviewer must not re-raise (findings dismissed with `lgtm dismiss` are injected automatically)')
   .option('--override <reason>', `Run a round past the ${ROUND_BUDGET}-round budget; the reason is recorded with the round`)
+  .option('--model <id>', 'Model to review with (default: your settings model; late chill rounds use LGTM_LATE_MODEL, claude-sonnet-5, unless set to off)')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -127,9 +130,11 @@ program
   .option('--no-charter', 'Skip the ARCHITECTURE.md charter conformance context (on by default when the repo has one)')
   .option('--no-standards', 'Skip the STANDARDS.md engineering-standards check (on by default when the repo has one)')
   .addOption(new Option('--context', 'deprecated alias for --related-files').default(false).hideHelp())
-  .action(async (prNumberStr: string | undefined, options) => {
+  .action(async (prNumberStr: string | undefined, options, command) => {
     const agent = options.agent;
     const local = options.local;
+    // Whether -H was given: a late round of a settled loop drops to chill by itself otherwise.
+    const harshnessExplicit = command.getOptionValueSource('harshness') !== 'default';
     // Agent mode is built on top of auto mode: same suppressed-output + JSON-to-stdout
     // machinery, but read-only and with a richer findings-focused payload.
     const auto = options.auto || agent;
@@ -173,6 +178,7 @@ program
     const ai = resolveProvider(options.ai, exitWithError);
 
     const batch = auto || options.batch;
+    if (options.model && !isModelId(options.model)) exitWithError(`--model ${JSON.stringify(options.model)} is not a model id`);
 
     // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
     // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
@@ -243,6 +249,9 @@ program
         decided,
         overrideReason,
         pr: memory.pr,
+        explicitModel: options.model,
+        harshnessExplicit,
+        policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
       });
@@ -289,6 +298,15 @@ interface RunOptions {
   overrideReason?: string;
   /** PR details already fetched by the pre-flight, so runReview need not fetch them again. */
   pr?: PRDetails;
+  /** `--model`, verbatim. */
+  explicitModel?: string;
+  /** False when -H was not given, so the round policy may lower it on a late, settled round. */
+  harshnessExplicit?: boolean;
+  /**
+   * What the round policy needs from the log; absent when the log was unavailable.
+   * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
+   */
+  policy?: { loopRound: number; openBugs: number; lastDiffLines: number | null };
   charterEnabled: boolean;
   standardsEnabled: boolean;
 }
@@ -309,7 +327,7 @@ function applyLoopMemory(opts: {
   decided?: DecidedFinding[];
   overrideReason?: string;
   exitWithError: (message: string) => never;
-}): { scope?: string; decided?: DecidedFinding[]; pr?: PRDetails } {
+}): { scope?: string; decided?: DecidedFinding[]; pr?: PRDetails; policy?: RunOptions['policy'] } {
   const { repo, local, prNumber, agent, overrideReason, exitWithError } = opts;
   let { scope, decided } = opts;
   let pr: PRDetails | undefined;
@@ -351,13 +369,23 @@ function applyLoopMemory(opts: {
   // The budget counts the whole loop — the branch's local rounds and the PR's — since
   // its last 7-day gap; a PR round is not a fresh start after eight local ones.
   if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
-    const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
+    const advice = stopAdvice(summary.budgetUsed, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
     exitWithError(
       `This would be round ${summary.budgetUsed + 1} of the loop behind ${roundKey} (${summary.budgetUsed} used of the ${ROUND_BUDGET}-round budget; ${advice.reason}). ` +
         `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
     );
   }
-  return { scope, decided, pr };
+  return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines } };
+}
+
+/** Added + removed lines in a unified diff — the size the round policy compares between rounds. */
+function countDiffLines(diff: string): number {
+  let n = 0;
+  for (const line of diff.split('\n')) {
+    // File headers are `+++ a/…` / `--- b/…` (with a space); a removed `-- comment` or an added `++i;` is a real line.
+    if ((line.startsWith('+') && !line.startsWith('+++ ')) || (line.startsWith('-') && !line.startsWith('--- '))) n++;
+  }
+  return n;
 }
 
 /**
@@ -488,6 +516,8 @@ interface LoopState {
   budget: { limit: number; overrideReason: string | null };
   /** Ids of this round's findings, in output order — `lgtm dismiss <id> --reason …` settles one. */
   findingIds: number[];
+  /** Which model this round ran on and why (`null` model = the operator's default, the full model). */
+  model: { id: string | null; reason: string } | null;
 }
 
 /**
@@ -515,8 +545,12 @@ function recordReviewMetrics(opts: {
   branch?: string;
   scope?: string;
   overrideReason?: string;
+  diffLines?: number;
+  modelChoice?: RoundModelChoice;
+  /** Set when the round produced no review — the error text. The row is logged; nothing is judged. */
+  failed?: string;
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
@@ -548,12 +582,16 @@ function recordReviewMetrics(opts: {
       scope,
       overrideReason,
       recovered,
+      diffLines,
+      modelReason: modelChoice && ai === 'claude' ? modelChoice.reason : undefined,
+      failed: Boolean(failed),
     });
     const round = allocated ?? 1;
+    if (failed) return { tokenEstimate, usage, loop: null };
     const findingIds = logFindings(reviewId, repoName, roundKey, round, comments);
     // The log decides whether this round can judge earlier ones (round 1, salvaged
     // output, unchanged code) — null means it could not.
-    const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered });
+    const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered, branch: local ? undefined : branch });
     const summary = getLoopSummary(repoName, roundKey, branch);
     loop = {
       mode,
@@ -565,6 +603,7 @@ function recordReviewMetrics(opts: {
       advice: stopAdvice(round, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty),
       budget: { limit: ROUND_BUDGET, overrideReason: overrideReason ?? null },
       findingIds,
+      model: modelChoice && ai === 'claude' ? { id: modelChoice.model ?? null, reason: modelChoice.reason } : null,
     };
   } catch (e) {
     // Metrics logging is non-critical — don't fail the review.
@@ -574,7 +613,15 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, policy, charterEnabled, standardsEnabled } = options;
+  let harshness = options.harshness;
+  // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
+  // asking "is it safe now?", which is chill's question — unless -H said otherwise.
+  if (!harshnessExplicit && policy && policy.loopRound >= LATE_ROUND && policy.openBugs === 0 && harshness !== 'chill') {
+    harshness = 'chill';
+    const line = `↓  harshness: chill — round ${policy.loopRound} of the loop with no BUG/SECURITY open (pass -H to override)`;
+    if (auto) console.error(chalk.gray(line)); else console.log(chalk.gray(line));
+  }
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -713,6 +760,25 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.blue(`\n📏 Loaded engineering standards (STANDARDS.md check enabled)`));
   }
 
+  // Which model this round runs on: --model, else the round policy (full model for
+  // every first look; the cheaper model only on a late chill round of a settled diff).
+  const diffLines = countDiffLines(diff);
+  // The policy's round is the LOOP's round (local + PR rounds in the current run), not
+  // the key's ordinal — a PR opened after five local rounds is on round six.
+  const initialChoice: RoundModelChoice = pickRoundModel({
+    explicit: explicitModel,
+    provider: ai,
+    round: policy?.loopRound ?? 1,
+    harshness,
+    openBugs: policy?.openBugs ?? 0,
+    diffLines,
+    lastDiffLines: policy?.lastDiffLines ?? null,
+  });
+  let choice: RoundModelChoice = initialChoice;
+  // Said even for codex, so `--model` with codex is visibly not applied rather than silently ignored.
+  const modelLine = `🎛  model: ${choice.model ?? (ai === 'claude' ? 'default (full)' : ai)} — ${choice.reason}`;
+  if (auto) console.error(chalk.gray(modelLine)); else log(chalk.gray(modelLine));
+
   // Review with AI
   const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
   const contextModes = [harshness + ' mode'];
@@ -724,7 +790,20 @@ async function runReview(options: RunOptions): Promise<void> {
   if (standardsContextStr) contextModes.push('standards');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const result = await reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr });
+  // The model is an argument of each attempt, not hidden state the ladder has to reset.
+  const review = (attempt: { enforceSchema?: boolean; model?: string } = {}) => {
+    if (ai === 'claude') setModelOverride(attempt.model);
+    return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema });
+  };
+  // The failed attempt's model choice is passed in, not closed over: the recovery ladder
+  // changes the choice between attempts and the row must name the model that actually failed.
+  const logFailedRound = (why: string, attempted: RoundModelChoice) => recordReviewMetrics({
+    repo, prNumber, diff, expanded, relatedFiles, ai, local,
+    filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
+    branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: attempted, failed: why,
+  });
+  let result: Awaited<ReturnType<typeof review>>;
+  ({ result, choice } = await reviewWithRecovery({ review, ai, choice, initialChoice, logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
 
   log(chalk.gray(`\n${result.summary}\n`));
 
@@ -734,7 +813,7 @@ async function runReview(options: RunOptions): Promise<void> {
   const metrics = recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
-    branch: local ? undefined : pr.headRef, scope, overrideReason,
+    branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice,
   });
   // The stopping rule, said out loud every round — on stderr in agent mode so the
   // stdout JSON contract is untouched, but a driving agent still sees it.
@@ -1442,7 +1521,7 @@ program
     if (stats.measured > 0) {
       console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
       console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);
-      console.log(`Cost (logged reviews):  $${stats.costUsd.toFixed(2)}`);
+      console.log(`API-equiv. cost:        $${stats.costUsd.toFixed(2)}  (logged reviews; the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
     }
     console.log('');
   });
@@ -1513,22 +1592,23 @@ program
     }
     const mixed = summary.rounds.some((r) => r.key !== key);
     console.log(chalk.bold(`\nReview rounds — ${key}${mixed ? ' (with the branch\'s local rounds first)' : ''}\n`));
-    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  fixed dism carr supp    cost`);
+    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  fixed dism carr supp    cost  model`);
     for (const r of summary.rounds) {
       const when = r.reviewedAt.slice(0, 16).replace('T', ' ');
       const s = r.bySeverity;
       const cost = r.costUsd === null ? '      —' : `$${r.costUsd.toFixed(2)}`.padStart(7);
       const loopCol = mixed ? `${(r.key.startsWith('pr:') ? 'pr' : 'local').padEnd(6)} ` : '';
+      const modelCol = `${r.model ?? '—'}${r.failed ? '  (failed — no review)' : ''}`;
       console.log(
         `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
           `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
-          `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}`
+          `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${modelCol}`
       );
     }
     const own = summary.rounds.filter((r) => r.key === key);
     const last = own.length > 0 ? own[own.length - 1].round : 0;
     console.log('');
-    console.log(`Measured cost so far: $${summary.totalCostUsd.toFixed(2)}`);
+    console.log(`API-equivalent cost so far: $${summary.totalCostUsd.toFixed(2)}  (the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
     if (last > 0) {
       const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
       console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);
@@ -1850,6 +1930,7 @@ arch
   .option('--dry-run', 'Show the review without posting', false)
   .option('--full-context', 'Include full contents of changed files (always on in agent mode)', false)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
+  .option('--model <id>', 'Model to review with (default: your settings model)')
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
     function exitWithError(message: string): never {
@@ -1859,6 +1940,9 @@ arch
         console.error(chalk.red(message));
       }
       process.exit(1);
+    }
+    if (options.model) {
+      try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
     }
 
     const local = options.local;
@@ -1878,6 +1962,7 @@ arch
       }
     }
     const ai = resolveProvider(options.ai, exitWithError);
+    if (options.model && ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
 
     try {
       await runArchReview({
@@ -1979,6 +2064,7 @@ standards
   .option('--skip-lint-gate', 'Review even when structural lint findings are outstanding', false)
   .option('--no-lint', 'Skip the ESLint pass entirely (no gate, no suppression)')
   .option('--max-files <n>', 'Cap files reviewed when the target is a directory', '5')
+  .option('--model <id>', 'Model to review with (default: your settings model)')
   .action(async (target: string, options) => {
     const agent = options.agent;
     function exitWithError(message: string): never {
@@ -1986,11 +2072,15 @@ standards
       else console.error(chalk.red(message));
       process.exit(1);
     }
+    if (options.model) {
+      try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
+    }
     // parseInt('5abc') is 5 — reject malformed input rather than guessing intent.
     if (!/^\d+$/.test(String(options.maxFiles).trim())) exitWithError('--max-files must be a positive integer');
     const maxFiles = parseInt(options.maxFiles, 10);
     if (maxFiles < 1) exitWithError('--max-files must be a positive integer');
     const ai = resolveProvider(options.ai, exitWithError);
+    if (options.model && ai === 'codex') console.error(chalk.yellow('⚠  --model applies to claude only; codex chooses its own model.'));
     try {
       await runStandardsReview({ target, ai, agent, skipLintGate: options.skipLintGate, noLint: options.lint === false, maxFiles });
     } catch (error: any) {
