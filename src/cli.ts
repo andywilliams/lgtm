@@ -316,6 +316,7 @@ function applyLoopMemory(opts: {
   let repoName: string;
   let roundKey: string;
   let ctx: ReturnType<typeof loopContext>;
+  let summary: ReturnType<typeof getLoopSummary>;
   try {
     ({ repoName, roundKey } = loopIdentity(repo, local, prNumber));
     // For a PR, the branch's --local rounds are the first half of this loop. The
@@ -323,7 +324,10 @@ function applyLoopMemory(opts: {
     if (!local) {
       try { pr = getPRDetails(prNumber, repo); } catch { /* memory then covers the PR key only */ }
     }
+    // Every read of the log happens here, inside the guard: a busy or unreadable
+    // store degrades to a stateless round, never a failed one.
     ctx = loopContext(repoName, roundKey, pr?.headRef);
+    summary = getLoopSummary(repoName, roundKey, pr?.headRef);
   } catch (e: any) {
     console.error(chalk.yellow(`⚠  loop memory unavailable (${e?.message ?? e}); running without it`));
     return { scope, decided, pr };
@@ -346,7 +350,6 @@ function applyLoopMemory(opts: {
   }
   // The budget counts the whole loop — the branch's local rounds and the PR's — since
   // its last 7-day gap; a PR round is not a fresh start after eight local ones.
-  const summary = getLoopSummary(repoName, roundKey, pr?.headRef);
   if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
     const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds);
     exitWithError(
