@@ -210,7 +210,13 @@ lgtm rounds --local     # the same for the current branch's working-tree reviews
 lgtm rounds 86 --json
 ```
 
-Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound` and `roundsSinceBug` — the inputs to a stopping rule such as *"no BUG/SECURITY for two rounds ⇒ stop"*.
+Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
+
+### The loop remembers, so you don't
+
+- **Scope is inherited.** `--scope` is required on the first agent-mode round of a loop and remembered; later rounds inherit it unless you pass a new one.
+- **Dismissals are injected.** Every finding in agent output carries an `id`. `lgtm dismiss <id> [<id>…] --reason "<why>"` settles it, and every later round hands the reviewer that dismissal automatically — no `--decided` file to maintain (the flag still works, and merges).
+- **There is a round budget.** After 8 rounds on one PR or branch the next review is refused until you pass `--override "<why this loop must continue>"`; the reason is recorded on the round. `lgtm rounds <pr>` shows where you are.
 
 ## Full Context Mode
 

@@ -38,6 +38,9 @@ export interface ReviewLog {
   /** sha1 of the diff text — lets two rounds on identical code be told apart from a changed one. */
   diffSha?: string;
   branch?: string;
+  scope?: string;
+  overrideReason?: string;
+  recovered?: boolean;
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -61,7 +64,26 @@ const REVIEW_COLUMNS: [string, string][] = [
   // The branch under review: the checkout's for --local, the PR's head for PR mode —
   // the one identity a pre-PR loop and its PR share.
   ['branch', 'TEXT'],
+  // The --scope statement, kept so later rounds inherit it instead of the agent
+  // having to restate (or forget) it; and the reason a round past the budget ran.
+  ['scope', 'TEXT'],
+  ['override_reason', 'TEXT'],
+  // 1 when the model's JSON was salvaged — such a round judges nothing and is not a
+  // "clean" round for the stopping rule either.
+  ['recovered', 'INTEGER'],
 ];
+
+/** Rounds a loop may run before the tool asks for a reason to continue. */
+export const ROUND_BUDGET = 8;
+/**
+ * What ends a loop: a gap of this many days between rounds. PR numbers are never
+ * reused, but branch names are and PRs reopen months later — rounds after the last
+ * gap are "the loop" for scope, budget and the stopping rule. Dismissals never age
+ * out: they are decisions about the code, not about the loop.
+ */
+export const LOOP_GAP_DAYS = 7;
+/** Consecutive rounds without a BUG/SECURITY finding after which the tool says stop. */
+export const CLEAN_ROUNDS_TO_STOP = 2;
 
 /**
  * How a finding from an earlier round fared once a later round ran (written onto the
@@ -124,6 +146,104 @@ export function initDb(): Database.Database {
   return db;
 }
 
+/**
+ * What the loop already knows before a round runs: the ordinal it will get, the scope
+ * the last round stated, and every finding dismissed so far (with its reason) — so the
+ * caller can inherit the scope and hand the reviewer its own dismissals without a file.
+ * The ordinal is a preview; the insert allocates the real one.
+ */
+export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; scopeFrom: string | null; dismissed: DecidedFinding[] } {
+  const db = initDb();
+  const nextRound = nextRoundIn(db, repo, roundKey);
+  // A PR loop continues the branch's local loop: its scope and dismissals carry over.
+  // The PR's own rounds win where both have spoken.
+  const keys = roundKey.startsWith('pr:') && branch ? [roundKey, `local:${branch}`] : [roundKey];
+  // Scope comes from the current run only — a loop restarted after a gap states its own.
+  const run = currentRun(db, repo, keys);
+  const scoped = [...run].reverse().find((r) => r.scope);
+  const marks = keys.map(() => '?').join(', ');
+  const dismissedRows = db.prepare(
+    `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' ORDER BY id`
+  ).all(repo, ...keys) as { file: string; line: number; title: string; dismissed_reason: string | null }[];
+  db.close();
+  const seen = new Set<string>();
+  const dismissed: DecidedFinding[] = [];
+  for (const r of dismissedRows) {
+    const k = `${r.file}#${normTitle(r.title)}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    dismissed.push({ file: r.file, line: r.line, title: r.title, reason: r.dismissed_reason ?? 'dismissed in an earlier round' });
+  }
+  return {
+    nextRound,
+    lastScope: scoped?.scope ?? null,
+    // Where the scope came from: "pr:34 round 2" or "local:feat/x round 5" — so the
+    // inherit message can say so instead of "round 0" on a PR's first round.
+    scopeFrom: scoped ? `${scoped.round_key} round ${scoped.round}` : null,
+    dismissed,
+  };
+}
+
+/**
+ * Dismiss open findings by id, now, with a reason — the operator's (or agent's) verdict,
+ * recorded where the next round will read it. Returns the ids actually changed; an id
+ * that is unknown or already disposed is reported back rather than silently skipped.
+ */
+export function dismissFindings(ids: number[], reason: string): { dismissed: number[]; skipped: number[] } {
+  const db = initDb();
+  const sel = db.prepare('SELECT id, repo, round_key FROM findings WHERE id = ? AND disposition IS NULL');
+  const upd = db.prepare(
+    "UPDATE findings SET disposition = 'dismissed', disposed_at_round = (SELECT COALESCE(MAX(round), 0) FROM reviews WHERE repo = ? AND round_key = ?), dismissed_reason = ? WHERE id = ?"
+  );
+  const out = { dismissed: [] as number[], skipped: [] as number[] };
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      const row = sel.get(id) as { id: number; repo: string; round_key: string } | undefined;
+      if (!row) { out.skipped.push(id); continue; }
+      upd.run(row.repo, row.round_key, reason, id);
+      out.dismissed.push(id);
+    }
+  });
+  tx();
+  db.close();
+  return out;
+}
+
+interface RunRow {
+  id: number;
+  round_key: string;
+  round: number;
+  reviewed_at: string;
+  harshness: string | null;
+  cost_usd: number | null;
+  prompt_tokens: number | null;
+  diff_sha: string | null;
+  recovered: number | null;
+  scope: string | null;
+}
+
+/** Every round under the keys, oldest first. */
+function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
+  const marks = keys.map(() => '?').join(', ');
+  return db.prepare(
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+  ).all(repo, ...keys) as RunRow[];
+}
+
+/** The rounds after the last LOOP_GAP_DAYS gap — the loop as it currently stands. */
+export function runOf<T extends { reviewed_at: string }>(rows: T[], gapDays = LOOP_GAP_DAYS): T[] {
+  const gapMs = gapDays * 86_400_000;
+  let start = 0;
+  for (let i = 1; i < rows.length; i++) {
+    if (Date.parse(rows[i].reviewed_at) - Date.parse(rows[i - 1].reviewed_at) > gapMs) start = i;
+  }
+  return rows.slice(start);
+}
+
+function currentRun(db: Database.Database, repo: string, keys: string[]): RunRow[] {
+  return runOf(roundsFor(db, repo, keys));
+}
+
 /** The round ordinal the next review under this key will get (1 for the first). */
 function nextRoundIn(db: Database.Database, repo: string, roundKey: string): number {
   const row = db.prepare('SELECT MAX(round) AS r FROM reviews WHERE repo = ? AND round_key = ?').get(repo, roundKey) as { r: number | null };
@@ -146,9 +266,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -177,7 +297,10 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     round,
     data.harshness ?? null,
     data.diffSha ?? null,
-    data.branch ?? null
+    data.branch ?? null,
+    data.scope ?? null,
+    data.overrideReason ?? null,
+    data.recovered ? 1 : 0
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -207,19 +330,55 @@ export function fingerprintOf(c: Pick<ReviewComment, 'file' | 'title'>): string 
 const normTitle = (t: string) =>
   t.toLowerCase().replace(/^\((?:out of scope|charter|standard [^)]*|ticket)\)\s*/, '').replace(/[^a-z0-9]+/g, ' ').trim();
 
-/** Store this round's findings against its review row. */
-export function logFindings(reviewId: number, repo: string, roundKey: string, round: number, comments: ReviewComment[]): void {
-  if (comments.length === 0) return;
+/** Store this round's findings against its review row; returns their ids, in input order. */
+export function logFindings(reviewId: number, repo: string, roundKey: string, round: number, comments: ReviewComment[]): number[] {
+  if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
     INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const tx = db.transaction((rows: ReviewComment[]) => {
-    for (const c of rows) ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c));
-  });
-  tx(comments);
+  const tx = db.transaction((rows: ReviewComment[]) =>
+    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c)).lastInsertRowid))
+  );
+  const ids = tx(comments);
   db.close();
+  return ids;
+}
+
+export interface StopAdvice {
+  /** True when the loop's own data says to stop: CLEAN_ROUNDS_TO_STOP consecutive rounds without BUG/SECURITY. */
+  stop: boolean;
+  reason: string;
+}
+
+/**
+ * The stopping rule, from data. Stop when CLEAN_ROUNDS_TO_STOP consecutive JUDGING
+ * rounds found no BUG/SECURITY (LoopSummary.cleanRounds), OR when the latest judging
+ * round raised nothing at all — there is nothing to fix, so nothing a further round
+ * could verify (and a re-run on the same diff would not count as a round anyway).
+ * A re-run on the same diff or a salvaged round is never a clean round.
+ */
+export function stopAdvice(round: number, lastBugRound: number | null, clean: number, lastRoundEmpty = false): StopAdvice {
+  if (lastRoundEmpty && clean >= 1) {
+    return { stop: true, reason: `round ${round} found nothing — stop; there is nothing left to verify` };
+  }
+  if (clean >= CLEAN_ROUNDS_TO_STOP) {
+    return {
+      stop: true,
+      reason: lastBugRound === null
+        ? `round ${round}, no BUG/SECURITY in any round — stop; file what is left`
+        : `round ${round}, last BUG/SECURITY round ${lastBugRound} — ${clean} clean rounds, stop; file what is left`,
+    };
+  }
+  const need = CLEAN_ROUNDS_TO_STOP - clean;
+  const more = need === 1 ? 'one more clean round' : `${need} more clean rounds`;
+  return {
+    stop: false,
+    reason: lastBugRound === null
+      ? `round ${round}, no BUG/SECURITY yet (${clean} clean) — ${more} and stop`
+      : `round ${round}, last BUG/SECURITY round ${lastBugRound} (${clean} clean since) — fix, then ${more}`,
+  };
 }
 
 export interface DispositionSummary {
@@ -325,25 +484,39 @@ export interface LoopSummary {
   rounds: RoundRow[];
   /** Round of the most recent BUG or SECURITY finding, or null if none ever. */
   lastBugRound: number | null;
+  /**
+   * Consecutive trailing rounds of the current run — the branch's local rounds and the
+   * PR's together — that found no BUG/SECURITY AND could judge; a salvaged round or one
+   * on an unchanged diff neither counts nor resets.
+   */
+  cleanRounds: number;
+  /** Rounds in the current run (both keys) — what the budget is measured against. */
+  budgetUsed: number;
+  /** True when the latest round could judge and raised nothing at all — there is nothing left to verify. */
+  lastRoundEmpty: boolean;
   totalCostUsd: number;
 }
 
 const SEVERITIES: Severity[] = ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'];
 
-/** Everything the stopping rule needs, per repo + round key, from the log alone. */
-export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
+/**
+ * Everything the stopping rule needs, per repo + round key, from the log alone. Pass
+ * `branch` when it is known (a PR's head): before the PR's first round is logged no row
+ * carries it, and the branch's local rounds would otherwise be invisible to the budget.
+ */
+export function getLoopSummary(repo: string, roundKey: string, branch?: string): LoopSummary {
   const db = initDb();
   // A PR loop is the continuation of the branch's local loop: include those rounds
-  // first (their own key and numbering) when the PR rows name a branch.
+  // first (their own key and numbering) when the branch is known or a PR row names it.
   const keys = [roundKey];
   if (roundKey.startsWith('pr:')) {
-    const b = db.prepare('SELECT branch FROM reviews WHERE repo = ? AND round_key = ? AND branch IS NOT NULL LIMIT 1').get(repo, roundKey) as { branch: string } | undefined;
+    const b = branch
+      ? { branch }
+      : (db.prepare('SELECT branch FROM reviews WHERE repo = ? AND round_key = ? AND branch IS NOT NULL LIMIT 1').get(repo, roundKey) as { branch: string } | undefined);
     if (b?.branch) keys.unshift(`local:${b.branch}`);
   }
   const marks = keys.map(() => '?').join(', ');
-  const reviews = db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at`
-  ).all(repo, ...keys) as { id: number; round_key: string; round: number; reviewed_at: string; harshness: string | null; cost_usd: number | null; prompt_tokens: number | null }[];
+  const reviews = roundsFor(db, repo, keys);
   const findings = db.prepare(
     `SELECT round_key, round, severity, disposition FROM findings WHERE repo = ? AND round_key IN (${marks})`
   ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null }[];
@@ -374,10 +547,30 @@ export function getLoopSummary(repo: string, roundKey: string): LoopSummary {
     if (f.disposition) row[f.disposition] += 1;
     if (f.round_key === roundKey && (f.severity === 'BUG' || f.severity === 'SECURITY') && (lastBugRound === null || f.round > lastBugRound)) lastBugRound = f.round;
   }
+  // The loop as it stands: the current run across both keys. Clean rounds walk it
+  // backwards from the latest; a BUG/SECURITY ends the count; a round that could not
+  // judge (salvaged, or the same diff as the round before) is skipped, not counted.
+  const run = runOf(reviews);
+  const judging = (i: number) => {
+    const r = run[i];
+    const prevSha = i > 0 ? run[i - 1].diff_sha : null;
+    return !r.recovered && !(r.diff_sha && prevSha && r.diff_sha === prevSha);
+  };
+  let cleanRounds = 0;
+  for (let i = run.length - 1; i >= 0; i--) {
+    const row = byRound.get(`${run[i].round_key}#${run[i].round}`)!;
+    if (row.bySeverity.BUG > 0 || row.bySeverity.SECURITY > 0) break;
+    if (judging(i)) cleanRounds += 1;
+  }
+  const lastIdx = run.length - 1;
+  const lastRoundEmpty = lastIdx >= 0 && judging(lastIdx) && byRound.get(`${run[lastIdx].round_key}#${run[lastIdx].round}`)!.findings === 0;
   return {
     roundKey,
     rounds,
     lastBugRound,
+    cleanRounds,
+    budgetUsed: run.length,
+    lastRoundEmpty,
     totalCostUsd: rounds.reduce((s, r) => s + (r.costUsd ?? 0), 0),
   };
 }

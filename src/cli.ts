@@ -18,11 +18,11 @@ import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
-import { logReview, logFindings, disposePreviousRound, getLoopSummary, type DispositionSummary } from './db.js';
+import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice } from './db.js';
 import { createHash } from 'node:crypto';
 import { takeUsage, promptTokens, type AIUsage } from './ai.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility } from './types.js';
+import type { Harshness, ReviewComment, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -112,7 +112,8 @@ program
   .option('--local', 'Review local working-tree changes vs a base ref (no GitHub PR; never posts)', false)
   .option('--base <ref>', 'Base ref for --local mode (default: auto-detected default branch)')
   .option('--scope <text>', 'What this change is meant to do — out-of-scope quality issues become SUGGESTION follow-ups (genuine bugs/security are still flagged)')
-  .option('--decided <file>', 'JSON file of previously-dismissed findings ({file?,line?,title,reason}[]) the reviewer must not re-raise')
+  .option('--decided <file>', 'JSON file of previously-dismissed findings ({file?,line?,title,reason}[]) the reviewer must not re-raise (findings dismissed with `lgtm dismiss` are injected automatically)')
+  .option('--override <reason>', `Run a round past the ${ROUND_BUDGET}-round budget; the reason is recorded with the round`)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -217,6 +218,12 @@ program
       }
     }
 
+    // The loop's own memory, applied before any model call is paid for.
+    const memory = applyLoopMemory({ repo: options.repo, local, prNumber, agent, scope: options.scope, decided, overrideReason: options.override, exitWithError });
+    const scope = memory.scope;
+    decided = memory.decided;
+    const overrideReason: string | undefined = options.override;
+
     try {
       await runReview({
         prNumber,
@@ -232,8 +239,10 @@ program
         usageContext,
         relatedFiles,
         ai,
-        scope: options.scope,
+        scope,
         decided,
+        overrideReason,
+        pr: memory.pr,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
       });
@@ -277,8 +286,88 @@ interface RunOptions {
   ai: AIProvider;
   scope?: string;
   decided?: DecidedFinding[];
+  overrideReason?: string;
+  /** PR details already fetched by the pre-flight, so runReview need not fetch them again. */
+  pr?: PRDetails;
   charterEnabled: boolean;
   standardsEnabled: boolean;
+}
+
+/**
+ * The loop's memory, applied BEFORE any model call is paid for: inherit the scope the
+ * last round stated (required on an agent-mode loop's first scoped round), hand the
+ * reviewer every dismissal recorded so far, and refuse a round past the budget unless a
+ * reason is given (and recorded). The log must never block a review — if it cannot be
+ * read, the round runs stateless with a warning.
+ */
+function applyLoopMemory(opts: {
+  repo?: string;
+  local: boolean;
+  prNumber: number;
+  agent: boolean;
+  scope?: string;
+  decided?: DecidedFinding[];
+  overrideReason?: string;
+  exitWithError: (message: string) => never;
+}): { scope?: string; decided?: DecidedFinding[]; pr?: PRDetails } {
+  const { repo, local, prNumber, agent, overrideReason, exitWithError } = opts;
+  let { scope, decided } = opts;
+  let pr: PRDetails | undefined;
+  let repoName: string;
+  let roundKey: string;
+  let ctx: ReturnType<typeof loopContext>;
+  let summary: ReturnType<typeof getLoopSummary>;
+  try {
+    ({ repoName, roundKey } = loopIdentity(repo, local, prNumber));
+    // For a PR, the branch's --local rounds are the first half of this loop. The
+    // details fetched here are handed on so the review does not fetch them twice.
+    if (!local) {
+      try { pr = getPRDetails(prNumber, repo); } catch { /* memory then covers the PR key only */ }
+    }
+    // Every read of the log happens here, inside the guard: a busy or unreadable
+    // store degrades to a stateless round, never a failed one.
+    ctx = loopContext(repoName, roundKey, pr?.headRef);
+    summary = getLoopSummary(repoName, roundKey, pr?.headRef);
+  } catch (e: any) {
+    console.error(chalk.yellow(`⚠  loop memory unavailable (${e?.message ?? e}); running without it`));
+    return { scope, decided, pr };
+  }
+  if (!scope && ctx.lastScope) {
+    scope = ctx.lastScope;
+    console.error(chalk.gray(`↩  --scope inherited from ${ctx.scopeFrom}: "${scope.slice(0, 80)}${scope.length > 80 ? '…' : ''}"`));
+  }
+  if (agent && !scope) {
+    exitWithError(
+      `--scope is required in agent mode: no round of ${roundKey} has recorded one yet (this would be round ${ctx.nextRound}). ` +
+        'Say what this change is meant to do; later rounds inherit it.'
+    );
+  }
+  if (ctx.dismissed.length > 0) {
+    const have = new Set((decided ?? []).map((d) => `${d.file ?? '*'}#${d.title.toLowerCase()}`));
+    const extra = ctx.dismissed.filter((d) => !have.has(`${d.file}#${d.title.toLowerCase()}`));
+    decided = [...(decided ?? []), ...extra];
+    if (extra.length > 0) console.error(chalk.gray(`↩  ${extra.length} dismissal(s) from earlier rounds injected`));
+  }
+  // The budget counts the whole loop — the branch's local rounds and the PR's — since
+  // its last 7-day gap; a PR round is not a fresh start after eight local ones.
+  if (summary.budgetUsed >= ROUND_BUDGET && !overrideReason) {
+    const advice = stopAdvice(ctx.nextRound - 1, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
+    exitWithError(
+      `This would be round ${summary.budgetUsed + 1} of the loop behind ${roundKey} (${summary.budgetUsed} used of the ${ROUND_BUDGET}-round budget; ${advice.reason}). ` +
+        `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
+    );
+  }
+  return { scope, decided, pr };
+}
+
+/**
+ * One identity per loop: the repo (the --repo slug, else the checkout's slug, else its
+ * path) and the round key (`pr:<n>`, or `local:<branch>` for a working-tree review).
+ */
+function loopIdentity(repo: string | undefined, local: boolean, prNumber: number): { repoName: string; roundKey: string } {
+  const repoName = repo || getCurrentRepoSlug() || getRepoRoot();
+  const roundKey = local ? `local:${getCurrentBranch()}` : `pr:${prNumber}`;
+  return { repoName, roundKey };
 }
 
 function formatReviewCommentBody(comment: ReviewComment): string {
@@ -326,8 +415,9 @@ function formatAutoResult(options: {
   });
 }
 
-// A finding plus whether it duplicates a comment already on the PR.
-type AnnotatedComment = ReviewComment & { duplicate: boolean };
+// A finding plus whether it duplicates a comment already on the PR, and its id in the
+// review log (so `lgtm dismiss <id>` can settle it) when the log recorded it.
+type AnnotatedComment = ReviewComment & { duplicate: boolean; id?: number };
 
 /**
  * Agent-mode payload. Unlike formatAutoResult (which reports what was *posted*),
@@ -358,6 +448,7 @@ function formatAgentResult(options: {
     commentsFound: options.comments.length,
     duplicates,
     comments: options.comments.map(c => ({
+      id: c.id ?? null,
       file: c.file,
       line: c.line,
       severity: c.severity,
@@ -388,10 +479,15 @@ interface LoopState {
   mode: 'pr' | 'local';
   key: string;
   round: number;
-  /** What became of last round's findings; null on round 1, or when this round's list was salvaged (truncated) JSON. */
+  /** What became of earlier rounds' findings; null when this round could not judge (round 1, salvaged JSON, unchanged diff). */
   previous: DispositionSummary | null;
   lastBugRound: number | null;
   roundsSinceBug: number | null;
+  /** The stopping rule, from the log. */
+  advice: StopAdvice;
+  budget: { limit: number; overrideReason: string | null };
+  /** Ids of this round's findings, in output order — `lgtm dismiss <id> --reason …` settles one. */
+  findingIds: number[];
 }
 
 /**
@@ -417,8 +513,10 @@ function recordReviewMetrics(opts: {
   recovered?: boolean;
   /** The branch under review: the PR's head, or the checkout's for --local. */
   branch?: string;
+  scope?: string;
+  overrideReason?: string;
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
@@ -426,12 +524,9 @@ function recordReviewMetrics(opts: {
   const usage = takeUsage();
   let loop: LoopState | null = null;
   try {
-    // One identity per repo on the write side: the --repo slug, else the checkout's
-    // slug, else its path (a checkout with no GitHub remote). Rows logged before this
-    // used the path; `rounds` reads both spellings.
-    const repoName = repo || getCurrentRepoSlug() || getRepoRoot();
+    // Rows logged before the slug became the key used the path; `rounds` reads both.
+    const { repoName, roundKey } = loopIdentity(repo, Boolean(local), prNumber);
     const mode: 'pr' | 'local' = local ? 'local' : 'pr';
-    const roundKey = local ? `local:${getCurrentBranch()}` : `pr:${prNumber}`;
     const diffSha = createHash('sha1').update(diff).digest('hex');
     const { id: reviewId, round: allocated } = logReview({
       repo: repoName,
@@ -450,13 +545,16 @@ function recordReviewMetrics(opts: {
       harshness,
       diffSha,
       branch: branch || (local ? getCurrentBranch() : undefined),
+      scope,
+      overrideReason,
+      recovered,
     });
     const round = allocated ?? 1;
-    logFindings(reviewId, repoName, roundKey, round, comments);
+    const findingIds = logFindings(reviewId, repoName, roundKey, round, comments);
     // The log decides whether this round can judge earlier ones (round 1, salvaged
     // output, unchanged code) — null means it could not.
     const previous = disposePreviousRound(repoName, roundKey, round, comments, { decided, harshness, diffSha, recovered });
-    const summary = getLoopSummary(repoName, roundKey);
+    const summary = getLoopSummary(repoName, roundKey, branch);
     loop = {
       mode,
       key: roundKey,
@@ -464,6 +562,9 @@ function recordReviewMetrics(opts: {
       previous,
       lastBugRound: summary.lastBugRound,
       roundsSinceBug: summary.lastBugRound === null ? null : round - summary.lastBugRound,
+      advice: stopAdvice(round, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty),
+      budget: { limit: ROUND_BUDGET, overrideReason: overrideReason ?? null },
+      findingIds,
     };
   } catch (e) {
     // Metrics logging is non-critical — don't fail the review.
@@ -473,7 +574,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, harshness, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, charterEnabled, standardsEnabled } = options;
 
   // In auto mode, suppress decorative output — only JSON goes to stdout.
   // Note: these wrappers suppress our own output but cannot capture stderr from
@@ -487,7 +588,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   // Fetch details
   log(chalk.blue(`\n🔍 ${local ? `Analysing local changes (vs ${base})` : `Fetching PR #${prNumber}`}...`));
-  const pr = local ? getLocalDetails(base!) : getPRDetails(prNumber, repo);
+  const pr = local ? getLocalDetails(base!) : (options.pr ?? getPRDetails(prNumber, repo));
   log(chalk.white(`   "${pr.title}" by ${pr.author}`));
   log(chalk.gray(`   ${pr.changedFiles} files, +${pr.additions}/-${pr.deletions}`));
 
@@ -633,8 +734,16 @@ async function runReview(options: RunOptions): Promise<void> {
   const metrics = recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
-    branch: local ? undefined : pr.headRef,
+    branch: local ? undefined : pr.headRef, scope, overrideReason,
   });
+  // The stopping rule, said out loud every round — on stderr in agent mode so the
+  // stdout JSON contract is untouched, but a driving agent still sees it.
+  if (metrics.loop) {
+    const { advice, round } = metrics.loop;
+    const line = `${advice.stop ? '🛑 STOP' : '↻'}  ${advice.reason}${round > ROUND_BUDGET ? ` (past the ${ROUND_BUDGET}-round budget)` : ''}`;
+    if (auto) console.error(advice.stop ? chalk.yellow(line) : chalk.gray(line));
+    else log(advice.stop ? chalk.yellow(`\n${line}`) : chalk.gray(`\n${line}`));
+  }
 
   // Agent mode: read-only. Return EVERY finding (flagging duplicates of existing PR
   // comments) and never post. The agent decides what to do with the results.
@@ -649,9 +758,10 @@ async function runReview(options: RunOptions): Promise<void> {
         // If we can't fetch existing comments, return findings without duplicate flags.
       }
     }
-    const annotated: AnnotatedComment[] = result.comments.map((comment) => ({
+    const annotated: AnnotatedComment[] = result.comments.map((comment, i) => ({
       ...comment,
       duplicate: isDuplicateComment(comment, existingComments),
+      id: metrics.loop?.findingIds[i],
     }));
 
     console.log(formatAgentResult({
@@ -1337,6 +1447,31 @@ program
     console.log('');
   });
 
+// Dismiss: settle findings by id with a reason. The next round injects every
+// dismissal automatically, so nothing has to be carried in a --decided file.
+program
+  .command('dismiss <finding-id...>')
+  .description('Dismiss open findings by id (from agent-mode output / lgtm rounds) — the next round will not re-raise them')
+  .requiredOption('--reason <text>', 'Why this finding does not apply — recorded, and shown to the reviewer next round')
+  .option('--json', 'Structured JSON to stdout', false)
+  .action((idStrs: string[], options: any) => {
+    // parseInt('12abc') is 12 — a mistyped id must not dismiss a different finding.
+    const ids = idStrs.filter((x) => /^[1-9]\d*$/.test(x)).map((x) => parseInt(x, 10));
+    if (ids.length !== idStrs.length) {
+      console.error(chalk.red('Finding ids must be positive integers (see the `id` field in agent output).'));
+      process.exit(1);
+    }
+    const out = dismissFindings(ids, options.reason);
+    // Nothing dismissed is a failure in both output modes — an agent must not have to parse the payload to notice.
+    if (out.dismissed.length === 0) process.exitCode = 1;
+    if (options.json) {
+      console.log(JSON.stringify(out));
+      return;
+    }
+    if (out.dismissed.length > 0) console.log(chalk.green(`✓ Dismissed ${out.dismissed.length}: ${out.dismissed.join(', ')}`));
+    if (out.skipped.length > 0) console.log(chalk.yellow(`⊘ Not open (unknown id or already settled): ${out.skipped.join(', ')}`));
+  });
+
 // Rounds: the fix→review loop for one PR or branch, from the log. This is the
 // stopping rule's evidence — findings per round, what became of them, and the last
 // round that found a BUG/SECURITY.
@@ -1392,13 +1527,12 @@ program
     }
     const own = summary.rounds.filter((r) => r.key === key);
     const last = own.length > 0 ? own[own.length - 1].round : 0;
-    const sinceBug = summary.lastBugRound === null ? null : last - summary.lastBugRound;
     console.log('');
-    console.log(`Last BUG/SECURITY: ${summary.lastBugRound === null ? 'none' : `round ${summary.lastBugRound}`}` +
-      (sinceBug === null ? '' : ` (${sinceBug} round(s) ago)`));
     console.log(`Measured cost so far: $${summary.totalCostUsd.toFixed(2)}`);
-    if (sinceBug !== null && sinceBug >= 2) {
-      console.log(chalk.yellow('Stopping rule: two or more rounds without a BUG/SECURITY finding — file what is left and stop.'));
+    if (last > 0) {
+      const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
+      console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);
+      console.log(`Budget: ${summary.budgetUsed} of ${ROUND_BUDGET} rounds used in the current loop${summary.budgetUsed >= ROUND_BUDGET ? ' — the next needs --override "<reason>"' : ''}.`);
     }
     console.log('');
   });
