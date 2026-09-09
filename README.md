@@ -185,6 +185,21 @@ LGTM supports multiple AI backends:
 
 Use `--ai <provider>` to force a specific backend, or let LGTM auto-detect.
 
+## What each call costs (measured)
+
+Every model call runs `claude --print` as a **stripped session**: no MCP servers, no settings or `CLAUDE.md` from the working directory, no saved transcript, JSON output. That removes roughly 10k tokens of chat-environment boilerplate from every review and returns the billed usage, which lgtm records per review (`~/.lgtm/reviews.db`: `prompt_tokens`, `output_tokens`, `cost_usd`, `model_id`) and prints in agent mode under `context.usage`. `lgtm report` sums it per month.
+
+Because settings are not loaded, lgtm pins the model and effort itself:
+
+| variable | default | purpose |
+|---|---|---|
+| `LGTM_MODEL` | your `~/.claude/settings.json` `model` | model id to review with |
+| `LGTM_EFFORT` | your settings' effort for that model | `low`/`medium`/`high`/`xhigh`/`max` |
+| `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
+| `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
+
+Codex has no usage envelope, so its rows are stored as `usage_source = 'estimate'`.
+
 ## Full Context Mode
 
 By default, LGTM only sends the PR diff to the AI. This is fast but can miss pattern violations — cases where new code doesn't follow established patterns in the file.
