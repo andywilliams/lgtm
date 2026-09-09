@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planSession, modelRoleOf, SYSTEM_PROMPT_KEY } from './session.js';
+import { planSession, modelRoleOf, SYSTEM_PROMPT_KEY, SESSION_CONTEXT_BUDGET } from './session.js';
 import type { RoundModelChoice } from './ai.js';
 import type { LoopSession } from './db.js';
 
@@ -8,7 +8,7 @@ const full: RoundModelChoice = { model: undefined, source: 'policy', reason: 'ro
 const late: RoundModelChoice = { model: 'claude-sonnet-5', source: 'policy', reason: 'late chill round' };
 const explicitSonnet: RoundModelChoice = { model: 'claude-sonnet-5', source: 'explicit', reason: '--model' };
 const contents = { 'a.ts': 'A', 'b.ts': 'B' };
-const prior = (over: Partial<LoopSession> = {}): LoopSession => ({ id: 'sess-1', model: 'claude-fable-5-1', role: 'full', fileShas: {}, ...over });
+const prior = (over: Partial<LoopSession> = {}): LoopSession => ({ id: 'sess-1', model: 'claude-fable-5-1', role: 'full', fileShas: {}, lastPromptTokens: 250_000, ...over });
 
 test('modelRoleOf compares what was asked for, suffix-free', () => {
   assert.equal(modelRoleOf(full), 'full');
@@ -82,4 +82,15 @@ test('a changed reviewer system prompt restarts the session; a changed charter i
   const newRules = planSession({ prior: seen, contents: { ...withRules, [SYSTEM_PROMPT_KEY]: 'rules v2' }, ai: 'claude', choice: full, newId: () => 'new-5' });
   assert.equal(newRules.session?.resume, false);
   assert.match(newRules.note ?? '', /system prompt changed/);
+});
+
+test('a session that would pass the context budget is not continued — a fresh one beats a compacted one', () => {
+  const big = { 'a.ts': 'x'.repeat(400_000) }; // ~100k tokens of changed content
+  const p = planSession({ prior: prior({ lastPromptTokens: SESSION_CONTEXT_BUDGET - 50_000 }), contents: big, ai: 'claude', choice: full, newId: () => 'new-6' });
+  assert.equal(p.session?.resume, false);
+  assert.match(p.note ?? '', /past the 700k budget/);
+  const ok = planSession({ prior: prior({ lastPromptTokens: 200_000 }), contents: big, ai: 'claude', choice: full });
+  assert.ok(ok.session?.resume, 'well under budget ⇒ continue');
+  const unknown = planSession({ prior: prior({ lastPromptTokens: null }), contents: big, ai: 'claude', choice: full });
+  assert.ok(unknown.session?.resume, 'no usage recorded ⇒ budget cannot be judged, continue');
 });

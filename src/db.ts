@@ -182,6 +182,8 @@ export interface LoopSession {
   role: string | null;
   /** path → sha1 of the file contents the session has already seen (latest version of each). */
   fileShas: Record<string, string>;
+  /** Billed prompt tokens of the session's latest turn — the context a resumed turn starts from. */
+  lastPromptTokens: number | null;
 }
 
 export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; scopeFrom: string | null; dismissed: DecidedFinding[]; session: LoopSession | null } {
@@ -208,7 +210,7 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
     // No role recorded (a row from before the column existed) ⇒ null; planSession then
     // opens a new session rather than guess from the reported id's family name.
-    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas };
+    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas, lastPromptTokens: sessionRow.prompt_tokens };
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(

@@ -17,6 +17,16 @@ export function modelRoleOf(choice: RoundModelChoice): string {
 /** Pseudo-path under which the reviewer's own system prompt is fingerprinted; a change restarts the session. */
 export const SYSTEM_PROMPT_KEY = '@system-prompt';
 
+/**
+ * Tokens of context a session may hold before the next round starts a fresh one. The
+ * CLI compacts a conversation that nears the 1M window — measured: a 883k-token session
+ * plus a 150k message came back as 228k with the whole cache lost — and a compacted
+ * session reviews from a summary instead of the files. A fresh full prompt is both
+ * cheaper and better than that. Rough token estimate: 4 chars per token.
+ */
+export const SESSION_CONTEXT_BUDGET = 700_000;
+const CHARS_PER_TOKEN = 4;
+
 export interface SessionPlan {
   /** sha1 of every file's contents as sent this round (changed files and related files). */
   fileShas: Record<string, string>;
@@ -58,7 +68,13 @@ export function planSession(input: {
   // The reviewer's own rules changed (lgtm upgraded mid-loop): the session's earlier
   // instructions would contradict this round's — start over.
   const rulesChanged = Boolean(prior && SYSTEM_PROMPT_KEY in fileShas && prior.fileShas[SYSTEM_PROMPT_KEY] !== undefined && prior.fileShas[SYSTEM_PROMPT_KEY] !== fileShas[SYSTEM_PROMPT_KEY]);
-  if (prior && !fresh && !rulesChanged && (sameRole || fullBeatsCheaper)) {
+  // What this round would add to the session: the files that moved (the diff and the
+  // per-round tail are small next to them). Over budget ⇒ a fresh session, not a compaction.
+  let changedChars = 0;
+  if (prior) for (const [path, content] of Object.entries(contents)) if (prior.fileShas[path] !== fileShas[path]) changedChars += content.length;
+  const wouldHold = (prior?.lastPromptTokens ?? 0) + Math.ceil(changedChars / CHARS_PER_TOKEN);
+  const overBudget = Boolean(prior && prior.lastPromptTokens !== null && wouldHold > SESSION_CONTEXT_BUDGET);
+  if (prior && !fresh && !rulesChanged && !overBudget && (sameRole || fullBeatsCheaper)) {
     const changedSinceLast: Record<string, string> = {};
     const unchangedFiles: string[] = [];
     for (const [path, content] of Object.entries(contents)) {
@@ -69,10 +85,9 @@ export function planSession(input: {
       : { ...choice, reason: `continuing the loop's session (${choice.reason}; ${Object.keys(changedSinceLast).length} file(s) changed since last round)` };
     return { fileShas, session: { id: prior.id, resume: true, changedSinceLast, unchangedFiles: unchangedFiles.sort() }, choice: kept };
   }
-  const note = prior && !fresh
-    ? (rulesChanged
-        ? `⟳  session: not continuing ${prior.id.slice(0, 8)} (the reviewer's system prompt changed since it opened) — opening a new one`
-        : `⟳  session: not continuing ${prior.id.slice(0, 8)} (it ran as ${sessionRole ?? 'unknown'}, this round needs ${wanted}) — opening a new one`)
-    : undefined;
+  const why = rulesChanged ? "the reviewer's system prompt changed since it opened"
+    : overBudget ? `it holds ~${Math.round((prior!.lastPromptTokens ?? 0) / 1000)}k tokens and this round would add ~${Math.round(changedChars / CHARS_PER_TOKEN / 1000)}k, past the ${SESSION_CONTEXT_BUDGET / 1000}k budget where the CLI would compact it`
+    : `it ran as ${sessionRole ?? 'unknown'}, this round needs ${wanted}`;
+  const note = prior && !fresh ? `⟳  session: not continuing ${prior.id.slice(0, 8)} (${why}) — opening a new one` : undefined;
   return { fileShas, session: { id: newId(), resume: false, changedSinceLast: {}, unchangedFiles: [] }, choice, note };
 }

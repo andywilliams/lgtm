@@ -327,6 +327,7 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   assert.equal(sess.id, 'sess-1');
   assert.equal(sess.model, 'claude-fable-5-1');
   assert.equal(sess.role, null, 'no model_role recorded ⇒ null, never inferred');
+  assert.equal(sess.lastPromptTokens, null, 'the latest session row had no measured usage');
   assert.deepEqual(sess.fileShas, { 'a.ts': 'a2', 'b.ts': 'b1' }, 'latest sha per file across the session');
   logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:27:00.000Z', sessionId: 'sess-1', modelRole: 'full' });
   assert.equal(loopContext(lrepo, 'pr:77', 'feat/w').session?.role, 'full', 'the column wins when present');

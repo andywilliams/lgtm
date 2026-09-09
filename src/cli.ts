@@ -799,8 +799,9 @@ async function runReview(options: RunOptions): Promise<void> {
   // related files too, so a newly discovered import is sent to a resumed session.
   // Related files come back with absolute paths; key them like the changed files (repo-relative)
   // or the same file is hashed twice and "changed" forever.
+  // getRepoRoot() falls back to cwd outside a checkout (`--repo owner/repo` from elsewhere); keys are then as given.
   const repoRootForKeys = getRepoRoot();
-  const relKey = (p: string) => (p.startsWith('/') ? relative(repoRootForKeys, p) : p);
+  const relKey = (p: string) => (p.startsWith('/') && p.startsWith(repoRootForKeys) ? relative(repoRootForKeys, p) : p);
   const contentsSeen: Record<string, string> = { ...(fileContents ?? {}) };
   for (const f of expanded) { const k = relKey(f.path); if (!(k in contentsSeen)) contentsSeen[k] = f.content; }
   // The stable prefix is fingerprinted like a file, under pseudo-paths: a charter edited
