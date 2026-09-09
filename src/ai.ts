@@ -125,7 +125,9 @@ export function lateModel(fullModel: string | undefined = resolveModel()): { mod
     note = ` (LGTM_LATE_MODEL=${JSON.stringify(explicit)} ignored: not a model id)`;
     explicit = undefined;
   }
-  if (explicit === undefined && fullModel !== undefined && !/^claude-/.test(fullModel)) {
+  // First-party ids are `claude-<family>[-<n>]` with an optional `[1m]` suffix; a Vertex
+  // `claude-…@date`, a Bedrock ARN or a gateway path is not, however it starts.
+  if (explicit === undefined && fullModel !== undefined && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
     return { model: undefined, reason: `full model is not a first-party id; set LGTM_LATE_MODEL to opt in${note}` };
   }
   const v = (explicit ?? DEFAULT_LATE_MODEL).trim();

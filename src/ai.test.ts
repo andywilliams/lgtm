@@ -234,6 +234,7 @@ test('pickRoundModel only assumes the first-party late model when the full model
     delete process.env.LGTM_LATE_MODEL;
     const base = { round: 5, harshness: 'chill', openBugs: 0, diffLines: 100, lastDiffLines: 100 };
     assert.equal(pickRoundModel({ ...base, fullModel: 'claude-fable-5-1[1m]' }).model, DEFAULT_LATE_MODEL);
+    assert.equal(pickRoundModel({ ...base, fullModel: 'claude-sonnet-5@20260501' }).model, undefined, 'a Vertex id starts with claude- but is not first-party');
     const bedrock = pickRoundModel({ ...base, fullModel: 'arn:aws:bedrock:eu-west-1:1:inference-profile/eu.anthropic.claude-opus-5' });
     assert.equal(bedrock.model, undefined);
     assert.match(bedrock.reason, /not a first-party id/);

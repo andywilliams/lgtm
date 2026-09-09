@@ -21,6 +21,7 @@ import { expandContext } from './contextExpander.js';
 import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice } from './db.js';
 import { createHash } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
+import { reviewWithRecovery } from './recovery.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
@@ -377,65 +378,12 @@ function applyLoopMemory(opts: {
   return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines } };
 }
 
-/**
- * Run the review with its recovery ladder. Every attempt that produces no review is
- * logged as a failed round — the spend is real and it judges nothing. Ladder: (1) an
- * unparsable reply is retried on the same model with the reply schema enforced (that is
- * what the schema fixes; other failures skip this rung); (2) if the policy had picked the
- * cheaper model, ANY failure then falls back to the full model with the schema — a
- * cheaper reviewer that cannot answer, for whatever reason, is not a saving. A failure
- * on the operator's own model (default or --model) rethrows: there is nothing cheaper
- * to have chosen wrongly.
- */
-async function reviewWithRecovery(opts: {
-  review: (enforceSchema?: boolean) => Promise<ReviewResult>;
-  ai: AIProvider;
-  choice: RoundModelChoice;
-  initialChoice: RoundModelChoice;
-  logFailedRound: (why: string, attempted: RoundModelChoice) => void;
-  say: (line: string) => void;
-}): Promise<{ result: ReviewResult; choice: RoundModelChoice }> {
-  const { review, ai, initialChoice, logFailedRound, say } = opts;
-  let { choice } = opts;
-  const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
-  const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
-  let lastError: any;
-  try {
-    return { result: await review(), choice };
-  } catch (e: any) {
-    logFailedRound(e?.message ?? String(e), choice);
-    lastError = e;
-    if (ai !== 'claude') throw e;
-    // A non-parse failure (model unavailable on this plan/region, a gateway error) has
-    // nothing for the schema to fix: go straight to the full model if the policy chose.
-    if (!isParseFailure(e) && !policyPickedCheaper()) throw e;
-  }
-  if (isParseFailure(lastError)) {
-    try {
-      say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
-      return { result: await review(true), choice };
-    } catch (e2: any) {
-      logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
-      lastError = e2;
-      if (!policyPickedCheaper()) throw e2;
-    }
-  }
-  choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review (${lastError?.message ?? lastError}; ${initialChoice.reason})` };
-  setModelOverride(undefined);
-  say(`↺  ${choice.reason}`);
-  try {
-    return { result: await review(true), choice };
-  } catch (e3: any) {
-    logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
-    throw e3;
-  }
-}
-
 /** Added + removed lines in a unified diff — the size the round policy compares between rounds. */
 function countDiffLines(diff: string): number {
   let n = 0;
   for (const line of diff.split('\n')) {
-    if ((line.startsWith('+') && !line.startsWith('+++')) || (line.startsWith('-') && !line.startsWith('---'))) n++;
+    // File headers are `+++ a/…` / `--- b/…` (with a space); a removed `-- comment` or an added `++i;` is a real line.
+    if ((line.startsWith('+') && !line.startsWith('+++ ')) || (line.startsWith('-') && !line.startsWith('--- '))) n++;
   }
   return n;
 }
@@ -827,7 +775,6 @@ async function runReview(options: RunOptions): Promise<void> {
     lastDiffLines: policy?.lastDiffLines ?? null,
   });
   let choice: RoundModelChoice = initialChoice;
-  if (ai === 'claude') setModelOverride(choice.model);
   // Said even for codex, so `--model` with codex is visibly not applied rather than silently ignored.
   const modelLine = `🎛  model: ${choice.model ?? (ai === 'claude' ? 'default (full)' : ai)} — ${choice.reason}`;
   if (auto) console.error(chalk.gray(modelLine)); else log(chalk.gray(modelLine));
@@ -843,7 +790,11 @@ async function runReview(options: RunOptions): Promise<void> {
   if (standardsContextStr) contextModes.push('standards');
   const modeLabel = contextModes.join(' + ');
   log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  const review = (enforceSchema = false) => reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema });
+  // The model is an argument of each attempt, not hidden state the ladder has to reset.
+  const review = (attempt: { enforceSchema?: boolean; model?: string } = {}) => {
+    if (ai === 'claude') setModelOverride(attempt.model);
+    return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema });
+  };
   // The failed attempt's model choice is passed in, not closed over: the recovery ladder
   // changes the choice between attempts and the row must name the model that actually failed.
   const logFailedRound = (why: string, attempted: RoundModelChoice) => recordReviewMetrics({

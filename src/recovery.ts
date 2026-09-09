@@ -1,0 +1,55 @@
+import type { AIProvider, RoundModelChoice } from './ai.js';
+import type { ReviewResult } from './types.js';
+
+/**
+ * Run the review with its recovery ladder. Every attempt that produces no review is
+ * logged as a failed round — the spend is real and it judges nothing. Ladder: (1) an
+ * unparsable reply is retried on the same model with the reply schema enforced (that is
+ * what the schema fixes; other failures skip this rung); (2) if the policy had picked the
+ * cheaper model, ANY failure then falls back to the full model with the schema — a
+ * cheaper reviewer that cannot answer, for whatever reason, is not a saving. A failure
+ * on the operator's own model (default or --model) rethrows: there is nothing cheaper
+ * to have chosen wrongly.
+ */
+export async function reviewWithRecovery(opts: {
+  review: (attempt: { enforceSchema?: boolean; model?: string }) => Promise<ReviewResult>;
+  ai: AIProvider;
+  choice: RoundModelChoice;
+  initialChoice: RoundModelChoice;
+  logFailedRound: (why: string, attempted: RoundModelChoice) => void;
+  say: (line: string) => void;
+}): Promise<{ result: ReviewResult; choice: RoundModelChoice }> {
+  const { review, ai, initialChoice, logFailedRound, say } = opts;
+  let { choice } = opts;
+  const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
+  const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
+  let lastError: any;
+  try {
+    return { result: await review({ model: choice.model }), choice };
+  } catch (e: any) {
+    logFailedRound(e?.message ?? String(e), choice);
+    lastError = e;
+    if (ai !== 'claude') throw e;
+    // A non-parse failure (model unavailable on this plan/region, a gateway error) has
+    // nothing for the schema to fix: go straight to the full model if the policy chose.
+    if (!isParseFailure(e) && !policyPickedCheaper()) throw e;
+  }
+  if (isParseFailure(lastError)) {
+    try {
+      say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
+      return { result: await review({ enforceSchema: true, model: choice.model }), choice };
+    } catch (e2: any) {
+      logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
+      lastError = e2;
+      if (!policyPickedCheaper()) throw e2;
+    }
+  }
+  choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review (${lastError?.message ?? lastError}; ${initialChoice.reason})` };
+  say(`↺  ${choice.reason}`);
+  try {
+    return { result: await review({ enforceSchema: true, model: undefined }), choice };
+  } catch (e3: any) {
+    logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
+    throw e3;
+  }
+}
