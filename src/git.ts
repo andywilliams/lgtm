@@ -176,3 +176,13 @@ export function getLocalDetails(base: string): PRDetails {
 
   return { number: 0, title, body, author, baseRef: base, headRef, additions, deletions, changedFiles };
 }
+
+/** The checked-out branch name, or 'detached' when HEAD is not on a branch. */
+export function getCurrentBranch(): string {
+  try {
+    const name = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return name === 'HEAD' || !name ? 'detached' : name;
+  } catch {
+    return 'detached';
+  }
+}

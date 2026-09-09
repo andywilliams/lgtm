@@ -103,3 +103,107 @@ test('logReview stores measured usage separately from the historical estimate, a
   assert.equal(stats.outputTokens, 1_200);
   assert.equal(stats.costUsd, 1.25);
 });
+
+test('findings are logged per round and the previous round is disposed: fixed / dismissed / carried', async () => {
+  const { logReview, logFindings, disposePreviousRound, getLoopSummary, fingerprintOf } = await import('./db.js');
+  const repo = 'loop/repo';
+  const key = 'pr:42';
+  const base = {
+    repo, prNumber: 42, filesReviewed: 3, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1000,
+    model: 'claude', usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key,
+  };
+  const c = (severity: any, title: string, file = 'src/a.ts', line = 10) => ({ severity, title, file, line, body: '' });
+
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-09T10:00:00.000Z', harshness: 'medium',
+    usage: { inputTokens: 0, cacheCreationTokens: 1000, cacheReadTokens: 0, outputTokens: 10, costUsd: 2, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, measured: true } });
+  assert.equal(r1.round, 1, 'round allocated inside the insert when not supplied');
+  logFindings(r1.id, repo, key, 1, [
+    c('BUG', 'Null deref on empty list'),
+    c('SUGGESTION', 'Rename foo'),
+    c('NITPICK', '(standard G9) unused import', 'src/b.ts', 3),
+  ]);
+  assert.equal(disposePreviousRound(repo, key, 1, []), null, 'round 1 has nothing to judge');
+
+  const round2 = [
+    c('SUGGESTION', 'Rename foo', 'src/a.ts', 14), // same complaint, moved line ⇒ carried
+    c('SUGGESTION', 'Missing test for the guard'),   // new
+  ];
+  const r2 = logReview({ ...base, reviewedAt: '2026-09-09T10:30:00.000Z', harshness: 'medium' });
+  assert.equal(r2.round, 2);
+  logFindings(r2.id, repo, key, 2, round2);
+  const d = disposePreviousRound(repo, key, 2, round2, { decided: [
+    { title: 'unused import', reason: 'generated file', file: 'src/b.ts' },            // tag-insensitive match
+    { title: 'Null deref on empty list', reason: 'wrong file', file: 'src/other.ts' }, // file mismatch ⇒ does not apply
+  ], harshness: 'medium' });
+  assert.deepEqual(d, { fixed: 1, dismissed: 1, carried: 1, suppressed: 0 });
+
+  // Running the disposition again for the same pair changes nothing — rows are already disposed.
+  assert.deepEqual(disposePreviousRound(repo, key, 2, round2), { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 });
+
+  const s = getLoopSummary(repo, key);
+  assert.equal(s.rounds.length, 2);
+  assert.deepEqual(s.rounds[0].bySeverity, { BUG: 1, SECURITY: 0, SUGGESTION: 1, NITPICK: 1 });
+  assert.equal(s.rounds[0].fixed, 1);
+  assert.equal(s.rounds[0].dismissed, 1);
+  assert.equal(s.rounds[0].carried, 1);
+  assert.equal(s.rounds[1].findings, 2);
+  assert.equal(s.lastBugRound, 1);
+  assert.equal(s.totalCostUsd, 2);
+
+  // Round 3 at chill: round 2's SUGGESTIONs vanish because chill does not raise them — suppressed, not fixed.
+  const r3 = logReview({ ...base, reviewedAt: '2026-09-09T11:00:00.000Z', harshness: 'chill' });
+  assert.equal(r3.round, 3);
+  assert.deepEqual(disposePreviousRound(repo, key, 3, [], { harshness: 'chill' }), { fixed: 0, dismissed: 0, carried: 0, suppressed: 2 });
+
+  // Round 4 is salvaged JSON ⇒ disposes nothing; round 5 (complete) must settle BOTH 3 and 4.
+  const r4 = logReview({ ...base, reviewedAt: '2026-09-09T11:30:00.000Z', harshness: 'medium', diffSha: 'aaa' });
+  logFindings(r4.id, repo, key, 4, [c('BUG', 'Off by one in pager'), c('SUGGESTION', 'Name the constant')]);
+  assert.equal(disposePreviousRound(repo, key, 4, [], { recovered: true }), null, 'salvaged round judges nothing');
+
+  // Round 5 on the IDENTICAL diff: a re-run, not a fix — absent findings stay open, re-raised ones are carried.
+  const r5 = logReview({ ...base, reviewedAt: '2026-09-09T12:00:00.000Z', harshness: 'medium', diffSha: 'aaa' });
+  assert.equal(r5.round, 5);
+  logFindings(r5.id, repo, key, 5, [c('BUG', 'Off by one in pager')]);
+  assert.deepEqual(disposePreviousRound(repo, key, 5, [c('BUG', 'Off by one in pager')], { harshness: 'medium', diffSha: 'aaa' }),
+    { fixed: 0, dismissed: 0, carried: 1, suppressed: 0 }, 'unchanged code: only carried is written');
+
+  // Round 6 with a changed diff and nothing raised: the still-open suggestion is now genuinely fixed.
+  const r6 = logReview({ ...base, reviewedAt: '2026-09-09T12:30:00.000Z', harshness: 'medium', diffSha: 'bbb' });
+  assert.equal(r6.round, 6);
+  assert.deepEqual(disposePreviousRound(repo, key, 6, [], { harshness: 'medium', diffSha: 'bbb' }), { fixed: 2, dismissed: 0, carried: 0, suppressed: 0 },
+    'round 4 leftover + round 5 carried copy both settle');
+  assert.equal(getLoopSummary(repo, key).lastBugRound, 5);
+
+  const db = new Database(dbPath, { readonly: true });
+  const dismissed = db.prepare("SELECT dismissed_reason, disposed_at_round FROM findings WHERE title LIKE '%unused import%'").get() as any;
+  assert.equal(dismissed.dismissed_reason, 'generated file');
+  assert.equal(dismissed.disposed_at_round, 2);
+  db.close();
+
+  // Fingerprints ignore the line and the (prefix) tags, so a moved or re-tagged finding still matches.
+  assert.equal(fingerprintOf({ file: 'x.ts', title: '(out of scope) Thing is wrong!' }), fingerprintOf({ file: 'x.ts', title: 'thing is wrong' }));
+  assert.notEqual(fingerprintOf({ file: 'x.ts', title: 'thing' }), fingerprintOf({ file: 'y.ts', title: 'thing' }));
+});
+
+test('local rounds are keyed on the branch and counted separately from PR rounds', async () => {
+  const { logReview, getLoopSummary } = await import('./db.js');
+  const repo = 'local/repo'; // this test's own repo — nothing above touches it
+  const row = (roundKey: string, harshness: string) => ({
+    repo, prNumber: 0, reviewedAt: '2026-09-09T09:00:00.000Z', filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]',
+    tokenCount: 10, model: 'claude', usedContextExpansion: false, falseNegative: false, mode: 'local' as const, roundKey, harshness,
+  });
+  assert.equal(logReview(row('local:feat/x', 'chill')).round, 1);
+  assert.equal(logReview(row('local:feat/x', 'chill')).round, 2);
+  assert.equal(logReview(row('pr:7', 'medium')).round, 1, 'a different key has its own counter');
+  assert.equal(logReview(row('local:feat/y', 'medium')).round, 1, 'so does a different branch');
+  const s = getLoopSummary(repo, 'local:feat/x');
+  assert.equal(s.rounds.length, 2);
+
+  // A PR row that names its head branch pulls that branch's local rounds into its summary, ahead of its own.
+  logReview({ ...row('pr:9', 'medium'), branch: 'feat/x' });
+  const pr = getLoopSummary(repo, 'pr:9');
+  assert.deepEqual(pr.rounds.map((r) => `${r.key}#${r.round}`), ['local:feat/x#1', 'local:feat/x#2', 'pr:9#1']);
+  assert.equal(pr.lastBugRound, null);
+  assert.equal(s.rounds[0].harshness, 'chill');
+  assert.equal(s.lastBugRound, null);
+});
