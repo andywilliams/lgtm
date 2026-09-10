@@ -263,8 +263,24 @@ export function diffFiles(diff: string): Set<string> {
  * They can still be REFUTED and dropped; what is refused is deletion by inability to prove.
  */
 export function citesDoc(f: ReviewComment): boolean {
-  return /^\((charter|ticket|standard\b[^)]*)\)/i.test(f.title);
+  return docTagOf(f) !== null;
 }
+
+/** The document a finding's tag cites, or null. */
+export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | null {
+  const m = f.title.match(/^\((charter|ticket|standard)\b/i);
+  return m ? (m[1].toLowerCase() as 'charter' | 'ticket' | 'standard') : null;
+}
+
+/**
+ * How many findings of each tag the drop exemption covers — the caps each check's own
+ * prompt states. Enforced HERE rather than trusted, because those caps are instructions to
+ * a model and the exemption is the one place the filter can be switched off: keyed on a
+ * title prefix the reviewer chooses, an uncapped exemption would let a pedantic round put
+ * any number of undroppable opinions through, with no signal that it had happened. Beyond
+ * the cap a doc-tagged finding is an ordinary opinion and droppable like any other.
+ */
+export const DOC_TAG_EXEMPT: Record<'charter' | 'ticket' | 'standard', number> = { charter: 1, ticket: 1, standard: 3 };
 
 export function citesDocs(findings: ReviewComment[]): boolean {
   return findings.some(citesDoc);
@@ -389,6 +405,7 @@ export function parseVerdicts(output: string, count: number): Verdicts {
  * the false-positive rate becomes a number) and only then hide them from its output.
  */
 export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx?: ShownContext, contents?: Record<string, string>): ReviewComment[] {
+  const usedExemption: Record<string, number> = {};
   return findings.map((f, i) => {
     const v = verdicts[i + 1];
     // No verdict at all is NOT "unproven": a verifier that skipped a finding has said
@@ -406,7 +423,14 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
-    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !citesDoc(f));
+    // The exemption is spent per tag, in the order the reviewer listed the findings.
+    const tag = docTagOf(f);
+    let exempt = false;
+    if (tag) {
+      const used = usedExemption[tag] ?? 0;
+      if (used < DOC_TAG_EXEMPT[tag]) { usedExemption[tag] = used + 1; exempt = true; }
+    }
+    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !exempt);
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)
       : verdict === 'unproven' ? 'low' as const : f.confidence;

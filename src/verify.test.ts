@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, DOC_TAG_EXEMPT, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -63,6 +63,22 @@ describe('applyVerdicts — what may drop a finding', () => {
 
     assert.equal(citesDoc(finding({ title: '(out of scope) x' })), false);
     assert.equal(citesDoc(finding({ title: 'plain finding' })), false);
+  });
+
+  test('the exemption is CAPPED per tag, so it cannot switch the filter off', () => {
+    // The caps each check states are instructions to a model, and the exemption is keyed on
+    // a title prefix the reviewer chooses. Unbounded, a pedantic round could put any number
+    // of undroppable opinions through with no signal that it had happened.
+    const many = [
+      ...Array.from({ length: 3 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(ticket) criterion ${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(standard FUN-${i}) too long` })),
+    ];
+    const unproven = Object.fromEntries(many.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    const out = applyVerdicts(many, unproven);
+    const kept = out.filter((c) => !c.verifier_dropped);
+    assert.equal(kept.length, DOC_TAG_EXEMPT.ticket + DOC_TAG_EXEMPT.standard, 'one ticket finding and three standards findings survive');
+    assert.equal(dropped(out).length, 4, 'the rest are ordinary opinions');
+    assert.deepEqual(kept.map((c) => c.title), ['(ticket) criterion 0', '(standard FUN-0) too long', '(standard FUN-1) too long', '(standard FUN-2) too long']);
   });
 
   test('an unproven BUG is kept at low confidence; an unproven SUGGESTION is dropped', () => {

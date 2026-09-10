@@ -2197,7 +2197,11 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     systemBlock: archCtx.systemBlock,
     repoMapBlock: repoMap.block,
     repoMapTruncated: repoMap.truncated,
-    ticketBlock: archTicket.block,
+    // The DATA, not the reviewer's task: the block's "add EXACTLY ONE finding: severity
+    // …, kind …, title …" instruction names fields the arch schema does not have, and the
+    // arch prompt is told correctness belongs to another tool. What arch wants from a
+    // ticket is the rationale its own schema asks for.
+    ticketBlock: archTicket.data,
     ticketSkip: archTicket.reason ? { configured: archTicket.skipped !== 'not-configured', reason: archTicket.reason } : undefined,
     handbookBlock,
     fileContents,
