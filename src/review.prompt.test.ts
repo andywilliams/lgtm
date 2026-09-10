@@ -78,5 +78,7 @@ test('a reviewed file that contains the prompt\'s own headings does not leak int
   const full = { ...base, fileContents: trap };
   const p = buildResumePrompt({ ...full, round: 2, changedSinceLast: {}, unchangedFiles: ['src/review.ts'] });
   assert.ok(!p.includes('// template'), 'the unchanged file is not re-sent even though it contains the headings');
+  // The ceiling is the volatile tail's size (prompt v2's output contract is ~1k of it),
+  // not a round number: what this pins is that the FILE CONTENTS are not re-sent.
   assert.ok(p.length < 6000, `resumed prompt should be small, was ${p.length}`);
 });

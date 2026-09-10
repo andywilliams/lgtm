@@ -339,3 +339,53 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   assert.equal(aged.lastScope, null, 'scope from before the gap is not inherited');
   assert.deepEqual(aged.dismissed.map((d) => d.title), ['Trailing comma'], 'dismissals persist');
 });
+
+test('prompt v2: a finding logged under the old title key is still matched by a fingerprinted round', async () => {
+  const { logReview, logFindings, disposePreviousRound, getLoopSummary, keysFor } = await import('./db.js');
+  const repo = 'v2/repo';
+  const key = 'pr:1';
+  const base = { repo, prNumber: 1, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+
+  // Round 1, pre-v2: no fingerprint, so the row's key is file#title.
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T09:00:00.000Z', harshness: 'medium', diffSha: 'a' });
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'BUG', title: 'Null deref in parseRow', file: 'a.ts', line: 1, body: '' },
+    { severity: 'SUGGESTION', title: 'Name the constant', file: 'a.ts', line: 5, body: '', confidence: 'medium' },
+  ]);
+
+  // Round 2, v2: the same complaint arrives with a fingerprint and a different title.
+  const same = { severity: 'BUG' as const, title: 'parseRow dereferences a null row', file: 'a.ts', line: 2, body: '', fingerprint: 'Null deref in parseRow', confidence: 'high' as const };
+  assert.ok(keysFor(same).length === 2, 'both spellings are offered');
+  const r2 = logReview({ ...base, reviewedAt: '2026-09-10T09:10:00.000Z', harshness: 'medium', diffSha: 'b' });
+  logFindings(r2.id, repo, key, 2, [same]);
+  assert.deepEqual(disposePreviousRound(repo, key, 2, [same], { harshness: 'medium', diffSha: 'b' }),
+    { fixed: 1, dismissed: 0, carried: 1, suppressed: 0 }, 'carried, not silently fixed');
+
+  // Round 3 at chill: the round-2 BUG is high confidence so its absence is a fix; a
+  // medium-confidence finding would only be below chill's bar.
+  const r3 = logReview({ ...base, reviewedAt: '2026-09-10T09:20:00.000Z', harshness: 'chill', diffSha: 'c' });
+  logFindings(r3.id, repo, key, 3, []);
+  assert.deepEqual(disposePreviousRound(repo, key, 3, [], { harshness: 'chill', diffSha: 'c' }),
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 0 });
+
+  const s = getLoopSummary(repo, key);
+  assert.equal(s.rounds[1].absences, 0);
+  assert.equal(s.rounds[1].highConfidence, 1, 'kind and confidence are recorded per finding');
+});
+
+test('prompt v2: a medium-confidence finding absent from a chill round is suppressed, not fixed', async () => {
+  const { logReview, logFindings, disposePreviousRound } = await import('./db.js');
+  const repo = 'v2b/repo';
+  const key = 'pr:2';
+  const base = { repo, prNumber: 2, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T10:00:00.000Z', harshness: 'medium', diffSha: 'a' });
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'BUG', title: 'Maybe a race', file: 'a.ts', line: 1, body: '', confidence: 'medium', kind: 'missing' },
+    { severity: 'BUG', title: 'Demonstrated crash', file: 'a.ts', line: 2, body: '', confidence: 'high' },
+  ]);
+  logReview({ ...base, reviewedAt: '2026-09-10T10:10:00.000Z', harshness: 'chill', diffSha: 'b' });
+  assert.deepEqual(disposePreviousRound(repo, key, 2, [], { harshness: 'chill', diffSha: 'b' }),
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 1 }, 'chill raises only high-confidence findings, so a medium one going quiet proves nothing');
+});

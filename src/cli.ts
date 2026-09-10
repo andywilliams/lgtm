@@ -406,7 +406,17 @@ function loopIdentity(repo: string | undefined, local: boolean, prNumber: number
 }
 
 function formatReviewCommentBody(comment: ReviewComment): string {
-  let body = `**${comment.title}**\n\n${comment.body}`;
+  let body = `**${comment.title}**`;
+  // What kind of problem and how sure the reviewer is, before the prose — a "missing"
+  // finding at low confidence reads very differently from a demonstrated bug.
+  const kind = comment.kind && comment.kind !== 'added' ? comment.kind : null;
+  const tags = [kind ? `_${kind}_` : null, comment.confidence ? `confidence: ${comment.confidence}` : null].filter(Boolean);
+  if (tags.length > 0) body += `\n\n${tags.join(' · ')}`;
+  body += `\n\n${comment.body}`;
+  if (comment.evidence && comment.evidence.length > 0) {
+    body += `\n\n**Evidence:**\n${comment.evidence.map((e) => `> ${e.replace(/\n/g, '\n> ')}`).join('\n>\n')}`;
+  }
+  if (comment.how_to_verify) body += `\n\n**How to check:** ${comment.how_to_verify}`;
   if (comment.suggestion) {
     body += `\n\n**Suggested fix:**\n\`\`\`suggestion\n${comment.suggestion}\n\`\`\``;
   }

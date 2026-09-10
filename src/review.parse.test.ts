@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { extractJsonObject } from "./review.js";
+import { extractJsonObject, parseReviewForTest } from "./review.js";
 
 // Guards the resilient JSON extraction that stops a malformed/truncated model
 // response from killing an entire review (the recurring "Failed to parse" bug),
@@ -47,4 +47,34 @@ describe("extractJsonObject", () => {
     assert.strictEqual(value, null);
     assert.strictEqual(recovered, false);
   });
+});
+
+// ---- prompt v2 (DWLF-208) --------------------------------------------------------
+describe('prompt v2 finding fields', () => {
+
+it('prompt v2: kind, confidence, evidence and fingerprint survive parsing, with safe defaults', () => {
+  const r = parseReviewForTest(JSON.stringify({
+    summary: 's',
+    comments: [
+      { file: 'a.ts', line: 3, severity: 'BUG', kind: 'removed', confidence: 'high', title: 'Guard deleted',
+        body: 'b', evidence: ['-  if (!x) return;'], how_to_verify: 'call with null', fingerprint: 'parseRow' },
+      { file: 'b.ts', line: 9, severity: 'SUGGESTION', title: 'Old shape' }, // pre-v2 / codex
+      { file: 'c.ts', line: 1, severity: 'BUG', kind: 'missing', confidence: 'high', title: 'No reader updated', body: 'b', evidence: [] },
+      { file: 'd.ts', line: 1, severity: 'BUG', kind: 'nonsense', confidence: 'certain', title: 'x', body: 'b' },
+    ],
+  })).comments;
+
+  assert.equal(r[0].kind, 'removed');
+  assert.equal(r[0].confidence, 'high');
+  assert.deepEqual(r[0].evidence, ['-  if (!x) return;']);
+  assert.equal(r[0].fingerprint, 'parseRow');
+
+  assert.equal(r[1].kind, 'added', 'an unlabelled finding is about added code, as every finding was before v2');
+  assert.equal(r[1].confidence, 'medium');
+  assert.deepEqual(r[1].evidence, []);
+
+  assert.equal(r[2].confidence, 'medium', 'high confidence is earned by evidence, not claimed');
+  assert.equal(r[3].kind, 'added', 'an unknown kind falls back');
+  assert.equal(r[3].confidence, 'medium', 'an unknown confidence falls back');
+});
 });

@@ -405,16 +405,23 @@ export function primaryModel(models: string[]): string {
 }
 
 /**
- * Identity of a finding across rounds. Line numbers move as fixes land, so the key
- * is file + a normalised title; the same complaint about the same file re-raised at
- * a different line is the same finding. (A model-supplied fingerprint would be
- * sharper — that is the prompt-v2 work; this is the matching the log has today.)
+ * Identity of a finding across rounds. Line numbers move as fixes land, so the key is
+ * the file plus the reviewer's own fingerprint — the symbol or construct at fault
+ * (prompt v2) — falling back to a normalised title for rows written before that, for
+ * codex, and for anything unlabelled. `keysFor` returns BOTH spellings, so a finding
+ * logged under the old key is still matched by a round that now sends a fingerprint.
  */
 export function fingerprintOf(c: Pick<ReviewComment, 'file' | 'title' | 'fingerprint'>): string {
-  // The reviewer names the symbol or construct at fault when it can (prompt v2); the
-  // normalised title is the fallback for older rows, codex, and anything unlabelled.
   const key = c.fingerprint?.trim() ? normTitle(c.fingerprint) : normTitle(c.title);
   return `${c.file}#${key}`;
+}
+
+/** Every key this finding could have been logged under — the current one and the pre-v2 title form. */
+export function keysFor(c: Pick<ReviewComment, 'file' | 'title' | 'fingerprint'>): string[] {
+  const keys = [fingerprintOf(c)];
+  const titleKey = `${c.file}#${normTitle(c.title)}`;
+  if (!keys.includes(titleKey)) keys.push(titleKey);
+  return keys;
 }
 
 /** Title identity: case-, punctuation- and tag-insensitive, so `(out of scope) Foo!` is `foo`. */
@@ -525,20 +532,28 @@ export function disposePreviousRound(
   const unchanged = Boolean(diffSha && last?.diff_sha && last.diff_sha === diffSha);
   const summary: DispositionSummary = { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 };
   const prev = db.prepare(
-    'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, f.kind, r.harshness FROM findings f ' +
+    'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, f.kind, f.confidence, r.harshness FROM findings f ' +
     'JOIN reviews r ON r.id = f.review_id ' +
     `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL`
-  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; kind: string | null; harshness: string | null }[];
+  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; kind: string | null; confidence: string | null; harshness: string | null }[];
   if (prev.length === 0) {
     db.close();
     return summary;
   }
   const rank = (h: string | null | undefined) => HARSHNESS_RANK[h ?? ''] ?? 1;
-  // A lower-harshness round does not raise SUGGESTION/NITPICK it would have before;
-  // their absence is silence, not a fix. BUG/SECURITY are raised at every level.
-  const suppressedBy = (severity: Severity, prevHarshness: string | null) =>
-    currentHarshness !== undefined && rank(currentHarshness) < rank(prevHarshness) && (severity === 'SUGGESTION' || severity === 'NITPICK');
-  const now = new Set(current.map(fingerprintOf));
+  // Two reasons a round can be silent about a finding without it having been fixed: it
+  // ran at a lower harshness that does not raise that severity, or it ran at chill, which
+  // raises only high-confidence findings (prompt v2). Both are silence, not a fix.
+  const suppressedBy = (severity: Severity, prevHarshness: string | null, prevConfidence: string | null) => {
+    if (currentHarshness === undefined) return false;
+    const lowerHarshness = rank(currentHarshness) < rank(prevHarshness) && (severity === 'SUGGESTION' || severity === 'NITPICK');
+    const belowChillBar = currentHarshness === 'chill' && prevConfidence !== null && prevConfidence !== 'high';
+    return lowerHarshness || belowChillBar;
+  };
+  // Both spellings of every current finding: a row logged before prompt v2 carries the
+  // title key, one logged after carries the fingerprint key, and the same complaint must
+  // match either way — otherwise the switch silently marks every open finding 'fixed'.
+  const now = new Set(current.flatMap(keysFor));
   // A --decided entry with a file applies to that file only; without one it applies by title.
   const dismissedReason = new Map(decided.map((d) => [`${d.file ?? '*'}#${normTitle(d.title)}`, d.reason]));
   const reasonFor = (f: { file: string; title: string }) =>
@@ -554,7 +569,7 @@ export function disposePreviousRound(
         disposition = 'dismissed';
         reason = dismissed;
       } else if (unchanged) continue; // absent on identical code: still open
-      else if (suppressedBy(f.severity, f.harshness)) disposition = 'suppressed';
+      else if (suppressedBy(f.severity, f.harshness, f.confidence)) disposition = 'suppressed';
       else disposition = 'fixed';
       upd.run(disposition, round, reason, f.id);
       summary[disposition] += 1;

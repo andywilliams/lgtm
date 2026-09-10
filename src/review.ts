@@ -110,6 +110,13 @@ expected value replaced by whatever the code now returns), a rewritten snapshot 
 behavioural reason. For every behavioural change, name the test that would fail without
 it — and if there is none, say so in the finding.
 
+ANCHORING — every finding must be postable:
+"line" MUST be a line that appears in the diff you were given (an added line, or a
+context line inside a hunk). GitHub only accepts a review comment on a line that is part
+of the diff, so a finding anchored anywhere else cannot be posted at all. For a "removed"
+or "missing" finding, pick the nearest such line and say in the body that the problem is
+the deletion or the absence, not that line.
+
 OTHER RULES:
 - Use the line number shown after @@ in the diff hunk header for context
 - Be specific about what's wrong and how to fix it
@@ -420,6 +427,11 @@ function salvageSummary(output: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** parseAIResponse, exposed for tests (it is the normalisation contract, not just parsing). */
+export function parseReviewForTest(output: string): ReviewResult {
+  return parseAIResponse(output);
 }
 
 /**
