@@ -1151,6 +1151,7 @@ async function runReview(options: RunOptions): Promise<void> {
       );
       log(chalk.white('─'.repeat(60)));
       log(chalk.bold(comment.title));
+      if (comment.cites) log(chalk.gray(`conformance claim against the ${comment.cites}`));
       if (comment.verifier_dropped) log(chalk.yellow(`DROPPED by the verifier (${comment.verdict}) — shown because --show-dropped: ${comment.verifier_note ?? 'no reason given'}`));
       else if (comment.verdict === 'confirmed') log(chalk.gray(`confirmed by the verifier: ${comment.verifier_note ?? ''}`));
       else if (comment.verdict === 'unproven') log(chalk.gray(`the verifier could not prove this: ${comment.verifier_note ?? ''}`));

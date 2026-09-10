@@ -643,8 +643,18 @@ function normalizeQuestion(q: any): QuizQuestion {
   };
 }
 
-/** The three document tags, in the two spellings a model might use for the middle one. */
-const CITED: Record<string, DocumentCited> = { charter: 'charter', standard: 'standard', standards: 'standard', ticket: 'ticket' };
+/**
+ * The three document tags, in the two spellings a model might use for the middle one.
+ * A Map, not an object literal: the key comes straight from the model's reply and `cites`
+ * is NOT schema-constrained on the normal path (the schema is a retry tool, and codex never
+ * gets one), so a bare index would resolve "constructor" and "__proto__" to inherited
+ * values — truthy ones, which would then be bound as a finding column and throw inside the
+ * metrics guard, losing every findings row for the round while its review row survived.
+ * The same guard, for the same reason, as `buildWindows`' own file lookup.
+ */
+const CITED = new Map<string, DocumentCited>([
+  ['charter', 'charter'], ['standard', 'standard'], ['standards', 'standard'], ['ticket', 'ticket'],
+]);
 
 /**
  * What document a finding cites: its declared `cites` if it gave one, else the title prefix
@@ -653,10 +663,10 @@ const CITED: Record<string, DocumentCited> = { charter: 'charter', standard: 'st
  * preferred and the prefix is the fallback that keeps codex and older rows working.
  */
 export function citedDocument(comment: { cites?: unknown; title?: string }): DocumentCited | undefined {
-  const declared = typeof comment.cites === 'string' ? CITED[comment.cites.toLowerCase()] : undefined;
+  const declared = typeof comment.cites === 'string' ? CITED.get(comment.cites.toLowerCase()) : undefined;
   if (declared) return declared;
   const m = String(comment.title ?? '').match(/^\((charter|standards?|ticket)\b/i);
-  return m ? CITED[m[1].toLowerCase()] : undefined;
+  return m ? CITED.get(m[1].toLowerCase()) : undefined;
 }
 
 function normalizeComment(comment: any): ReviewComment {

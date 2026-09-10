@@ -243,6 +243,15 @@ describe('buildVerifyPrompt', () => {
     assert.match(buildVerifyPrompt({ ...base, findings: [finding({ title: '(standard FUN-1) too long' })] }), /CHARTER-TEXT-MARKER/);
   });
 
+  test('a conformance finding is told to answer "unshown" when its document was not sent', () => {
+    // The document block is one joined blob of whichever of the three were resolvable, so
+    // "judge it against the document above" would be a false claim in a repo that has a
+    // charter and no STANDARDS.md — nudging the verdict away from the one that KEEPS it.
+    const f = finding({ severity: 'SUGGESTION', title: '(standard FUN-1) too long', cites: 'standard' });
+    assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f] }), /was NOT given to you — the verdict is "unshown"/);
+    assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f], docs: 'DOC' }), /IF it appears above/);
+  });
+
   test('says when the reviewer quoted nothing, so an unevidenced claim is visible as one', () => {
     const p = buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [finding({ evidence: [] })] });
     assert.match(p, /the reviewer quoted nothing/);

@@ -92,6 +92,21 @@ describe("citedDocument", () => {
     assert.equal(citedDocument({}), undefined);
   });
 
+  it("a cites value naming an inherited property is not a document", () => {
+    // `cites` is not schema-constrained on the normal path (the schema is a retry tool, and
+    // codex never gets one), so any string arrives here. A bare object index would return
+    // Object / Object.prototype for these — truthy, and then bound as a finding column,
+    // which throws inside the metrics guard and loses every findings row for the round
+    // while the review row survives as one that "raised nothing".
+    for (const evil of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      assert.equal(citedDocument({ cites: evil, title: "ordinary" }), undefined, evil);
+    }
+    const r = parseReviewForTest(JSON.stringify({ summary: "s", comments: [
+      { file: "a.ts", line: 1, severity: "SUGGESTION", title: "t", body: "b", cites: "constructor" },
+    ] }));
+    assert.equal(r.comments[0].cites, undefined);
+  });
+
   it("normalizeComment sets cites from either source, so the verifier reads one field", () => {
     const r = parseReviewForTest(JSON.stringify({ summary: "s", comments: [
       { file: "a.ts", line: 1, severity: "SUGGESTION", title: "Criterion 2 unaddressed", body: "b", cites: "ticket" },

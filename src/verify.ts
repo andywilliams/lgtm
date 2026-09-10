@@ -303,6 +303,7 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
   const docsSection = docs && citesDocs(findings) ? `\n${docs}\n` : '';
+  const hasDocs = Boolean(docsSection);
   const list = findings.map((f, i) => {
     const parts = [
       `### Finding ${i + 1}`,
@@ -313,7 +314,16 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
       `- claim: ${f.body}`,
     ];
     const cites = citedDocument(f);
-    if (cites) parts.push(`- this is a conformance claim against the ${cites === 'standard' ? "repo's STANDARDS.md" : cites === 'charter' ? 'architecture charter' : 'ticket'}, not a claim about the code — judge it against that document, which is included above`);
+    if (cites) {
+      const doc = cites === 'standard' ? "repo's STANDARDS.md" : cites === 'charter' ? 'architecture charter' : 'ticket';
+      // Conditional, because the document block is: it is one joined blob of whichever of
+      // the three were resolvable, so a finding citing STANDARDS.md in a repo that has only
+      // a charter would otherwise be told its evidence is above when it is not — nudging it
+      // from "unshown" (which keeps the finding) towards a verdict that can drop it.
+      parts.push(hasDocs
+        ? `- this is a conformance claim against the ${doc}, not a claim about the code — judge it against that document IF it appears above; if it does not, the verdict is "unshown"`
+        : `- this is a conformance claim against the ${doc}, not a claim about the code, and that document was NOT given to you — the verdict is "unshown"`);
+    }
     if (f.evidence && f.evidence.length > 0) parts.push(`- the reviewer quoted:\n${f.evidence.map((e) => `  > ${e}`).join('\n')}`);
     else parts.push('- the reviewer quoted nothing');
     if (f.how_to_verify) parts.push(`- the reviewer says this settles it: ${f.how_to_verify}`);
