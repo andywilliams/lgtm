@@ -279,6 +279,25 @@ test('timeoutMs: a positive override wins, anything else falls back to the defau
   }
 });
 
+test('isTimeout recognises what execFileSync ACTUALLY throws when it kills a child', async () => {
+  // Not a hand-written fixture: run a real command that outlasts a real timeout, and
+  // feed the error Node actually produced to the predicate that decides whether a
+  // 15-minute wait gets repeated.
+  const { execFileSync } = await import('node:child_process');
+  const { isTimeout } = await import('./ai.js');
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  process.env.LGTM_TIMEOUT_MS = '150';
+  const startedAt = Date.now();
+  try {
+    execFileSync('sleep', ['5'], { timeout: 150, stdio: 'pipe' });
+    assert.fail('the child should have been killed');
+  } catch (e: any) {
+    assert.equal(isTimeout(e, startedAt), true, `real timeout error not recognised: ${JSON.stringify({ code: e?.code, killed: e?.killed, signal: e?.signal })}`);
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
+});
+
 test('isTimeout: a killed child is ours only if the wait actually elapsed', async () => {
   const { isTimeout } = await import('./ai.js');
   const saved = process.env.LGTM_TIMEOUT_MS;

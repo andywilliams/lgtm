@@ -1,4 +1,4 @@
-import { TimeoutError, type AIProvider, type RoundModelChoice } from './ai.js';
+import { isTimeoutError, type AIProvider, type RoundModelChoice } from './ai.js';
 import type { ReviewResult } from './types.js';
 
 /**
@@ -27,7 +27,7 @@ export async function reviewWithRecovery(opts: {
   const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
   // A timeout is never retried, whichever rung hit it: each one would spend the same
   // budget again, turning one 15-minute wait into three quarters of an hour.
-  const refuseTimeout = (e: any) => { if (e instanceof TimeoutError || e?.name === 'TimeoutError') throw e; };
+  const refuseTimeout = (e: any) => { if (isTimeoutError(e)) throw e; };
   const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
   let lastError: any;
   let freshened = false;

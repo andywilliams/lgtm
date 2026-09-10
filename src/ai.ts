@@ -105,7 +105,6 @@ export function takeUsage(): AIUsage {
   return out;
 }
 
-// Anthropic ids, the [1m] suffix, Vertex `@date` ids and Bedrock ARNs (`/`, `:`).
 /**
  * How long one model call may take before lgtm gives up and SAYS so. A review that
  * cannot finish used to hang with no output at all — four attempts on DWLF-136 produced
@@ -121,6 +120,15 @@ export function timeoutMs(): number {
 /** A call that ran out of time. Named so the recovery ladder can refuse to retry it. */
 export class TimeoutError extends Error {
   readonly name = 'TimeoutError';
+}
+
+/**
+ * One test for "this failure is a timeout", used everywhere. Both halves matter: the
+ * prototype check fails across module instances (a test importing twice, a bundled copy),
+ * and the name check alone would match anything that borrowed the name.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  return error instanceof TimeoutError || (error as any)?.name === 'TimeoutError';
 }
 
 /**
@@ -525,7 +533,7 @@ export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', op
     return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {
     // A timeout already knows what it is; do not probe the CLI to diagnose it.
-    if (error instanceof TimeoutError) throw error;
+    if (isTimeoutError(error)) throw error;
     // Only claim "CLI not found" when the binary genuinely isn't runnable NOW —
     // message-sniffing ('not found' / ENOENT) misdiagnoses unrelated failures
     // (e.g. codex exiting 0 without writing its output file) as a missing install.
