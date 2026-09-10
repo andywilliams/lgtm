@@ -65,9 +65,7 @@ describe('readers: what counts as a write', () => {
     assert.ok(!ids.includes('comment.only.event'));
     assert.ok(!ids.includes('test.only.event'));
 
-    // Only the object spread is treated as the emitted payload's builder.
-    const helpers = fieldsFromHelpers(diff, '/nonexistent-root');
-    assert.deepEqual(helpers, [], 'no repo to resolve helpers in — and no crash');
+    assert.deepEqual(fieldsFromHelpers(diff, '/nonexistent-root'), [], 'no repo to resolve helpers in — and no crash');
   });
 
   it('dedupes and caps the combined identifier list', async () => {
@@ -77,5 +75,50 @@ describe('readers: what counts as a write', () => {
     assert.equal(merged[0].why, 'event type', 'the first list wins a duplicate');
     assert.ok(merged.length <= 14, `capped, was ${merged.length}`);
     assert.equal(new Set(merged.map((m) => m.id)).size, merged.length, 'no duplicates');
+  });
+});
+
+describe('readers: following the payload helper', () => {
+  it('follows the payload helper an object spread names, and not an unrelated call', async () => {
+    const { fieldsFromHelpers } = await import('./readers.js');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-readers-'));
+    try {
+      writeFileSync(join(dir, 'helpers.ts'), [
+        'export function createPayload(s) {',
+        '  return { pivotTime: s.t, pivotIndex: s.i, price: s.p };',
+        '}',
+        'export function unrelatedThing(n) {',
+        '  return { neverEmitted: n };',
+        '}',
+      ].join('\n'));
+      const diff = [
+        '+++ b/src/emit.ts',
+        '+  const x = unrelatedThing(1);',
+        '+  emit({',
+        '+    ...createPayload(next),',
+        '+    cycleBreak: breakPayload,',
+        '+  });',
+      ].join('\n');
+      const fields = fieldsFromHelpers(diff, dir).map((f) => f.id);
+      // The spread names the emitted payload: its fields ARE things this change writes,
+      // read out of the helper's own body (single-line literal included).
+      assert.ok(fields.includes('pivotTime'), `object spread followed: ${fields.join(',') || '(none)'}`);
+      assert.ok(fields.includes('price'));
+      // A call that is neither spread into the payload nor named like a builder
+      // (create*/build*/make*/to* — a deliberate second net) is not followed.
+      assert.ok(!fields.includes('neverEmitted'), 'an unrelated call is not the payload');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a search root that does not exist instead of finding nothing', async () => {
+    const { searchRoots } = await import('./readers.js');
+    const { roots, missing } = searchRoots(process.cwd(), ['/definitely/not/here']);
+    assert.deepEqual(missing, ['/definitely/not/here']);
+    assert.ok(roots.includes(process.cwd()));
   });
 });

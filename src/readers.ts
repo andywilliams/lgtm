@@ -42,7 +42,9 @@ export function addedProductionLines(diff: string): string[] {
     // would otherwise be mined as though the code emitted it.
     const trimmed = code.trim();
     if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*') || trimmed.startsWith('#')) continue;
-    out.push(code.replace(/\/\/.*$/, ''));
+    // A whole-line comment is dropped above; a trailing one is left alone, because
+    // stripping from the first `//` also truncates any line that contains a URL.
+    out.push(code);
   }
   return out;
 }
@@ -88,18 +90,15 @@ export function extractWriteIdentifiers(diff: string): WriteIdentifier[] {
 export function fieldsFromHelpers(diff: string, repoRoot: string, maxHelpers = 3): WriteIdentifier[] {
   const added = addedProductionLines(diff);
   const helpers = new Set<string>();
-  // Spread first: `...createPayload(x)` IS the emitted object, where a `makeThing()`
-  // elsewhere in the diff may be anything. Order decides which survive the cap.
+  // Spread first: `{ ...createPayload(x) }` IS the emitted object, where `[...f(x)]` is
+  // an array and `g(...f(x))` an argument list. Matched over the added text as a whole so
+  // a spread on its own line inside a multi-line object literal still counts — its
+  // enclosing `{` sits on an earlier line, which a line-by-line rule cannot see.
   const spread = new Set<string>();
   const named = new Set<string>();
+  const blob = added.join('\n');
+  for (const m of blob.matchAll(/\{(?:[^{}[\]]|\n){0,400}?\.\.\.(\w{4,})\s*\(/g)) spread.add(m[1]);
   for (const line of added) {
-    // Object spread only — `{ ...createPayload(x) }` IS the emitted object, where
-    // `[...f(x)]` and `g(...f(x))` are an array and an argument list.
-    for (const m of line.matchAll(/\{[^}]*\.\.\.(\w{4,})\s*\(/g)) spread.add(m[1]);
-    if (/^\s*\.\.\.(\w{4,})\s*\(/.test(line)) {
-      // A spread on its own line inside a multi-line object literal.
-      spread.add(line.match(/^\s*\.\.\.(\w{4,})\s*\(/)![1]);
-    }
     for (const m of line.matchAll(/\b((?:create|build|make|to)[A-Z]\w+)\s*\(/g)) named.add(m[1]);
   }
   for (const h of [...spread, ...named]) helpers.add(h);
@@ -137,16 +136,38 @@ function definitionFiles(name: string, repoRoot: string): string[] {
   return files;
 }
 
+/** The `{...}` literals in a chunk of source, brace-matched and bounded. */
+function objectLiterals(body: string, max = 4): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < body.length && out.length < max; i++) {
+    if (body[i] !== '{') continue;
+    let depth = 0;
+    let j = i;
+    for (; j < body.length && j - i < 2000; j++) {
+      if (body[j] === '{') depth++;
+      else if (body[j] === '}') { depth--; if (depth === 0) break; }
+    }
+    if (depth === 0 && j > i) { out.push(body.slice(i, j + 1)); i = j; }
+  }
+  return out;
+}
+
 /** The object keys a helper assigns — its payload's shape, as far as a regex can see it. */
 function fieldsAssignedIn(file: string, helper: string, maxFields = 8): string[] {
   let text: string;
   try { text = readFileSync(file, 'utf-8'); } catch { return []; }
   const start = text.search(new RegExp(`(function\\s+${helper}\\b|const\\s+${helper}\\s*=|\\b${helper}\\s*[:=]\\s*\\()`));
   if (start === -1) return [];
-  // A window, not a parse: enough to cover a payload builder, cheap and predictable.
-  const body = text.slice(start, start + 4000);
+  // The helper's OWN body: brace-matched from its opening `{`, so a window does not run
+  // on into the next function and mine its object literals as this payload's fields.
+  const window = text.slice(start, start + 6000);
+  const [body = window] = objectLiterals(window, 1);
   const fields = new Set<string>();
-  for (const m of body.matchAll(/^\s*(\w{3,})\s*:/gm)) fields.add(m[1]);
+  // Keys of the object literals the helper builds — brace-matched, so a payload written
+  // on one line (`return { pivotTime: t, price: p };`) is read as well as a multi-line one.
+  for (const literal of objectLiterals(body)) {
+    for (const m of literal.matchAll(/(?:^|[{,\s])(\w{3,})\s*:/g)) fields.add(m[1]);
+  }
   for (const m of body.matchAll(/\b(?:payload|result|out|obj)\.(\w{3,})\s*=/g)) fields.add(m[1]);
   const noise = new Set(['type', 'name', 'value', 'data', 'return', 'const', 'this', 'true', 'false', 'null', 'string', 'number', 'boolean', 'default', 'case']);
   return [...fields].filter((f) => !noise.has(f)).slice(0, maxFields);
@@ -163,13 +184,15 @@ export interface ReaderHit {
 }
 
 /** Search roots: the repo, plus any sibling repos configured for cross-repo reads. */
-export function searchRoots(repoRoot: string, addDirs: string[] = []): string[] {
+export function searchRoots(repoRoot: string, addDirs: string[] = []): { roots: string[]; missing: string[] } {
   const fromEnv = (process.env.LGTM_SIBLING_DIRS ?? '')
     .split(':')
     .map((d) => d.trim())
     .filter(Boolean);
-  const roots = [repoRoot, ...addDirs, ...fromEnv].map((d) => resolve(d));
-  return [...new Set(roots)].filter((d) => existsSync(d));
+  const wanted = [...new Set([repoRoot, ...addDirs, ...fromEnv].map((d) => resolve(d)))];
+  // A directory that is not there is reported, never silently dropped: its absence would
+  // otherwise turn into "nothing outside this repo reads what you write".
+  return { roots: wanted.filter((d) => existsSync(d)), missing: wanted.filter((d) => !existsSync(d)) };
 }
 
 /** True once a search tool has actually run — so "nothing reads this" is a result, not a silence. */
@@ -221,6 +244,7 @@ export function mergeIdentifiers(...lists: WriteIdentifier[][]): WriteIdentifier
   return [...seen.values()].slice(0, MAX_IDENTIFIERS + 6);
 }
 
+/** Where each written identifier is read, outside the files the diff changes. */
 export function findReaders(identifiers: WriteIdentifier[], roots: string[], options: FindReadersOptions): ReaderHit[] {
   const { changedFiles, maxFilesPerRoot = 3, maxTotalLines = 160 } = options;
   const changed = new Set(changedFiles.map((f) => resolve(f)));

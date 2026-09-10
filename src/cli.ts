@@ -751,13 +751,16 @@ async function runReview(options: RunOptions): Promise<void> {
   if (readersEnabled !== false) {
     const identifiers = mergeIdentifiers(extractWriteIdentifiers(diff), fieldsFromHelpers(diff, getRepoRoot()));
     if (identifiers.length > 0) {
-      const roots = searchRoots(getRepoRoot(), addDirs ?? []);
-      const changedAbs = changedFilesOf().map((f) => (f.startsWith('/') ? f : `${getRepoRoot()}/${f}`));
+      const repoRootForReaders = getRepoRoot();
+      const { roots, missing } = searchRoots(repoRootForReaders, addDirs ?? []);
+      for (const m of missing) console.error(chalk.yellow(`⚠  --add-dir/LGTM_SIBLING_DIRS names ${m}, which does not exist — its readers were NOT searched.`));
+      const changedAbs = changedFilesOf().map((f) => (f.startsWith('/') ? f : `${repoRootForReaders}/${f}`));
       const hits = findReaders(identifiers, roots, { changedFiles: changedAbs });
-      readersContextStr = formatReadersContext(hits, getRepoRoot());
+      readersContextStr = formatReadersContext(hits, repoRootForReaders);
       if (hits.length > 0) {
         log(chalk.blue(`\n📡 Readers of what this diff writes:`));
-        for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.file.startsWith(getRepoRoot()) ? h.file.slice(getRepoRoot().length + 1) : `${h.file} (another repo)`}`));
+        // The same foreign test the prompt uses — the carried root, not a path prefix.
+        for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.root === repoRootForReaders ? relative(repoRootForReaders, h.file) : `${h.file} (another repo)`}`));
       } else if (readersSearchRan()) {
         log(chalk.gray(`\n📡 Nothing outside the changed files reads what this diff writes (${identifiers.length} identifier(s) searched)`));
       } else {
