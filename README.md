@@ -218,6 +218,18 @@ Each finding carries its own triage fields: `kind` (`added`, or `removed` / `mis
 
 Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
 
+### Who reads what this diff writes
+
+A diff review cannot see its own consumers: the reader never appears in the diff. Before each review lgtm pulls the identifiers the added production lines **write** — event type literals, table names, persisted fields, exported symbols, and the fields of any payload helper the change spreads into its output — then greps for who **reads** them outside the changed files.
+
+```bash
+lgtm review 86 --add-dir ../dwlf-scheduled-jobs   # also search a sibling repo
+export LGTM_SIBLING_DIRS=~/dev/jobs:~/dev/api      # or configure it once
+lgtm review 86 --no-readers                        # off for this run
+```
+
+A reader in another repository is labelled as one this diff cannot have updated. If neither `rg` nor `grep` runs, or a named directory is missing, the review says so rather than reporting that nothing reads anything.
+
 ### One session per loop — the prompt cache does the rest
 
 The first round of a loop opens a Claude session and sends the full, stable-first prompt. Every later round **resumes** that session and sends only what moved: the current contents of files changed since the session last saw them, the current diff, and the per-round instructions. Everything the session already holds is a prompt-cache read. Measured: a resumed turn read 86k of 86k tokens from cache and cost $0.018 against $0.32 for the first. A session is continued when its model role fits the round: the same role, or a full-model session carrying a round that would merely have gone cheaper (a cached full-model turn beats an uncached cheaper one); a cheaper-model session is not continued into a round that needs the full model, and `--model` is matched exactly. A charter, standards or handbook edited mid-loop reaches the session as updated context; an lgtm upgrade that changes the reviewer's own rules restarts it. `--fresh` starts a new session; `LGTM_SESSIONS=off` makes every round a one-off call. One transcript per loop is written under the CLI's project dir for the repo and is subject to the CLI's own retention (`cleanupPeriodDays`, 30 by default).

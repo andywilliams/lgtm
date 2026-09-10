@@ -24,6 +24,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
 import { planSession, modelRoleOf } from './session.js';
+import { extractWriteIdentifiers, failedSearchRoots, fieldsFromHelpers, findReaders, formatReadersContext, mergeIdentifiers, readersSearchRan, searchRoots } from './readers.js';
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
@@ -107,6 +108,7 @@ program.addHelpText(
     '  LGTM_EFFORT                   low|medium|high|xhigh|max (default: your settings effort for that model)\n' +
     '  LGTM_LATE_MODEL               model for late (round 4+) chill review rounds (default claude-sonnet-5; "off" = always the full model)\n' +
     '  LGTM_SESSIONS                 "off" = every round is a one-off call (default: one Claude session per loop, resumed each round for the prompt cache)\n' +
+    '  LGTM_SIBLING_DIRS             colon-separated repos to also search for readers of what a diff writes (same as repeating --add-dir)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -122,6 +124,8 @@ program
   .option('--override <reason>', `Run a round past the ${ROUND_BUDGET}-round budget; the reason is recorded with the round`)
   .option('--model <id>', 'Model to review with (default: your settings model; late chill rounds use LGTM_LATE_MODEL, claude-sonnet-5, unless set to off)')
   .option('--fresh', 'Start a new loop session instead of continuing the existing one (LGTM_SESSIONS=off disables sessions entirely)', false)
+  .option('--add-dir <path>', 'Also search this directory for readers of what the diff writes (repeatable; LGTM_SIBLING_DIRS does the same)', (v: string, acc: string[]) => [...acc, v], [])
+  .option('--no-readers', 'Skip the readers-of-what-this-writes search (on by default)')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -257,6 +261,8 @@ program
         explicitModel: options.model,
         harshnessExplicit,
         fresh: options.fresh,
+        addDirs: options.addDir ?? [],
+        readersEnabled: options.readers !== false,
         policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
@@ -310,6 +316,9 @@ interface RunOptions {
   harshnessExplicit?: boolean;
   /** `--fresh`: do not continue the loop's session. */
   fresh?: boolean;
+  /** Extra roots to search for readers of what the diff writes. */
+  addDirs?: string[];
+  readersEnabled?: boolean;
   /**
    * What the round policy needs from the log; absent when the log was unavailable.
    * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
@@ -616,7 +625,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, policy, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, addDirs, readersEnabled, policy, charterEnabled, standardsEnabled } = options;
   let harshness = options.harshness;
   // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
   // asking "is it safe now?", which is chill's question — unless -H said otherwise.
@@ -735,6 +744,33 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
+  // Who READS what this diff writes — the question a diff review structurally cannot
+  // answer, because the reader never appears in the diff (DWLF-127's Telegram alerts,
+  // indicators' pivotTime sort key). Deterministic: identifiers out, grep in.
+  let readersContextStr = '';
+  if (readersEnabled !== false) {
+    const identifiers = mergeIdentifiers(extractWriteIdentifiers(diff), fieldsFromHelpers(diff, getRepoRoot()));
+    if (identifiers.length > 0) {
+      const repoRootForReaders = getRepoRoot();
+      const { roots, missing } = searchRoots(repoRootForReaders, addDirs ?? []);
+      for (const m of missing) console.error(chalk.yellow(`⚠  --add-dir/LGTM_SIBLING_DIRS names ${m}, which does not exist — its readers were NOT searched.`));
+      const changedAbs = changedFilesOf().map((f) => (f.startsWith('/') ? f : `${repoRootForReaders}/${f}`));
+      const hits = findReaders(identifiers, roots, { changedFiles: changedAbs });
+      readersContextStr = formatReadersContext(hits, repoRootForReaders);
+      if (hits.length > 0) {
+        log(chalk.blue(`\n📡 Readers of what this diff writes:`));
+        // The same foreign test the prompt uses — the carried root, not a path prefix.
+        for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.root === repoRootForReaders ? relative(repoRootForReaders, h.file) : `${h.file} (another repo)`}`));
+      } else if (readersSearchRan()) {
+        log(chalk.gray(`\n📡 Nothing outside the changed files reads what this diff writes (${identifiers.length} identifier(s) searched)`));
+      } else {
+        // Never report an absence the search could not have found: no rg, no grep, no answer.
+        log(chalk.yellow(`\n📡 Could not search for readers — neither rg nor grep ran. This review is blind to who reads what it writes.`));
+      }
+      for (const f of failedSearchRoots()) console.error(chalk.yellow(`⚠  the reader search failed under ${f} — this review is blind to consumers there.`));
+    }
+  }
+
   // Optional domain context from a local second-brain (opt-in via LGTM_BRAIN_DIR /
   // LGTM_BRAIN_URL). No-op — and silent — for anyone who hasn't configured one.
   const handbookContextStr = await fetchBrainContext(repo);
@@ -829,6 +865,7 @@ async function runReview(options: RunOptions): Promise<void> {
     if (session) started.add(session.id);
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
       scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
+      readersContext: readersContextStr,
       session: session ? { ...session, round: policy?.loopRound ?? 1 } : undefined,
     });
   };
