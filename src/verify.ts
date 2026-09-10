@@ -1,4 +1,4 @@
-import { runAIPrompt, setModelOverride, getModelOverride, resolveModel, DEFAULT_LATE_MODEL, type AIProvider } from './ai.js';
+import { runAIPrompt, setModelOverride, getModelOverride, resolveModel, isModelId, DEFAULT_LATE_MODEL, type AIProvider } from './ai.js';
 import { extractJsonObject } from './review.js';
 import type { ReviewComment, Severity, Verdict } from './types.js';
 
@@ -34,16 +34,37 @@ export function verifyMaxContextBytes(raw = process.env.LGTM_VERIFY_MAX_BYTES): 
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_CONTEXT_BYTES;
 }
 
-/** The model the verifier runs on when none is named: the same cheap model late rounds use. */
-export function verifyModel(fullModel: string | undefined = resolveModel()): { model: string | undefined; reason: string } {
-  const explicit = process.env.LGTM_VERIFY_MODEL?.trim();
-  if (explicit && explicit.toLowerCase() !== 'off') return { model: explicit, reason: 'LGTM_VERIFY_MODEL' };
+export interface VerifyModelChoice {
+  /** False when the operator turned the pass off with LGTM_VERIFY_MODEL=off. */
+  enabled: boolean;
+  /** undefined ⇒ run the verifier on the operator's own (full) model. */
+  model: string | undefined;
+  reason: string;
+}
+
+/**
+ * Which model the verifier runs on. Mirrors `lateModel` deliberately, including its two
+ * failure modes: `off` DISABLES the pass (the same idiom as `LGTM_LATE_MODEL=off`, which
+ * turns off the policy it names), and a value that is not a model id warns and falls back
+ * rather than being passed through — unvalidated, it reaches `setModelOverride`, throws
+ * inside the pass's own guard, and every round then silently verifies nothing.
+ */
+export function verifyModel(fullModel: string | undefined = resolveModel()): VerifyModelChoice {
+  let explicit = process.env.LGTM_VERIFY_MODEL?.trim();
+  if (explicit && explicit.toLowerCase() === 'off') return { enabled: false, model: undefined, reason: 'LGTM_VERIFY_MODEL=off' };
+  let note = '';
+  if (explicit !== undefined && explicit !== '' && !isModelId(explicit)) {
+    process.stderr.write(`lgtm: ignoring LGTM_VERIFY_MODEL=${JSON.stringify(explicit)} (not a model id)\n`);
+    note = ` (LGTM_VERIFY_MODEL=${JSON.stringify(explicit)} ignored: not a model id)`;
+    explicit = undefined;
+  }
+  if (explicit) return { enabled: true, model: explicit, reason: 'LGTM_VERIFY_MODEL' };
   // Same first-party guard as the late-round policy: a Bedrock ARN or Vertex id operator
   // opts in by naming a verifier model rather than having a claude-* id assumed for them.
   if (fullModel !== undefined && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
-    return { model: undefined, reason: 'full model is not a first-party id — verifying on it (set LGTM_VERIFY_MODEL to use a cheaper one)' };
+    return { enabled: true, model: undefined, reason: `full model is not a first-party id — verifying on it (set LGTM_VERIFY_MODEL to use a cheaper one)${note}` };
   }
-  return { model: DEFAULT_LATE_MODEL, reason: 'default verifier model' };
+  return { enabled: true, model: DEFAULT_LATE_MODEL, reason: `default verifier model${note}` };
 }
 
 /** The shape a verify reply must have — used on the schema retry, not on the first call. */
@@ -129,8 +150,11 @@ function mergeRanges(ranges: [number, number][]): [number, number][] {
 export function buildWindows(findings: ReviewComment[], contents: Record<string, string>, maxBytes: number): string {
   const byFile = new Map<string, [number, number][]>();
   for (const f of findings) {
-    const text = contents[f.file];
-    if (text === undefined) continue;
+    // Own properties only: `file` comes from the model, and "toString" or "constructor"
+    // would otherwise resolve to an inherited function and blow up on .split below —
+    // inside the one statement that used to sit outside this pass's never-throws guard.
+    const text = Object.prototype.hasOwnProperty.call(contents, f.file) ? contents[f.file] : undefined;
+    if (typeof text !== 'string') continue;
     const total = text.split('\n').length;
     const from = Math.max(1, f.line - WINDOW_LINES);
     const to = Math.min(total, f.line + WINDOW_LINES);
@@ -140,7 +164,7 @@ export function buildWindows(findings: ReviewComment[], contents: Record<string,
   let out = '';
   let truncated = false;
   for (const [file, ranges] of [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-    const lines = contents[file].split('\n');
+    const lines = contents[file]!.split('\n');
     for (const [from, to] of mergeRanges(ranges)) {
       const numbered = lines.slice(from - 1, to).map((l, i) => `${from + i}\t${l}`).join('\n');
       const block = `### ${file} — lines ${from}-${to} (current contents)\n\`\`\`\n${numbered}\n\`\`\`\n\n`;
@@ -293,11 +317,14 @@ export function verifyFindings(input: VerifyInput & {
 }): VerifyOutcome {
   const { ai, model, findings } = input;
   if (findings.length === 0) return { comments: findings };
-  const prompt = buildVerifyPrompt(input);
   // The override is process-wide, so the verifier's cheaper model is put back exactly as
   // it was found: the review's own choice is still set when this runs.
   const previous = getModelOverride();
   try {
+    // Inside the guard, not above it: this is the statement that consumes untrusted model
+    // output (a finding's `file` and `line`), and the function's contract is that a review
+    // already paid for is never lost to something that happens after it.
+    const prompt = buildVerifyPrompt(input);
     if (ai === 'claude') setModelOverride(model);
     let output: string;
     try {

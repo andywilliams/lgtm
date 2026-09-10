@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, verifyModel, verifyMaxContextBytes, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
 const finding = (over: Partial<ReviewComment> = {}): ReviewComment => ({
@@ -130,6 +131,12 @@ describe('buildWindows', () => {
   test('no windows at all produces nothing rather than an empty header', () => {
     assert.equal(buildWindows([], { 'src/a.ts': file }, 100_000), '');
   });
+
+  test('a file name that is an inherited property is not a file', () => {
+    // `file` is model output; a bare contents[f.file] resolves "toString" to a function.
+    assert.equal(buildWindows([finding({ file: 'toString' })], { 'src/a.ts': file }, 100_000), '');
+    assert.equal(buildWindows([finding({ file: 'constructor' })], {}, 100_000), '');
+  });
 });
 
 describe('buildVerifyPrompt', () => {
@@ -162,10 +169,23 @@ describe('buildVerifyPrompt', () => {
 describe('configuration', () => {
   test('the verifier model defaults to the cheap one, is overridable, and is not assumed for a non-first-party id', () => {
     delete process.env.LGTM_VERIFY_MODEL;
-    assert.equal(verifyModel('claude-opus-5').model, 'claude-sonnet-5');
+    assert.deepEqual({ ...verifyModel('claude-opus-5'), reason: '' }, { enabled: true, model: 'claude-sonnet-5', reason: '' });
     assert.equal(verifyModel('arn:aws:bedrock:eu-west-2::foundation-model/x').model, undefined);
     process.env.LGTM_VERIFY_MODEL = 'claude-haiku-4-5-20251001';
     assert.equal(verifyModel('claude-opus-5').model, 'claude-haiku-4-5-20251001');
+    delete process.env.LGTM_VERIFY_MODEL;
+  });
+
+  test('LGTM_VERIFY_MODEL=off turns the pass off; junk is ignored rather than passed through', () => {
+    process.env.LGTM_VERIFY_MODEL = 'off';
+    assert.equal(verifyModel('claude-opus-5').enabled, false, 'the same idiom as LGTM_LATE_MODEL=off');
+    // Unvalidated, a typo reaches setModelOverride, throws inside the pass's own guard,
+    // and every round silently verifies nothing with no warning anywhere.
+    process.env.LGTM_VERIFY_MODEL = 'sonnet please';
+    const junk = verifyModel('claude-opus-5');
+    assert.equal(junk.enabled, true);
+    assert.equal(junk.model, 'claude-sonnet-5', 'falls back to the default');
+    assert.match(junk.reason, /ignored: not a model id/);
     delete process.env.LGTM_VERIFY_MODEL;
   });
 
@@ -174,5 +194,62 @@ describe('configuration', () => {
     assert.equal(verifyMaxContextBytes('-5'), verifyMaxContextBytes(undefined));
     assert.equal(verifyMaxContextBytes('banana'), verifyMaxContextBytes(undefined));
     assert.equal(verifyMaxContextBytes('1234'), 1234);
+  });
+});
+
+
+describe('verifyFindings — the contract that must hold when it goes wrong', () => {
+  test('a pass that cannot run leaves every finding exactly as raised, and says why', () => {
+    // LGTM_NO_CALL is the "stop before any model call" sentinel: the closest thing to a
+    // CLI that is missing, broken or refusing, without spending anything.
+    process.env.LGTM_NO_CALL = '1';
+    try {
+      const findings = [finding({ severity: 'BUG' }), finding({ severity: 'SUGGESTION', title: 'nit' })];
+      const out = verifyFindings({ diff: 'd', prTitle: 'T', findings, ai: 'claude', model: 'claude-sonnet-5' });
+      assert.match(out.failed ?? '', /LGTM_NO_CALL/);
+      assert.deepEqual(out.comments, findings, 'not one finding is altered, and none is dropped');
+      assert.deepEqual(dropped(out.comments), []);
+    } finally {
+      delete process.env.LGTM_NO_CALL;
+    }
+  });
+
+  test('it puts the review\'s model back, even when it fails', () => {
+    // The override is process-wide: leaving the verifier's cheaper model set would run
+    // whatever the command does after this on it.
+    process.env.LGTM_NO_CALL = '1';
+    setModelOverride('claude-opus-5');
+    try {
+      verifyFindings({ diff: 'd', prTitle: 'T', findings: [finding()], ai: 'claude', model: 'claude-sonnet-5' });
+      assert.equal(getModelOverride(), 'claude-opus-5');
+    } finally {
+      delete process.env.LGTM_NO_CALL;
+      setModelOverride(undefined);
+    }
+  });
+
+  test('a finding whose file names an inherited property does not escape the guard', () => {
+    // `file` is model output. Before the fix, buildVerifyPrompt ran ABOVE the try and
+    // indexed `contents[f.file]` bare, so "toString" resolved to a function and threw out
+    // of the function documented as never throwing — losing a review already paid for.
+    process.env.LGTM_NO_CALL = '1';
+    try {
+      const out = verifyFindings({ diff: 'd', prTitle: 'T', findings: [finding({ file: 'toString' })], contents: { 'src/a.ts': 'x' }, ai: 'claude' });
+      assert.ok(out.failed, 'it reports a failure rather than throwing');
+      assert.equal(out.comments.length, 1);
+    } finally {
+      delete process.env.LGTM_NO_CALL;
+    }
+  });
+
+  test('nothing to verify means no model call at all', () => {
+    process.env.LGTM_NO_CALL = '1';
+    try {
+      const out = verifyFindings({ diff: 'd', prTitle: 'T', findings: [], ai: 'claude' });
+      assert.deepEqual(out.comments, []);
+      assert.equal(out.failed, undefined, 'an empty round is not a failed pass');
+    } finally {
+      delete process.env.LGTM_NO_CALL;
+    }
   });
 });

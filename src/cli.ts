@@ -22,7 +22,7 @@ import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } fr
 import { expandContext } from './contextExpander.js';
 import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice, type LoopSession } from './db.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, mergeUsage, emptyUsage, DEFAULT_LATE_MODEL, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
+import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, mergeRoundUsage, emptyUsage, DEFAULT_LATE_MODEL, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
 import { verifyFindings, verifyModel, kept, dropped, type VerifyOutcome } from './verify.js';
 import { planSession, modelRoleOf } from './session.js';
@@ -944,10 +944,17 @@ async function runReview(options: RunOptions): Promise<void> {
   const reviewUsage = takeUsage();
   let verifyOutcome: VerifyOutcome | null = null;
   let verifyUsage = emptyUsage();
-  if (verifyEnabled && result.comments.length > 0) {
+  const verifyChoice = options.verifyModel
+    ? { enabled: true, model: options.verifyModel, reason: '--verify-model' }
+    : verifyModel();
+  if (verifyEnabled && !verifyChoice.enabled) {
+    const off = `⚖  verifier pass off — ${verifyChoice.reason}`;
+    if (auto) console.error(chalk.gray(off)); else log(chalk.gray(off));
+  }
+  if (verifyEnabled && verifyChoice.enabled && result.comments.length > 0) {
     const vAi = options.verifyAi ?? ai;
-    const chosen = options.verifyModel ?? (vAi === 'claude' ? verifyModel().model : undefined);
-    const line = `⚖  verifying ${result.comments.length} finding(s) on ${chosen ?? `${vAi}'s default model`}`;
+    const chosen = vAi === 'claude' ? verifyChoice.model : undefined;
+    const line = `⚖  verifying ${result.comments.length} finding(s) on ${chosen ?? `${vAi}'s default model`} (${verifyChoice.reason})`;
     if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
     verifyOutcome = verifyFindings({
       diff: truncatedDiff, prTitle: pr.title, findings: result.comments, contents: contentsSeen,
@@ -963,7 +970,11 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
   const droppedComments = dropped(result.comments);
+  // What is DISPLAYED. `--show-dropped` is an audit flag for reading the pass, so it must
+  // not reach the posting path: a refuted finding posted to a PR carries no marker saying
+  // so, and would be indistinguishable from one nothing ever checked.
   const shownComments = showDropped ? result.comments : kept(result.comments);
+  const postableComments = kept(result.comments);
   // A refuted BUG/SECURITY is the one drop that can cost something, so it is always said
   // out loud even though it is not shown as a finding — a bad drop must be visible.
   for (const d of droppedComments) {
@@ -990,7 +1001,7 @@ async function runReview(options: RunOptions): Promise<void> {
     filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice,
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(choice),
-    usage: mergeUsage(reviewUsage, verifyUsage),
+    usage: mergeRoundUsage(reviewUsage, verifyUsage),
     verify: verifyOutcome ? { model: verifyOutcome.model, usage: verifyUsage, failed: verifyOutcome.failed } : undefined,
   });
   // The stopping rule, said out loud every round — on stderr in agent mode so the
@@ -1081,7 +1092,7 @@ async function runReview(options: RunOptions): Promise<void> {
     return;
   }
 
-  if (shownComments.length === 0) {
+  if (postableComments.length === 0) {
     if (auto) {
       console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
     } else {
@@ -1092,8 +1103,8 @@ async function runReview(options: RunOptions): Promise<void> {
 
   log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
   const existingComments = getExistingReviewComments(prNumber, repo);
-  const commentsToReview = shownComments.filter((comment) => !isDuplicateComment(comment, existingComments));
-  const duplicateCount = shownComments.length - commentsToReview.length;
+  const commentsToReview = postableComments.filter((comment) => !isDuplicateComment(comment, existingComments));
+  const duplicateCount = postableComments.length - commentsToReview.length;
 
   if (duplicateCount > 0) {
     log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
@@ -1803,14 +1814,23 @@ program
     console.log(`API-equivalent cost so far: $${summary.totalCostUsd.toFixed(2)}  (the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
     // The point of storing drops: the false-positive share is a number, per loop, from
     // the tool's own log rather than from anyone's recollection of a bad review.
-    const checked = summary.rounds.reduce((n, r) => n + r.findings + r.dropped, 0);
-    const drops = summary.rounds.reduce((n, r) => n + r.dropped, 0);
+    // Only rounds the verifier actually CHECKED are in the denominator. Counting rounds
+    // that predate the pass, ran --no-verify, or whose pass failed would divide the drops
+    // by findings nobody adjudicated and quietly understate the false-positive share —
+    // which is the one number this feature is justified by.
+    const adjudicated = summary.rounds.filter((r) => r.verified && !r.verifyFailed);
+    const checked = adjudicated.reduce((n, r) => n + r.findings + r.dropped, 0);
+    const drops = adjudicated.reduce((n, r) => n + r.dropped, 0);
     const verifySpend = summary.rounds.reduce((n, r) => n + (r.verifyCostUsd ?? 0), 0);
-    if (checked > 0 && summary.rounds.some((r) => r.verifyModel !== null)) {
+    const unchecked = summary.rounds.filter((r) => r.verifyFailed);
+    if (checked > 0) {
       console.log(
-        `Verifier: dropped ${drops} of ${checked} finding(s) — ${((drops / checked) * 100).toFixed(0)}% — for $${verifySpend.toFixed(2)} ` +
+        `Verifier: dropped ${drops} of ${checked} finding(s) over ${adjudicated.length} round(s) — ${((drops / checked) * 100).toFixed(0)}% — for $${verifySpend.toFixed(2)} ` +
         `(${(verifySpend / Math.max(summary.totalCostUsd - verifySpend, 1e-9) * 100).toFixed(0)}% on top of the reviews)`
       );
+    }
+    for (const r of unchecked) {
+      console.log(chalk.yellow(`⚠  round ${r.round}: the verifier ran and could not answer (${r.verifyFailed}) — its findings are unchecked, not clean`));
     }
     if (last > 0) {
       const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);

@@ -105,6 +105,10 @@ const REVIEW_COLUMNS: [string, string][] = [
   // a subtraction, not an estimate. NULL when the pass did not run; `verify_failed` holds
   // why when it ran and could not answer, since "nothing dropped" and "nothing checked"
   // are different rounds.
+  // 1 when the pass RAN. A pass can run with no model id (the operator's own model is
+  // not a first-party one), so verify_model being NULL cannot stand for "did not run" —
+  // and "nothing was dropped" and "nothing was checked" must not read the same.
+  ['verify_ran', 'INTEGER'],
   ['verify_model', 'TEXT'],
   ['verify_cost_usd', 'REAL'],
   ['verify_tokens', 'INTEGER'],
@@ -340,15 +344,17 @@ interface RunRow {
   file_shas: string | null;
   model_role: string | null;
   context_tokens: number | null;
+  verify_ran: number | null;
   verify_model: string | null;
   verify_cost_usd: number | null;
+  verify_failed: string | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens, verify_model, verify_cost_usd FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens, verify_ran, verify_model, verify_cost_usd, verify_failed FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -389,9 +395,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
       mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens,
-      verify_model, verify_cost_usd, verify_tokens, verify_failed
+      verify_ran, verify_model, verify_cost_usd, verify_tokens, verify_failed
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -432,6 +438,7 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.modelRole ?? null,
     m ? m.lastPromptTokens : null,
     u ? u.sentTokens : null,
+    data.verify ? 1 : 0,
     data.verify?.model ?? null,
     data.verify?.costUsd ?? null,
     data.verify?.tokens ?? null,
@@ -686,6 +693,10 @@ export interface RoundRow {
   dismissed: number;
   carried: number;
   suppressed: number;
+  /** True when the verifier pass ran on this round at all — the denominator of a drop rate. */
+  verified: boolean;
+  /** Why the pass could not answer, when it ran and could not: the round is UNCHECKED, not clean. */
+  verifyFailed: string | null;
   /** The verifier pass's own spend, when it ran. */
   verifyCostUsd: number | null;
   verifyModel: string | null;
@@ -758,6 +769,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     dismissed: 0,
     carried: 0,
     suppressed: 0,
+    verified: Boolean(r.verify_ran),
+    verifyFailed: r.verify_failed,
     verifyCostUsd: r.verify_cost_usd,
     verifyModel: r.verify_model,
   }));

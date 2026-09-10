@@ -230,7 +230,11 @@ lgtm review 86 --no-verify                 # off
 lgtm review 86 --verify-model claude-haiku-4-5-20251001
 lgtm review 86 --verify-ai codex           # a different model FAMILY, for decorrelation
 lgtm review 86 --agent --show-dropped      # audit the pass: show what it dropped
+export LGTM_VERIFY_MODEL=off               # turn the pass off everywhere
 ```
+
+`--show-dropped` changes what is *displayed*, never what is posted: a refuted finding is never pushed to a PR.
+
 
 Each finding comes back with a verdict:
 
@@ -243,7 +247,7 @@ Each finding comes back with a verdict:
 
 Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`.
 
-Drops are never silent. They are stored in `reviews.db` (so the false-positive share per round is a number, not a memory), listed under `verify.dropped` in agent output, and any dropped BUG/SECURITY prints a line on stderr. A dropped finding is **not** fed back as a dismissal — the next round is free to raise it again, so one bad drop cannot silence a real bug for the rest of a loop.
+Drops are never silent. They are stored in `reviews.db` (so the false-positive share per round is a number, not a memory), listed under `verify.dropped` in agent output, and any dropped BUG/SECURITY prints a line on stderr. `lgtm rounds` divides the drops only by the findings a pass actually adjudicated, and names any round whose verifier ran and could not answer — those findings are *unchecked*, which is not the same as clean. A dropped finding is **not** fed back as a dismissal — the next round is free to raise it again, so one bad drop cannot silence a real bug for the rest of a loop.
 
 The verifier is deliberately given the diff and a window around each finding rather than the whole context: its question is per-finding, so its cost scales with the number of findings. Measured, it runs on `LGTM_VERIFY_MODEL` (default `claude-sonnet-5`) and `lgtm rounds` prints what it cost as a percentage on top of the reviews.
 

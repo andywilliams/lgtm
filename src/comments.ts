@@ -20,7 +20,10 @@ export function formatReviewCommentBody(comment: ReviewComment): string {
     const verdict = comment.verdict === 'confirmed'
       ? 'Confirmed by a second review pass'
       : 'A second review pass could not prove this from the code it was shown';
-    body += `\n\n_${verdict}${comment.verifier_note ? `: ${comment.verifier_note}` : '.'}_`;
+    // One sentence, always closed: the note comes from a model and may or may not end
+    // in a full stop, and half a sentence in italics reads as truncated output.
+    const note = comment.verifier_note?.trim().replace(/[.\s]+$/, '');
+    body += `\n\n_${verdict}${note ? `: ${note}` : ''}._`;
     if (comment.original_severity) body += `\n\n_Severity lowered from ${comment.original_severity} by that pass._`;
   }
   if (comment.suggestion) {

@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeRoundUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -314,32 +314,45 @@ test('isTimeout: a killed child is ours only if the wait actually elapsed', asyn
   }
 });
 
-describe('mergeUsage', () => {
+describe('mergeRoundUsage', () => {
   const u = (over: Partial<AIUsage> = {}): AIUsage => ({ ...emptyUsage(), calls: 1, ...over });
 
   test('sums the spend of the review and the verifier pass', () => {
-    const merged = mergeUsage(
+    const merged = mergeRoundUsage(
       u({ inputTokens: 100, cacheReadTokens: 900, outputTokens: 50, costUsd: 1.5, durationMs: 1000, models: ['claude-opus-5'], sentTokens: 250, lastPromptTokens: 1000 }),
       u({ inputTokens: 20, outputTokens: 5, costUsd: 0.04, durationMs: 300, models: ['claude-sonnet-5'], sentTokens: 30, lastPromptTokens: 20 }),
     );
     assert.equal(merged.costUsd, 1.54);
     assert.equal(merged.calls, 2);
-    assert.equal(merged.sentTokens, 280);
+    assert.equal(merged.outputTokens, 55);
     assert.deepEqual(merged.models, ['claude-opus-5', 'claude-sonnet-5']);
-    // The session holds the REVIEW's context; the verifier runs outside it and must not
-    // be read as having grown it, or the next round's session budget is wrong.
+  });
+
+  test('the session-shaped fields are the SESSION window\'s, never the sum', () => {
+    // Both are read back by planSession to decide whether the session has room for
+    // another round. The verifier's prompt is not in the session, so summing them charges
+    // it phantom context and abandons it early — re-sending the whole prompt uncached.
+    const merged = mergeRoundUsage(
+      u({ sentTokens: 250, lastPromptTokens: 1000, costUsd: 1.5 }),
+      u({ sentTokens: 30, lastPromptTokens: 20, costUsd: 0.04 }),
+    );
+    assert.equal(merged.sentTokens, 250);
     assert.equal(merged.lastPromptTokens, 1000);
+    assert.equal(merged.costUsd, 1.54, 'the money is still the total');
   });
 
   test('an unmeasured half taints the total rather than reading as a low bill', () => {
-    assert.equal(mergeUsage(u({ costUsd: 1 }), u({ measured: false })).measured, false);
-    assert.equal(mergeUsage(u({ measured: false }), u({ costUsd: 1 })).measured, false);
+    assert.equal(mergeRoundUsage(u({ costUsd: 1 }), u({ measured: false })).measured, false);
+    assert.equal(mergeRoundUsage(u({ measured: false }), u({ costUsd: 1 })).measured, false);
   });
 
-  test('a window with no calls is ignored, not averaged in', () => {
-    const review = u({ costUsd: 2, lastPromptTokens: 500 });
-    assert.deepEqual(mergeUsage(review, emptyUsage()), review);
-    assert.deepEqual(mergeUsage(emptyUsage(), review), review);
+  test('a window with no calls is ignored, and a verifier with no review before it grows no session', () => {
+    const review = u({ costUsd: 2, lastPromptTokens: 500, sentTokens: 400 });
+    assert.deepEqual(mergeRoundUsage(review, emptyUsage()), review);
+    const verifyOnly = mergeRoundUsage(emptyUsage(), review);
+    assert.equal(verifyOnly.costUsd, 2);
+    assert.equal(verifyOnly.sentTokens, 0, 'an outside call never counts as session context');
+    assert.equal(verifyOnly.lastPromptTokens, 0);
   });
 });
 
