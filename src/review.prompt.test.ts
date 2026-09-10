@@ -11,6 +11,7 @@ const base = {
   usageContext: '## Usage\nused in b.ts',
   expandedContext: '## Expanded Context (Auto-discovered)\n### src/b.ts',
   handbookContext: '## Handbook\nslash-form symbols',
+  readersContext: '## Readers of what this diff writes\n### `thing.done`\n- other/repo.ts (ANOTHER REPOSITORY)',
   extra: { scope: 'add the thing', charter: '## Architecture Charter\ninvariant 1', standards: '## Standards\nG5', decided: [{ title: 'Rename', reason: 'domain term' }] },
 };
 
@@ -18,7 +19,7 @@ test('everything stable across a loop precedes the first volatile byte; everythi
   const stable = buildStablePrefix(base);
   const volatile = buildVolatileTail(base);
   assert.equal(buildReviewPrompt(base), stable + volatile);
-  for (const s of ['You are a senior code reviewer', 'slash-form symbols', 'invariant 1', '## Standards', 'src/b.ts', 'const a = 1;', 'used in b.ts']) {
+  for (const s of ['You are a senior code reviewer', 'slash-form symbols', 'invariant 1', '## Standards', 'src/b.ts', 'const a = 1;', 'used in b.ts', 'ANOTHER REPOSITORY']) {
     assert.ok(stable.includes(s), `stable prefix carries: ${s}`);
     assert.ok(!volatile.includes(s) || s === 'const a = 1;', `volatile tail does not repeat: ${s}`);
   }

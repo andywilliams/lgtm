@@ -42,3 +42,40 @@ describe('readers of what a diff writes', () => {
     assert.equal(formatReadersContext([], '/repos/lib'), '');
   });
 });
+
+describe('readers: what counts as a write', () => {
+  it('ignores comments, test files and non-object spreads', async () => {
+    const { addedProductionLines, fieldsFromHelpers } = await import('./readers.js');
+    const diff = [
+      '+++ b/src/a.ts',
+      "+  const E = 'a.b.c';",
+      "+  // emits 'comment.only.event' — prose, not a write",
+      '+  const xs = [...buildList(1)];',
+      '+  const p = { ...createPayload(next) };',
+      '+++ b/src/a.test.ts',
+      "+  const T = 'test.only.event';",
+    ].join('\n');
+    const lines = addedProductionLines(diff);
+    assert.ok(lines.some((l) => l.includes("'a.b.c'")));
+    assert.ok(!lines.some((l) => l.includes('comment.only.event')), 'a comment is not a write');
+    assert.ok(!lines.some((l) => l.includes('test.only.event')), 'a test file is not a write');
+
+    const ids = extractWriteIdentifiers(diff).map((i) => i.id);
+    assert.ok(ids.includes('a.b.c'));
+    assert.ok(!ids.includes('comment.only.event'));
+    assert.ok(!ids.includes('test.only.event'));
+
+    // Only the object spread is treated as the emitted payload's builder.
+    const helpers = fieldsFromHelpers(diff, '/nonexistent-root');
+    assert.deepEqual(helpers, [], 'no repo to resolve helpers in — and no crash');
+  });
+
+  it('dedupes and caps the combined identifier list', async () => {
+    const { mergeIdentifiers } = await import('./readers.js');
+    const many = Array.from({ length: 40 }, (_, i) => ({ id: `f${i}`, why: 'helper field' }));
+    const merged = mergeIdentifiers([{ id: 'f1', why: 'event type' }], many);
+    assert.equal(merged[0].why, 'event type', 'the first list wins a duplicate');
+    assert.ok(merged.length <= 14, `capped, was ${merged.length}`);
+    assert.equal(new Set(merged.map((m) => m.id)).size, merged.length, 'no duplicates');
+  });
+});

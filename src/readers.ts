@@ -36,7 +36,13 @@ export function addedProductionLines(diff: string): string[] {
     const header = line.match(/^\+\+\+ b\/(.+)$/);
     if (header) { inTest = TEST_FILE.test(header[1]); continue; }
     if (line.startsWith('+++ ') || line.startsWith('--- ')) continue;
-    if (!inTest && line.startsWith('+')) out.push(line.slice(1));
+    if (inTest || !line.startsWith('+')) continue;
+    const code = line.slice(1);
+    // Prose about a write is not a write: a comment naming an event type or a field
+    // would otherwise be mined as though the code emitted it.
+    const trimmed = code.trim();
+    if (trimmed.startsWith('//') || trimmed.startsWith('*') || trimmed.startsWith('/*') || trimmed.startsWith('#')) continue;
+    out.push(code.replace(/\/\/.*$/, ''));
   }
   return out;
 }
@@ -87,7 +93,13 @@ export function fieldsFromHelpers(diff: string, repoRoot: string, maxHelpers = 3
   const spread = new Set<string>();
   const named = new Set<string>();
   for (const line of added) {
-    for (const m of line.matchAll(/\.\.\.(\w{4,})\s*\(/g)) spread.add(m[1]);
+    // Object spread only — `{ ...createPayload(x) }` IS the emitted object, where
+    // `[...f(x)]` and `g(...f(x))` are an array and an argument list.
+    for (const m of line.matchAll(/\{[^}]*\.\.\.(\w{4,})\s*\(/g)) spread.add(m[1]);
+    if (/^\s*\.\.\.(\w{4,})\s*\(/.test(line)) {
+      // A spread on its own line inside a multi-line object literal.
+      spread.add(line.match(/^\s*\.\.\.(\w{4,})\s*\(/)![1]);
+    }
     for (const m of line.matchAll(/\b((?:create|build|make|to)[A-Z]\w+)\s*\(/g)) named.add(m[1]);
   }
   for (const h of [...spread, ...named]) helpers.add(h);
@@ -160,6 +172,12 @@ export function searchRoots(repoRoot: string, addDirs: string[] = []): string[] 
   return [...new Set(roots)].filter((d) => existsSync(d));
 }
 
+/** True once a search tool has actually run — so "nothing reads this" is a result, not a silence. */
+let searchToolWorked = false;
+export function readersSearchRan(): boolean {
+  return searchToolWorked;
+}
+
 function grepFor(id: string, root: string, maxFiles: number, maxPerFile = 6): { file: string; line: number; text: string }[] {
   // ripgrep when present (fast, respects .gitignore); grep -rn is the fallback so a
   // machine without rg still gets the context rather than silently getting none.
@@ -169,6 +187,7 @@ function grepFor(id: string, root: string, maxFiles: number, maxPerFile = 6): { 
   for (const [cmd, args] of [['rg', rg], ['grep', grep]] as [string, string[]][]) {
     try {
       const out = execFileSync(cmd, args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 8 * 1024 * 1024 });
+      searchToolWorked = true;
       const hits: { file: string; line: number; text: string }[] = [];
       for (const row of out.split('\n')) {
         const m = row.match(/^(.+?):(\d+):(.*)$/);
@@ -179,7 +198,7 @@ function grepFor(id: string, root: string, maxFiles: number, maxPerFile = 6): { 
       return hits;
     } catch (e: any) {
       // grep/rg exit 1 means "no matches" — that is an answer, not a failure.
-      if (e?.status === 1) return [];
+      if (e?.status === 1) { searchToolWorked = true; return []; }
       // A missing binary falls through to the next candidate.
     }
   }
@@ -195,6 +214,13 @@ export interface FindReadersOptions {
 }
 
 /** Where each written identifier is read, outside the files the diff changes. */
+/** Dedupe by id and cap the combined list — helper fields can otherwise add dozens. */
+export function mergeIdentifiers(...lists: WriteIdentifier[][]): WriteIdentifier[] {
+  const seen = new Map<string, WriteIdentifier>();
+  for (const list of lists) for (const i of list) if (!seen.has(i.id)) seen.set(i.id, i);
+  return [...seen.values()].slice(0, MAX_IDENTIFIERS + 6);
+}
+
 export function findReaders(identifiers: WriteIdentifier[], roots: string[], options: FindReadersOptions): ReaderHit[] {
   const { changedFiles, maxFilesPerRoot = 3, maxTotalLines = 160 } = options;
   const changed = new Set(changedFiles.map((f) => resolve(f)));
@@ -249,7 +275,9 @@ export function formatReadersContext(hits: ReaderHit[], repoRoot: string): strin
   for (const [id, group] of byId) {
     out += `### \`${id}\` — ${group[0].why}\n`;
     for (const h of group) {
-      const foreign = !h.file.startsWith(repoRoot);
+      // The root the hit was found under, not a path prefix: a sibling checkout nested
+      // inside this one would otherwise read as local.
+      const foreign = h.root !== repoRoot;
       const label = foreign ? `${h.file} (ANOTHER REPOSITORY)` : relative(repoRoot, h.file);
       out += `- ${label}\n`;
       for (const l of h.lines) out += `  ${l.line}: ${l.text}\n`;

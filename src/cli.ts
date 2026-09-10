@@ -24,7 +24,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
 import { planSession, modelRoleOf } from './session.js';
-import { extractWriteIdentifiers, fieldsFromHelpers, findReaders, formatReadersContext, searchRoots } from './readers.js';
+import { extractWriteIdentifiers, fieldsFromHelpers, findReaders, formatReadersContext, mergeIdentifiers, readersSearchRan, searchRoots } from './readers.js';
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
@@ -749,7 +749,7 @@ async function runReview(options: RunOptions): Promise<void> {
   // indicators' pivotTime sort key). Deterministic: identifiers out, grep in.
   let readersContextStr = '';
   if (readersEnabled !== false) {
-    const identifiers = [...extractWriteIdentifiers(diff), ...fieldsFromHelpers(diff, getRepoRoot())];
+    const identifiers = mergeIdentifiers(extractWriteIdentifiers(diff), fieldsFromHelpers(diff, getRepoRoot()));
     if (identifiers.length > 0) {
       const roots = searchRoots(getRepoRoot(), addDirs ?? []);
       const changedAbs = changedFilesOf().map((f) => (f.startsWith('/') ? f : `${getRepoRoot()}/${f}`));
@@ -758,8 +758,11 @@ async function runReview(options: RunOptions): Promise<void> {
       if (hits.length > 0) {
         log(chalk.blue(`\n📡 Readers of what this diff writes:`));
         for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.file.startsWith(getRepoRoot()) ? h.file.slice(getRepoRoot().length + 1) : `${h.file} (another repo)`}`));
-      } else {
+      } else if (readersSearchRan()) {
         log(chalk.gray(`\n📡 Nothing outside the changed files reads what this diff writes (${identifiers.length} identifier(s) searched)`));
+      } else {
+        // Never report an absence the search could not have found: no rg, no grep, no answer.
+        log(chalk.yellow(`\n📡 Could not search for readers — neither rg nor grep ran. This review is blind to who reads what it writes.`));
       }
     }
   }
