@@ -143,8 +143,10 @@ export interface VerifyInput {
   contents?: Record<string, string>;
   /** The readers-of-what-this-writes block: small, and the proof of a whole finding class. */
   readersContext?: string;
-  /** Charter / standards text — sent only when a finding cites one of them. */
+  /** Charter / standards / ticket text — sent only when a finding cites one of them. */
   docs?: string;
+  /** WHICH of those documents `docs` actually contains. The caller knows; it must not be guessed. */
+  docsPresent?: DocumentCited[];
   maxContextBytes?: number;
 }
 
@@ -303,7 +305,7 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
   const docsSection = docs && citesDocs(findings) ? `\n${docs}\n` : '';
-  const hasDocs = Boolean(docsSection);
+  const present = new Set(docsSection ? input.docsPresent ?? [] : []);
   const list = findings.map((f, i) => {
     const parts = [
       `### Finding ${i + 1}`,
@@ -320,8 +322,8 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
       // the three were resolvable, so a finding citing STANDARDS.md in a repo that has only
       // a charter would otherwise be told its evidence is above when it is not — nudging it
       // from "unshown" (which keeps the finding) towards a verdict that can drop it.
-      parts.push(hasDocs
-        ? `- this is a conformance claim against the ${doc}, not a claim about the code — judge it against that document IF it appears above; if it does not, the verdict is "unshown"`
+      parts.push(present.has(cites)
+        ? `- this is a conformance claim against the ${doc}, not a claim about the code — judge it against that document, which is above`
         : `- this is a conformance claim against the ${doc}, not a claim about the code, and that document was NOT given to you — the verdict is "unshown"`);
     }
     if (f.evidence && f.evidence.length > 0) parts.push(`- the reviewer quoted:\n${f.evidence.map((e) => `  > ${e}`).join('\n')}`);
@@ -399,6 +401,8 @@ export interface ShownContext {
   inDiff: Set<string>;
   /** Everything the verifier was sent, for checking that a refutation quotes real text. */
   text?: string;
+  /** The documents that were put in the prompt, for the same check applied to conformance claims. */
+  docs?: Set<DocumentCited>;
 }
 
 /**
@@ -408,6 +412,12 @@ export interface ShownContext {
  * on it, which errs towards keeping a finding rather than dropping one.
  */
 export function wasShown(f: ReviewComment, ctx: ShownContext, contents: Record<string, string> = {}): boolean {
+  // A conformance claim turns on its DOCUMENT, not on the file it is anchored in. The caller
+  // resolved those documents and knows exactly which it sent, so the same rule applies: a
+  // verdict about one that was not sent is a verdict about nothing. Prose said this per
+  // finding; the file equivalent has always been the caller's decision, and so is this.
+  const cites = citedDocument(f);
+  if (cites && ctx.docs && !ctx.docs.has(cites)) return false;
   const have = (path: string) => ctx.shown.has(path) || ctx.inDiff.has(path);
   if (!have(f.file)) return false;
   const keys = Object.keys(contents).filter((k) => !k.startsWith('@'));
@@ -523,7 +533,7 @@ export function verifyFindings(input: VerifyInput & {
   // it was found: the review's own choice is still set when this runs.
   const previous = getModelOverride();
   const shown = new Set<string>();
-  const ctx: ShownContext = { shown, inDiff: diffFiles(input.diff) };
+  const ctx: ShownContext = { shown, inDiff: diffFiles(input.diff), docs: new Set(input.docs ? input.docsPresent ?? [] : []) };
   try {
     // Inside the guard, not above it: this is the statement that consumes untrusted model
     // output (a finding's `file` and `line`), and the function's contract is that a review

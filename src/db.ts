@@ -138,8 +138,11 @@ const REVIEW_COLUMNS: [string, string][] = [
  * and never silently rewrite. 1: confirmed/refuted/unproven, an unproven opinion dropped.
  * 2: 'unshown' carved out of 'unproven' and enforced by the caller, not only asked for in
  * the prompt — after v1 dropped three findings that were true and merely not shown.
+ * 3: findings citing a document are exempt from the opinion-drop (capped per document), the
+ * exemption keys on a declared `cites` field rather than a title prefix, and a verdict about
+ * a document that was not sent is rewritten to 'unshown' the way a file's already was.
  */
-export const VERIFY_RULES_VERSION = 2;
+export const VERIFY_RULES_VERSION = 3;
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
 export const ROUND_BUDGET = 8;

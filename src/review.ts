@@ -664,9 +664,13 @@ const CITED = new Map<string, DocumentCited>([
  */
 export function citedDocument(comment: { cites?: unknown; title?: string }): DocumentCited | undefined {
   const declared = typeof comment.cites === 'string' ? CITED.get(comment.cites.toLowerCase()) : undefined;
-  if (declared) return declared;
   const m = String(comment.title ?? '').match(/^\((charter|standards?|ticket)\b/i);
-  return m ? CITED.get(m[1].toLowerCase()) : undefined;
+  const tagged = m ? CITED.get(m[1].toLowerCase()) : undefined;
+  // When the two disagree, the TITLE wins: it is what every human surface shows, and the
+  // filter must not act on a different document from the one the reader is told about.
+  // A prefix with no field, or a field with no prefix, is honoured as given.
+  if (tagged && declared && tagged !== declared) return tagged;
+  return declared ?? tagged;
 }
 
 function normalizeComment(comment: any): ReviewComment {

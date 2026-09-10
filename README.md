@@ -800,12 +800,19 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   },
   "comments": [
     {
+      "id": 412,
+      "kind": "added",
+      "confidence": "high",
+      "how_to_verify": "call parse() with a header-less row",
+      "evidence": ["const header = raw[0];"],
       "file": "src/parser.ts",
       "line": 42,
       "severity": "BUG",
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
       "suggestion": "if (!input) return null;",
+      "fingerprint": "parse",
+      "cites": null,
       "duplicate": false,
       "verdict": "confirmed",
       "verifier_note": "parse() is called with the raw header on line 40",
@@ -814,11 +821,19 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
       "dropped": false
     },
     {
+      "id": 413,
+      "kind": "missing",
+      "confidence": "medium",
+      "how_to_verify": "read the Acceptance section against the diff",
+      "evidence": [],
       "file": "src/parser.ts",
       "line": 87,
       "severity": "SUGGESTION",
-      "title": "Extract magic number",
-      "body": "The value 1024 appears without explanation...",
+      "title": "(ticket) is criterion 2 addressed?",
+      "body": "The ticket asks for X; I cannot see it in this diff...",
+      "suggestion": null,
+      "fingerprint": "acceptance criterion 2",
+      "cites": "ticket",
       "duplicate": true,
       "verdict": "unverified",
       "verifier_note": null,
@@ -836,6 +851,8 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   }
 }
 ```
+
+Every field `--agent` emits per finding is shown above. `cites` names the document a finding is a conformance claim against (`charter`, `standard`, `ticket`) and is what gives it immunity from the verifier's opinion-drop; it is `null` for an ordinary finding.
 
 `verify` is `null` when the verifier pass did not run. `verify.checked` counts every finding the reviewer raised, including the dropped ones — `verify.dropped.length / verify.checked` is the round's false-positive share. Findings listed under `verify.dropped` are **not** in `comments`; `--show-dropped` puts them back, flagged `dropped: true`.
 

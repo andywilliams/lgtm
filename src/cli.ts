@@ -477,6 +477,7 @@ function formatAutoResult(options: {
     // refuted findings in this list.
     comments: options.comments.map(c => ({
       file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion,
+      cites: c.cites ?? null,
       verdict: c.verdict ?? 'unverified', verifier_note: c.verifier_note ?? null, dropped: Boolean(c.verifier_dropped),
     })),
     verify: options.verify ?? null,
@@ -1021,6 +1022,14 @@ async function runReview(options: RunOptions): Promise<void> {
       // The ticket's DATA, never its instruction half: the reviewer is told to add one
       // (ticket) finding, and the verifier's own first rule is that it may not add any.
       docs: [charterContextStr, standardsContextStr, ticket.data].filter(Boolean).join('\n') || undefined,
+      // WHICH of them that blob holds. The verifier must not be told a document is above
+      // when a different one is: that claim decides between a verdict that keeps a finding
+      // and one that can delete it.
+      docsPresent: [
+        ...(charterContextStr ? ['charter' as const] : []),
+        ...(standardsContextStr ? ['standard' as const] : []),
+        ...(ticket.data ? ['ticket' as const] : []),
+      ],
       ai: vAi, model: chosen,
     });
     verifyUsage = takeUsage();
@@ -1211,6 +1220,9 @@ async function runReview(options: RunOptions): Promise<void> {
     );
     log(chalk.white('─'.repeat(60)));
     log(chalk.bold(comment.title));
+    // The approval path is the ONE surface where a human decides whether to post, so it
+    // must not be the one missing what kind of claim this is.
+    if (comment.cites) log(chalk.gray(`conformance claim against the ${comment.cites}`));
     log(chalk.white(comment.body));
     if (comment.suggestion) {
       log(chalk.green('\nSuggested fix:'));
