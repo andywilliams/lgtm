@@ -65,6 +65,20 @@ describe('applyVerdicts — what may drop a finding', () => {
     assert.equal(citesDoc(finding({ title: 'plain finding' })), false);
   });
 
+  test('the DECLARED field carries the exemption, and the title prefix is the fallback', () => {
+    // Control flow should not turn on how a model phrased a heading. The field is a closed
+    // enum the reply schema enforces; the prefix keeps codex — which gets no schema — and
+    // rows written before the field working.
+    const declaredOnly = finding({ severity: 'SUGGESTION', title: 'Criterion 2 is not addressed', cites: 'ticket' });
+    const prefixOnly = finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' });
+    const neither = finding({ severity: 'SUGGESTION', title: 'Criterion 2 is not addressed' });
+    const unproven = { 1: { verdict: 'unproven' as const, verifier_note: 'n' } };
+
+    assert.equal(applyVerdicts([declaredOnly], unproven)[0].verifier_dropped, undefined, 'declared, no prefix');
+    assert.equal(applyVerdicts([prefixOnly], unproven)[0].verifier_dropped, undefined, 'prefix, no field');
+    assert.equal(applyVerdicts([neither], unproven)[0].verifier_dropped, true, 'neither is an ordinary opinion');
+  });
+
   test('the exemption is CAPPED per tag, so it cannot switch the filter off', () => {
     // The caps each check states are instructions to a model, and the exemption is keyed on
     // a title prefix the reviewer chooses. Unbounded, a pedantic round could put any number

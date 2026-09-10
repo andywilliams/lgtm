@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { extractJsonObject, parseReviewForTest } from "./review.js";
+import { extractJsonObject, parseReviewForTest, citedDocument } from "./review.js";
 
 // Guards the resilient JSON extraction that stops a malformed/truncated model
 // response from killing an entire review (the recurring "Failed to parse" bug),
@@ -77,4 +77,27 @@ it('prompt v2: kind, confidence, evidence and fingerprint survive parsing, with 
   assert.equal(r[3].kind, 'added', 'an unknown kind falls back');
   assert.equal(r[3].confidence, 'medium', 'an unknown confidence falls back');
 });
+});
+
+
+describe("citedDocument", () => {
+  it("prefers the declared field, falls back to the title prefix, and normalises both spellings", () => {
+    assert.equal(citedDocument({ cites: "ticket", title: "anything at all" }), "ticket");
+    assert.equal(citedDocument({ cites: "standards", title: "x" }), "standard", "either spelling of the middle one");
+    assert.equal(citedDocument({ cites: "STANDARD", title: "x" }), "standard");
+    assert.equal(citedDocument({ title: "(standard FUN-1) too long" }), "standard", "the prefix still works for codex");
+    assert.equal(citedDocument({ title: "(charter) drifted" }), "charter");
+    assert.equal(citedDocument({ cites: "nonsense", title: "(ticket) x" }), "ticket", "a junk field falls through to the prefix");
+    assert.equal(citedDocument({ title: "(out of scope) x" }), undefined);
+    assert.equal(citedDocument({}), undefined);
+  });
+
+  it("normalizeComment sets cites from either source, so the verifier reads one field", () => {
+    const r = parseReviewForTest(JSON.stringify({ summary: "s", comments: [
+      { file: "a.ts", line: 1, severity: "SUGGESTION", title: "Criterion 2 unaddressed", body: "b", cites: "ticket" },
+      { file: "a.ts", line: 2, severity: "SUGGESTION", title: "(charter) drifted", body: "b" },
+      { file: "a.ts", line: 3, severity: "SUGGESTION", title: "ordinary", body: "b" },
+    ] }));
+    assert.deepEqual(r.comments.map((c) => c.cites), ["ticket", "charter", undefined]);
+  });
 });

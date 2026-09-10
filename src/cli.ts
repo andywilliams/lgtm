@@ -547,6 +547,7 @@ function formatAgentResult(options: {
       body: c.body,
       suggestion: c.suggestion,
       fingerprint: c.fingerprint ?? null,
+      cites: c.cites ?? null,
       duplicate: c.duplicate,
       // What the verifier made of it. 'unverified' means the pass did not run or said
       // nothing — deliberately NOT the same as 'unproven', which is a judgement.

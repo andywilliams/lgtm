@@ -1,6 +1,6 @@
 import { runAIPrompt, setModelOverride, getModelOverride, resolveModel, isModelId, DEFAULT_LATE_MODEL, type AIProvider } from './ai.js';
-import { extractJsonObject } from './review.js';
-import type { ReviewComment, Severity, Verdict } from './types.js';
+import { extractJsonObject, citedDocument } from './review.js';
+import type { ReviewComment, Severity, Verdict, DocumentCited } from './types.js';
 
 /**
  * The verifier pass: a SECOND model call that proves or drops each finding the reviewer
@@ -266,10 +266,15 @@ export function citesDoc(f: ReviewComment): boolean {
   return docTagOf(f) !== null;
 }
 
-/** The document a finding's tag cites, or null. */
-export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | null {
-  const m = f.title.match(/^\((charter|ticket|standard)\b/i);
-  return m ? (m[1].toLowerCase() as 'charter' | 'ticket' | 'standard') : null;
+
+/**
+ * The document this finding cites, from its DECLARED field — a closed enum the reply schema
+ * enforces — falling back to the title prefix for codex (which gets no schema) and for rows
+ * written before the field existed. The exemption below is control flow, and control flow
+ * should not turn on how a model chose to phrase a heading.
+ */
+export function docTagOf(f: ReviewComment): DocumentCited | null {
+  return citedDocument(f) ?? null;
 }
 
 /**
@@ -280,7 +285,7 @@ export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | 
  * any number of undroppable opinions through, with no signal that it had happened. Beyond
  * the cap a doc-tagged finding is an ordinary opinion and droppable like any other.
  */
-export const DOC_TAG_EXEMPT: Record<'charter' | 'ticket' | 'standard', number> = { charter: 1, ticket: 1, standard: 3 };
+export const DOC_TAG_EXEMPT: Record<DocumentCited, number> = { charter: 1, ticket: 1, standard: 3 };
 
 export function citesDocs(findings: ReviewComment[]): boolean {
   return findings.some(citesDoc);
@@ -307,6 +312,8 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
       `- title: ${f.title}`,
       `- claim: ${f.body}`,
     ];
+    const cites = citedDocument(f);
+    if (cites) parts.push(`- this is a conformance claim against the ${cites === 'standard' ? "repo's STANDARDS.md" : cites === 'charter' ? 'architecture charter' : 'ticket'}, not a claim about the code — judge it against that document, which is included above`);
     if (f.evidence && f.evidence.length > 0) parts.push(`- the reviewer quoted:\n${f.evidence.map((e) => `  > ${e}`).join('\n')}`);
     else parts.push('- the reviewer quoted nothing');
     if (f.how_to_verify) parts.push(`- the reviewer says this settles it: ${f.how_to_verify}`);

@@ -1,7 +1,7 @@
 import { jsonrepair } from 'jsonrepair';
 import { fenced } from './ticket.js';
 import { runAIPrompt, type AIProvider } from './ai.js';
-import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, DocumentCited, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
 // Provider plumbing lives in ai.ts; re-exported here so existing importers keep working.
 export { checkClaudeCli, checkCodexCli, getAvailableProviders } from './ai.js';
@@ -65,6 +65,7 @@ export const REVIEW_SCHEMA = {
           evidence: { type: 'array', items: { type: 'string' } },
           how_to_verify: { type: 'string' },
           fingerprint: { type: 'string' },
+          cites: { type: 'string', enum: ['charter', 'standard', 'ticket'] },
           suggestion: { type: 'string' },
         },
         required: ['file', 'line', 'severity', 'kind', 'confidence', 'title', 'body', 'evidence', 'how_to_verify', 'fingerprint'],
@@ -291,6 +292,10 @@ For each issue found, include in the comments array:
 - "evidence": array of exact quoted lines showing the problem (may be empty ONLY at confidence "low")
 - "how_to_verify": the single check that settles it
 - "fingerprint": the symbol or construct at fault, not the line number
+- "cites": omit for an ordinary finding. Set it to "charter", "standard" or "ticket" when the finding is a
+  conformance claim against one of those documents rather than a claim about the code — i.e. exactly the
+  findings whose title you were told to prefix "(charter)", "(standard <id>)" or "(ticket)". The tag and
+  this field must agree.
 - "suggestion": optional code fix
 
 Respond with this exact JSON structure:
@@ -638,6 +643,22 @@ function normalizeQuestion(q: any): QuizQuestion {
   };
 }
 
+/** The three document tags, in the two spellings a model might use for the middle one. */
+const CITED: Record<string, DocumentCited> = { charter: 'charter', standard: 'standard', standards: 'standard', ticket: 'ticket' };
+
+/**
+ * What document a finding cites: its declared `cites` if it gave one, else the title prefix
+ * it was told to write. Both are the model's word, but the field is a closed enum the schema
+ * can enforce, and the prefix is free text that must survive rendering — so the field is
+ * preferred and the prefix is the fallback that keeps codex and older rows working.
+ */
+export function citedDocument(comment: { cites?: unknown; title?: string }): DocumentCited | undefined {
+  const declared = typeof comment.cites === 'string' ? CITED[comment.cites.toLowerCase()] : undefined;
+  if (declared) return declared;
+  const m = String(comment.title ?? '').match(/^\((charter|standards?|ticket)\b/i);
+  return m ? CITED[m[1].toLowerCase()] : undefined;
+}
+
 function normalizeComment(comment: any): ReviewComment {
   const validSeverities: Severity[] = ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'];
   const kinds: FindingKind[] = ['added', 'removed', 'missing'];
@@ -658,6 +679,7 @@ function normalizeComment(comment: any): ReviewComment {
     evidence,
     how_to_verify: comment.how_to_verify ? String(comment.how_to_verify) : undefined,
     fingerprint: comment.fingerprint ? String(comment.fingerprint) : undefined,
+    cites: citedDocument(comment),
     title: String(comment.title || 'Review comment'),
     body: String(comment.body || ''),
     suggestion: comment.suggestion ? String(comment.suggestion) : undefined,
