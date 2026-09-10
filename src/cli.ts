@@ -109,6 +109,7 @@ program.addHelpText(
     '  LGTM_LATE_MODEL               model for late (round 4+) chill review rounds (default claude-sonnet-5; "off" = always the full model)\n' +
     '  LGTM_SESSIONS                 "off" = every round is a one-off call (default: one Claude session per loop, resumed each round for the prompt cache)\n' +
     '  LGTM_SIBLING_DIRS             colon-separated repos to also search for readers of what a diff writes (same as repeating --add-dir)\n' +
+    '  LGTM_TIMEOUT_MS               how long one model call may take before lgtm gives up and says so (default 15 minutes)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );

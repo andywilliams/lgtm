@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -261,4 +261,55 @@ test('claudePrintArgs: a loop session persists and is started or resumed by id; 
   assert.ok(!cont.includes('--session-id'));
   assert.ok(!cont.includes('--no-session-persistence'));
   assert.ok(claudePrintArgs('claude-fable-5-1[1m]', 'high', '').includes('--no-session-persistence'));
+});
+
+test('timeoutMs: a positive override wins, anything else falls back to the default', () => {
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  try {
+    delete process.env.LGTM_TIMEOUT_MS;
+    assert.equal(timeoutMs(), DEFAULT_TIMEOUT_MS);
+    process.env.LGTM_TIMEOUT_MS = '60000';
+    assert.equal(timeoutMs(), 60_000);
+    for (const junk of ['0', '-1', 'soon', '']) {
+      process.env.LGTM_TIMEOUT_MS = junk;
+      assert.equal(timeoutMs(), DEFAULT_TIMEOUT_MS, `junk ${JSON.stringify(junk)} falls back`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
+});
+
+test('isTimeout recognises what execFileSync ACTUALLY throws when it kills a child', async () => {
+  // Not a hand-written fixture: run a real command that outlasts a real timeout, and
+  // feed the error Node actually produced to the predicate that decides whether a
+  // 15-minute wait gets repeated.
+  const { execFileSync } = await import('node:child_process');
+  const { isTimeout } = await import('./ai.js');
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  process.env.LGTM_TIMEOUT_MS = '150';
+  const startedAt = Date.now();
+  try {
+    execFileSync('sleep', ['5'], { timeout: 150, stdio: 'pipe' });
+    assert.fail('the child should have been killed');
+  } catch (e: any) {
+    assert.equal(isTimeout(e, startedAt), true, `real timeout error not recognised: ${JSON.stringify({ code: e?.code, killed: e?.killed, signal: e?.signal })}`);
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
+});
+
+test('isTimeout: a killed child is ours only if the wait actually elapsed', async () => {
+  const { isTimeout } = await import('./ai.js');
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  try {
+    process.env.LGTM_TIMEOUT_MS = '1000';
+    const started = 10_000;
+    const killed = { killed: true, signal: 'SIGTERM' };
+    assert.equal(isTimeout(killed, started, started + 1000), true, 'killed at the limit');
+    assert.equal(isTimeout({ code: 'ETIMEDOUT' }, started, started + 950), true, 'ETIMEDOUT just inside the tolerance');
+    assert.equal(isTimeout(killed, started, started + 200), false, 'a Ctrl-C two hundred ms in is not our timeout');
+    assert.equal(isTimeout({ status: 1 }, started, started + 5000), false, 'a plain failure is not a timeout, however long it took');
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
 });

@@ -105,6 +105,55 @@ export function takeUsage(): AIUsage {
   return out;
 }
 
+/**
+ * How long one model call may take before lgtm gives up and SAYS so. A review that
+ * cannot finish used to hang with no output at all — four attempts on DWLF-136 produced
+ * nothing, not even a "too large" message, which is what made a slow tool look broken.
+ */
+export const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+export function timeoutMs(): number {
+  const raw = process.env.LGTM_TIMEOUT_MS?.trim();
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
+}
+
+/** A call that ran out of time. Named so the recovery ladder can refuse to retry it. */
+export class TimeoutError extends Error {
+  readonly name = 'TimeoutError';
+}
+
+/**
+ * One test for "this failure is a timeout", used everywhere. Both halves matter: the
+ * prototype check fails across module instances (a test importing twice, a bundled copy),
+ * and the name check alone would match anything that borrowed the name.
+ */
+export function isTimeoutError(error: unknown): boolean {
+  return error instanceof TimeoutError || (error as any)?.name === 'TimeoutError';
+}
+
+/**
+ * Did this failure come from our own timeout? `execFileSync` reports the child it killed
+ * as `killed: true` with `signal: 'SIGTERM'` (and `code: 'ETIMEDOUT'` on some paths), but
+ * an operator's Ctrl-C looks the same — so the elapsed time is what separates them.
+ * Exported for tests: this predicate decides whether a wait is retried, and it is not
+ * something a live run can be made to exercise on demand.
+ */
+export function isTimeout(error: any, startedAt: number, now = Date.now()): boolean {
+  const elapsed = now - startedAt;
+  const killed = error?.code === 'ETIMEDOUT' || error?.killed === true || error?.signal === 'SIGTERM';
+  return killed && elapsed >= timeoutMs() * 0.9;
+}
+
+/** The message a timed-out call raises: what it was doing, and the levers that fix it. */
+function timeoutError(prompt: string, what: string): TimeoutError {
+  const mins = Math.round(timeoutMs() / 60000);
+  return new TimeoutError(
+    `${what} produced nothing in ${mins} minutes (prompt ~${Math.ceil(prompt.length / 4).toLocaleString()} tokens). ` +
+      'A first round on a very large change is the usual cause. Options: review the unreviewed delta only ' +
+      '(--local --base <last-reviewed-commit>), split the change, or raise LGTM_TIMEOUT_MS.'
+  );
+}
+
 // Anthropic ids, the [1m] suffix, Vertex `@date` ids and Bedrock ARNs (`/`, `:`).
 const MODEL_ID = /^[\w.:@\/\-\[\]]+$/;
 
@@ -334,9 +383,12 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
   return { text, usage };
 }
 
+/** A version probe is a diagnosis, not work: it never gets more than a few seconds. */
+const PROBE_TIMEOUT_MS = 10_000;
+
 export function checkClaudeCli(): boolean {
   try {
-    execSync('claude --version', { stdio: 'pipe' });
+    execSync('claude --version', { stdio: 'pipe', timeout: PROBE_TIMEOUT_MS });
     return true;
   } catch {
     return false;
@@ -345,7 +397,7 @@ export function checkClaudeCli(): boolean {
 
 export function checkCodexCli(): boolean {
   try {
-    execSync('codex --version', { stdio: 'pipe' });
+    execSync('codex --version', { stdio: 'pipe', timeout: PROBE_TIMEOUT_MS });
     return true;
   } catch {
     return false;
@@ -402,17 +454,27 @@ function runClaude(prompt: string, opts: RunOptions): string {
     process.stderr.write('lgtm: no model configured — the claude CLI picks its default, and lgtm cannot tell when you change it (a loop session opened on the old one would then review with a cold cache). Set LGTM_MODEL, or "model" in ~/.claude/settings.json, to pin it.\n');
   }
   const args = claudePrintArgs(model, effort, settingSources(), opts.schema, opts.session);
+  const startedAt = Date.now();
   try {
     const raw = execFileSync('claude', args, {
       input: prompt,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs(),
     });
     const { text, usage } = parsePrintEnvelope(raw);
     addUsage(usage, prompt.length);
     return text;
   } catch (error: any) {
+    // A run that cannot finish must say so, with the lever that fixes it — silence for
+    // fifteen minutes is what made this look like a broken tool rather than a slow one.
+    // The call is recorded either way: the time and tokens were spent, and a round that
+    // spent them is a round, however little came back.
+    if (isTimeout(error, startedAt)) {
+      addUsage(null, prompt.length);
+      throw timeoutError(prompt, 'claude --print');
+    }
     // A non-zero exit usually still carries the JSON envelope on stdout; surface its
     // reason instead of the bare "Command failed: claude …". Anything that is NOT an
     // envelope (usage text from an older CLI, a stray message) stays an error.
@@ -434,14 +496,22 @@ function runCodex(prompt: string, label: string): string {
   const tempFile = join(tmpdir(), `lgtm-${label}-${Date.now()}-${process.pid}.txt`);
   const outputFile = tempFile + '.out';
   writeFileSync(tempFile, prompt);
+  const startedAt = Date.now();
   try {
     execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs(),
     });
     addUsage(null, prompt.length);
     return readFileSync(outputFile, 'utf-8');
+  } catch (error: any) {
+    if (isTimeout(error, startedAt)) {
+      addUsage(null, prompt.length);
+      throw timeoutError(prompt, 'codex exec');
+    }
+    throw error;
   } finally {
     try { unlinkSync(outputFile); } catch { /* ignore */ }
     try { unlinkSync(tempFile); } catch { /* ignore */ }
@@ -462,6 +532,8 @@ export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', op
   try {
     return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {
+    // A timeout already knows what it is; do not probe the CLI to diagnose it.
+    if (isTimeoutError(error)) throw error;
     // Only claim "CLI not found" when the binary genuinely isn't runnable NOW —
     // message-sniffing ('not found' / ENOENT) misdiagnoses unrelated failures
     // (e.g. codex exiting 0 without writing its output file) as a missing install.
