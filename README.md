@@ -256,7 +256,7 @@ Three rules keep it safe rather than merely cheaper. It can **never add a findin
 
 That last distinction was bought with data. On this feature's own third review round, before `unshown` existed, the verifier dropped three findings — and all three were true, dropped only because their proof sat in a file it had not been given. So it is now also **shown the whole of any other file a finding names**, and told exactly which files it has. And the rule is enforced where the truth is known: lgtm records which files it actually sent, and rewrites any verdict about a file it never sent to `unshown` — the model is asked, but not trusted, because the configurations this feature recommends for decorrelation are the ones least likely to honour a fine prose distinction.
 
-A finding tagged `(ticket)`, `(charter)` or `(standard …)` is never dropped merely as `unproven` — it can still be refuted. The completeness check asserts an *absence*, which has no lines to quote, so without the exemption the filter could silently delete a whole capped feature. The exemption itself is capped in code, not in a prompt: one `(charter)`, one `(ticket)` and three `(standard …)` findings per round, matching what each check's prompt asks for. Anything past that is an ordinary opinion and droppable.
+A finding that declares `cites: "ticket" | "charter" | "standard"` (or, for a provider with no schema, carries the matching title prefix) is never dropped merely as `unproven` — it can still be refuted. The completeness check asserts an *absence*, which has no lines to quote, so without the exemption the filter could silently delete a whole capped feature. The exemption itself is capped in code, not in a prompt: one `(charter)`, one `(ticket)` and three `(standard …)` findings per round, matching what each check's prompt asks for. Anything past that is an ordinary opinion and droppable.
 
 `comments` in agent mode now carries the findings that **survived**. Everything dropped is in `verify.dropped` with its own `id`, so a wrong drop can be quoted back, dismissed, or joined to its row in the log.
 
@@ -699,6 +699,7 @@ On success:
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
       "suggestion": "if (!input) return null;",
+      "cites": null,
       "verdict": "confirmed",
       "verifier_note": "parse() is called with the raw header on line 40",
       "dropped": false
@@ -800,12 +801,19 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   },
   "comments": [
     {
+      "id": 412,
+      "kind": "added",
+      "confidence": "high",
+      "how_to_verify": "call parse() with a header-less row",
+      "evidence": ["const header = raw[0];"],
       "file": "src/parser.ts",
       "line": 42,
       "severity": "BUG",
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
       "suggestion": "if (!input) return null;",
+      "fingerprint": "parse",
+      "cites": null,
       "duplicate": false,
       "verdict": "confirmed",
       "verifier_note": "parse() is called with the raw header on line 40",
@@ -814,11 +822,19 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
       "dropped": false
     },
     {
+      "id": 413,
+      "kind": "missing",
+      "confidence": "medium",
+      "how_to_verify": "read the Acceptance section against the diff",
+      "evidence": [],
       "file": "src/parser.ts",
       "line": 87,
       "severity": "SUGGESTION",
-      "title": "Extract magic number",
-      "body": "The value 1024 appears without explanation...",
+      "title": "(ticket) is criterion 2 addressed?",
+      "body": "The ticket asks for X; I cannot see it in this diff...",
+      "suggestion": null,
+      "fingerprint": "acceptance criterion 2",
+      "cites": "ticket",
       "duplicate": true,
       "verdict": "unverified",
       "verifier_note": null,
@@ -836,6 +852,8 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   }
 }
 ```
+
+Every field `--agent` emits per finding is shown above. `cites` names the document a finding is a conformance claim against (`charter`, `standard`, `ticket`) and is what gives it immunity from the verifier's opinion-drop; it is `null` for an ordinary finding.
 
 `verify` is `null` when the verifier pass did not run. `verify.checked` counts every finding the reviewer raised, including the dropped ones — `verify.dropped.length / verify.checked` is the round's false-positive share. Findings listed under `verify.dropped` are **not** in `comments`; `--show-dropped` puts them back, flagged `dropped: true`.
 

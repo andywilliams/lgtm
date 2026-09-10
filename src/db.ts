@@ -138,8 +138,11 @@ const REVIEW_COLUMNS: [string, string][] = [
  * and never silently rewrite. 1: confirmed/refuted/unproven, an unproven opinion dropped.
  * 2: 'unshown' carved out of 'unproven' and enforced by the caller, not only asked for in
  * the prompt — after v1 dropped three findings that were true and merely not shown.
+ * 3: findings citing a document are exempt from the opinion-drop (capped per document), the
+ * exemption keys on a declared `cites` field rather than a title prefix, and a verdict about
+ * a document that was not sent is rewritten to 'unshown' the way a file's already was.
  */
-export const VERIFY_RULES_VERSION = 2;
+export const VERIFY_RULES_VERSION = 3;
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
 export const ROUND_BUDGET = 8;
@@ -207,6 +210,9 @@ function migrate(db: Database.Database): void {
     // open findings does not silently inherit the verifier's opinion, and a finding
     // dropped in one round and confirmed in the next is a join anyone can write.
     ['verdict', 'TEXT'], ['verifier_note', 'TEXT'], ['verifier_evidence', 'TEXT'], ['original_severity', 'TEXT'], ['dropped', 'INTEGER'],
+    // Which document a finding is a conformance claim against — the key the verifier's drop
+    // exemption turns on, so it is stored rather than re-derived from a rendered title.
+    ['cites', 'TEXT'],
   ] as [string, string][]) {
     if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
   }
@@ -518,8 +524,8 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   const db = initDb();
   const ins = db.prepare(`
     INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify,
-      verdict, verifier_note, verifier_evidence, original_severity, dropped)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      verdict, verifier_note, verifier_evidence, original_severity, dropped, cites)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   // The evidence is stored with the finding, not just shown: `confidence` is a verdict
   // derived from it, and a later round marking the finding fixed or suppressed is only
@@ -537,6 +543,7 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
       c.verifier_evidence && c.verifier_evidence.length > 0 ? JSON.stringify(c.verifier_evidence) : null,
       c.original_severity ?? null,
       c.verifier_dropped ? 1 : 0,
+      c.cites ?? null,
     ).lastInsertRowid))
   );
   const ids = tx(comments);

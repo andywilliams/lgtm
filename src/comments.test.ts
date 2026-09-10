@@ -38,6 +38,8 @@ describe('posted-comment rendering and dedupe', () => {
       { verdict: 'unproven', verifier_note: 'not visible in the shown windows' },
       { verdict: 'confirmed', original_severity: 'BUG', severity: 'SUGGESTION', verifier_note: 'at worst a naming problem' },
       { verdict: 'unverified' },
+      { cites: 'ticket' },
+      { cites: 'standard', kind: 'missing', confidence: 'low' },
     ];
     for (const shape of shapes) {
       const c = finding(shape);
@@ -48,6 +50,14 @@ describe('posted-comment rendering and dedupe', () => {
     const c = finding({ kind: 'removed', confidence: 'high' });
     const old = [{ path: c.file, line: c.line, body: `**${c.title}**\n\n${c.body}` }];
     assert.equal(isDuplicateComment(c, old as any), true);
+  });
+
+  it('says when a finding is a conformance claim, since the title may no longer show it', () => {
+    // A finding may now DECLARE `cites` without the title prefix that used to make it
+    // obvious, and it carries the verifier's drop immunity — a reader deciding what to do
+    // with it needs to know it is a conformance claim, not an ordinary suggestion.
+    assert.ok(formatReviewCommentBody(finding({ cites: 'ticket', confidence: 'medium' })).includes('cites: ticket · confidence: medium'));
+    assert.ok(!formatReviewCommentBody(finding()).includes('cites:'));
   });
 
   it('says what the verifier made of a finding, and only when it said something', () => {

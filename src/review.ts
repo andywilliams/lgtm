@@ -1,7 +1,7 @@
 import { jsonrepair } from 'jsonrepair';
 import { fenced } from './ticket.js';
 import { runAIPrompt, type AIProvider } from './ai.js';
-import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, DocumentCited, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
 // Provider plumbing lives in ai.ts; re-exported here so existing importers keep working.
 export { checkClaudeCli, checkCodexCli, getAvailableProviders } from './ai.js';
@@ -65,6 +65,7 @@ export const REVIEW_SCHEMA = {
           evidence: { type: 'array', items: { type: 'string' } },
           how_to_verify: { type: 'string' },
           fingerprint: { type: 'string' },
+          cites: { type: 'string', enum: ['charter', 'standard', 'ticket'] },
           suggestion: { type: 'string' },
         },
         required: ['file', 'line', 'severity', 'kind', 'confidence', 'title', 'body', 'evidence', 'how_to_verify', 'fingerprint'],
@@ -291,6 +292,10 @@ For each issue found, include in the comments array:
 - "evidence": array of exact quoted lines showing the problem (may be empty ONLY at confidence "low")
 - "how_to_verify": the single check that settles it
 - "fingerprint": the symbol or construct at fault, not the line number
+- "cites": omit for an ordinary finding. Set it to "charter", "standard" or "ticket" when the finding is a
+  conformance claim against one of those documents rather than a claim about the code — i.e. exactly the
+  findings whose title you were told to prefix "(charter)", "(standard <id>)" or "(ticket)". The tag and
+  this field must agree.
 - "suggestion": optional code fix
 
 Respond with this exact JSON structure:
@@ -638,6 +643,38 @@ function normalizeQuestion(q: any): QuizQuestion {
   };
 }
 
+/**
+ * The three document tags, in the two spellings a model might use for the middle one.
+ * A Map, not an object literal: the key comes straight from the model's reply and `cites`
+ * is NOT schema-constrained on the normal path (the schema is a retry tool, and codex never
+ * gets one), so a bare index would resolve "constructor" and "__proto__" to inherited
+ * values — truthy ones, which would then be bound as a finding column and throw inside the
+ * metrics guard, losing every findings row for the round while its review row survived.
+ * The same guard, for the same reason, as `buildWindows`' own file lookup.
+ */
+const CITED = new Map<string, DocumentCited>([
+  ['charter', 'charter'], ['standard', 'standard'], ['standards', 'standard'], ['ticket', 'ticket'],
+]);
+
+/**
+ * What document a finding is a conformance claim against: the TITLE PREFIX when it has one,
+ * else the declared `cites` field.
+ *
+ * That precedence looks backwards for a field that exists to replace a convention, and it is
+ * deliberate. The prefix is what every human surface renders, and the same answer decides
+ * whether the verifier may delete the finding — so if the two ever disagree, the filter must
+ * act on the document the reader was told about, not a different one. The field earns its
+ * place by covering the case the prefix cannot: a finding that declares its document without
+ * spelling it in its heading. Either alone is honoured as given, which is what keeps codex
+ * (no schema) and rows written before the field working.
+ */
+export function citedDocument(comment: { cites?: unknown; title?: string }): DocumentCited | undefined {
+  const declared = typeof comment.cites === 'string' ? CITED.get(comment.cites.toLowerCase()) : undefined;
+  const m = String(comment.title ?? '').match(/^\((charter|standards?|ticket)\b/i);
+  const tagged = m ? CITED.get(m[1].toLowerCase()) : undefined;
+  return tagged ?? declared;
+}
+
 function normalizeComment(comment: any): ReviewComment {
   const validSeverities: Severity[] = ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'];
   const kinds: FindingKind[] = ['added', 'removed', 'missing'];
@@ -658,6 +695,7 @@ function normalizeComment(comment: any): ReviewComment {
     evidence,
     how_to_verify: comment.how_to_verify ? String(comment.how_to_verify) : undefined,
     fingerprint: comment.fingerprint ? String(comment.fingerprint) : undefined,
+    cites: citedDocument(comment),
     title: String(comment.title || 'Review comment'),
     body: String(comment.body || ''),
     suggestion: comment.suggestion ? String(comment.suggestion) : undefined,

@@ -5,7 +5,12 @@ export function formatReviewCommentBody(comment: ReviewComment): string {
   // What kind of problem and how sure the reviewer is, before the prose — a "missing"
   // finding at low confidence reads very differently from a demonstrated bug.
   const kind = comment.kind && comment.kind !== 'added' ? comment.kind : null;
-  const tags = [kind ? `_${kind}_` : null, comment.confidence ? `confidence: ${comment.confidence}` : null].filter(Boolean);
+  // `cites` is rendered because a finding may now DECLARE it without the title prefix that
+  // used to make it obvious. A reader deciding what to do with a conformance claim needs to
+  // know it is one — and that it holds the verifier's drop immunity — not see an ordinary
+  // suggestion. Safe for dedupe: the fingerprint is the title alone.
+  const cites = comment.cites ? `cites: ${comment.cites}` : null;
+  const tags = [kind ? `_${kind}_` : null, cites, comment.confidence ? `confidence: ${comment.confidence}` : null].filter(Boolean);
   if (tags.length > 0) body += `\n\n${tags.join(' · ')}`;
   body += `\n\n${comment.body}`;
   if (comment.evidence && comment.evidence.length > 0) {

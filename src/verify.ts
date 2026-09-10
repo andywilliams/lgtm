@@ -1,6 +1,6 @@
 import { runAIPrompt, setModelOverride, getModelOverride, resolveModel, isModelId, DEFAULT_LATE_MODEL, type AIProvider } from './ai.js';
-import { extractJsonObject } from './review.js';
-import type { ReviewComment, Severity, Verdict } from './types.js';
+import { extractJsonObject, citedDocument } from './review.js';
+import type { ReviewComment, Severity, Verdict, DocumentCited } from './types.js';
 
 /**
  * The verifier pass: a SECOND model call that proves or drops each finding the reviewer
@@ -143,8 +143,10 @@ export interface VerifyInput {
   contents?: Record<string, string>;
   /** The readers-of-what-this-writes block: small, and the proof of a whole finding class. */
   readersContext?: string;
-  /** Charter / standards text — sent only when a finding cites one of them. */
+  /** Charter / standards / ticket text — sent only when a finding cites one of them. */
   docs?: string;
+  /** WHICH of those documents `docs` actually contains. The caller knows; it must not be guessed. */
+  docsPresent?: DocumentCited[];
   maxContextBytes?: number;
 }
 
@@ -266,10 +268,14 @@ export function citesDoc(f: ReviewComment): boolean {
   return docTagOf(f) !== null;
 }
 
-/** The document a finding's tag cites, or null. */
-export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | null {
-  const m = f.title.match(/^\((charter|ticket|standard)\b/i);
-  return m ? (m[1].toLowerCase() as 'charter' | 'ticket' | 'standard') : null;
+
+/**
+ * The document this finding cites — the title prefix when it has one, else the declared
+ * `cites` field. See `citedDocument`: the field is what a schema can constrain, the prefix
+ * is what every human surface shows, and when they disagree the shown one wins.
+ */
+export function docTagOf(f: ReviewComment): DocumentCited | null {
+  return citedDocument(f) ?? null;
 }
 
 /**
@@ -280,7 +286,7 @@ export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | 
  * any number of undroppable opinions through, with no signal that it had happened. Beyond
  * the cap a doc-tagged finding is an ordinary opinion and droppable like any other.
  */
-export const DOC_TAG_EXEMPT: Record<'charter' | 'ticket' | 'standard', number> = { charter: 1, ticket: 1, standard: 3 };
+export const DOC_TAG_EXEMPT: Record<DocumentCited, number> = { charter: 1, ticket: 1, standard: 3 };
 
 export function citesDocs(findings: ReviewComment[]): boolean {
   return findings.some(citesDoc);
@@ -298,6 +304,7 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
   const docsSection = docs && citesDocs(findings) ? `\n${docs}\n` : '';
+  const present = new Set(docsSection ? input.docsPresent ?? [] : []);
   const list = findings.map((f, i) => {
     const parts = [
       `### Finding ${i + 1}`,
@@ -307,6 +314,17 @@ export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string
       `- title: ${f.title}`,
       `- claim: ${f.body}`,
     ];
+    const cites = citedDocument(f);
+    if (cites) {
+      const doc = cites === 'standard' ? "repo's STANDARDS.md" : cites === 'charter' ? 'architecture charter' : 'ticket';
+      // Conditional, because the document block is: it is one joined blob of whichever of
+      // the three were resolvable, so a finding citing STANDARDS.md in a repo that has only
+      // a charter would otherwise be told its evidence is above when it is not — nudging it
+      // from "unshown" (which keeps the finding) towards a verdict that can drop it.
+      parts.push(present.has(cites)
+        ? `- this is a conformance claim against the ${doc}, not a claim about the code — judge it against that document, which is above`
+        : `- this is a conformance claim against the ${doc}, not a claim about the code, and that document was NOT given to you — the verdict is "unshown"`);
+    }
     if (f.evidence && f.evidence.length > 0) parts.push(`- the reviewer quoted:\n${f.evidence.map((e) => `  > ${e}`).join('\n')}`);
     else parts.push('- the reviewer quoted nothing');
     if (f.how_to_verify) parts.push(`- the reviewer says this settles it: ${f.how_to_verify}`);
@@ -382,6 +400,8 @@ export interface ShownContext {
   inDiff: Set<string>;
   /** Everything the verifier was sent, for checking that a refutation quotes real text. */
   text?: string;
+  /** The documents that were put in the prompt, for the same check applied to conformance claims. */
+  docs?: Set<DocumentCited>;
 }
 
 /**
@@ -402,6 +422,19 @@ export function wasShown(f: ReviewComment, ctx: ShownContext, contents: Record<s
     if (resolved && !have(resolved)) return false;
   }
   return true;
+}
+
+/**
+ * Was the DOCUMENT a conformance claim cites put in front of the verifier? Kept separate
+ * from `wasShown` because it is gated on the exemption cap: a finding past its document's
+ * cap is an ordinary opinion, and handing it `unshown` would make "the document was not
+ * resolvable" a route to unlimited undroppable findings — which is precisely the switch the
+ * cap exists to prevent, and worst in the repos where the tag is least trustworthy, since
+ * the reviewer was never given the block that asks for those findings.
+ */
+export function citedDocShown(f: ReviewComment, ctx: ShownContext): boolean {
+  const cites = citedDocument(f);
+  return !cites || !ctx.docs || ctx.docs.has(cites);
 }
 
 export interface Verdicts {
@@ -458,13 +491,16 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
-    // The exemption is spent per tag, in the order the reviewer listed the findings.
+    // The exemption is spent per tag, in the order the reviewer listed the findings — and
+    // spent BEFORE the document rewrite below, so that neither protection can be reached
+    // without consuming a slot.
     const tag = docTagOf(f);
     let exempt = false;
     if (tag) {
       const used = usedExemption[tag] ?? 0;
       if (used < DOC_TAG_EXEMPT[tag]) { usedExemption[tag] = used + 1; exempt = true; }
     }
+    if (exempt && ctx && verdict !== 'unverified' && verdict !== 'unshown' && !citedDocShown(f, ctx)) verdict = 'unshown';
     const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !exempt);
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)
@@ -506,7 +542,7 @@ export function verifyFindings(input: VerifyInput & {
   // it was found: the review's own choice is still set when this runs.
   const previous = getModelOverride();
   const shown = new Set<string>();
-  const ctx: ShownContext = { shown, inDiff: diffFiles(input.diff) };
+  const ctx: ShownContext = { shown, inDiff: diffFiles(input.diff), docs: new Set(input.docs ? input.docsPresent ?? [] : []) };
   try {
     // Inside the guard, not above it: this is the statement that consumes untrusted model
     // output (a finding's `file` and `line`), and the function's contract is that a review

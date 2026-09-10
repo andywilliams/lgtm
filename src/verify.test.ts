@@ -2,7 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, DOC_TAG_EXEMPT, quotesShownText, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
-import type { ReviewComment, Severity } from './types.js';
+import type { ReviewComment, Severity, DocumentCited } from './types.js';
 
 const finding = (over: Partial<ReviewComment> = {}): ReviewComment => ({
   file: 'src/a.ts', line: 10, severity: 'BUG', title: 'boom', body: 'it explodes',
@@ -63,6 +63,20 @@ describe('applyVerdicts — what may drop a finding', () => {
 
     assert.equal(citesDoc(finding({ title: '(out of scope) x' })), false);
     assert.equal(citesDoc(finding({ title: 'plain finding' })), false);
+  });
+
+  test('the DECLARED field carries the exemption, and the title prefix is the fallback', () => {
+    // Control flow should not turn on how a model phrased a heading. The field is a closed
+    // enum the reply schema enforces; the prefix keeps codex — which gets no schema — and
+    // rows written before the field working.
+    const declaredOnly = finding({ severity: 'SUGGESTION', title: 'Criterion 2 is not addressed', cites: 'ticket' });
+    const prefixOnly = finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' });
+    const neither = finding({ severity: 'SUGGESTION', title: 'Criterion 2 is not addressed' });
+    const unproven = { 1: { verdict: 'unproven' as const, verifier_note: 'n' } };
+
+    assert.equal(applyVerdicts([declaredOnly], unproven)[0].verifier_dropped, undefined, 'declared, no prefix');
+    assert.equal(applyVerdicts([prefixOnly], unproven)[0].verifier_dropped, undefined, 'prefix, no field');
+    assert.equal(applyVerdicts([neither], unproven)[0].verifier_dropped, true, 'neither is an ordinary opinion');
   });
 
   test('the exemption is CAPPED per tag, so it cannot switch the filter off', () => {
@@ -227,6 +241,53 @@ describe('buildVerifyPrompt', () => {
     assert.doesNotMatch(buildVerifyPrompt({ ...base, findings: [finding()] }), /CHARTER-TEXT-MARKER/);
     assert.match(buildVerifyPrompt({ ...base, findings: [finding({ title: '(charter) drifted' })] }), /CHARTER-TEXT-MARKER/);
     assert.match(buildVerifyPrompt({ ...base, findings: [finding({ title: '(standard FUN-1) too long' })] }), /CHARTER-TEXT-MARKER/);
+  });
+
+  test('a conformance finding is told to answer "unshown" when its document was not sent', () => {
+    // The document block is one joined blob of whichever of the three were resolvable, so
+    // "judge it against the document above" would be a false claim in a repo that has a
+    // charter and no STANDARDS.md — nudging the verdict away from the one that KEEPS it.
+    const f = finding({ severity: 'SUGGESTION', title: '(standard FUN-1) too long', cites: 'standard' });
+    assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f] }), /was NOT given to you — the verdict is "unshown"/);
+    // The blob is truthy but holds only the charter — the caller says which, so the claim is true.
+    assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f], docs: 'DOC', docsPresent: ['charter'] }), /was NOT given to you/);
+    assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f], docs: 'DOC', docsPresent: ['standard'] }), /judge it against that document, which is above/);
+  });
+
+  test('an unsent document protects only findings WITHIN the cap', () => {
+    // Otherwise "the document was not resolvable" is a route to unlimited undroppable
+    // opinions — in most repos, since most resolve no ticket board and many no STANDARDS.md
+    // — and it is exactly where the tag is least trustworthy, because the reviewer was never
+    // given the block that asks for those findings.
+    const many = Array.from({ length: 5 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(standard FUN-${i}) too long`, file: 'src/a.ts' }));
+    const unproven = Object.fromEntries(many.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    const noStandards = { shown: new Set(['src/a.ts']), inDiff: new Set<string>(), docs: new Set<DocumentCited>(['charter']), text: '' };
+    const out = applyVerdicts(many, unproven, noStandards, { 'src/a.ts': 'x' });
+    assert.equal(out.filter((c) => !c.verifier_dropped).length, DOC_TAG_EXEMPT.standard);
+    assert.equal(dropped(out).length, 2, 'the two past the cap are ordinary opinions');
+  });
+
+  test('a verdict about a document that was not sent is rewritten to "unshown" in code', () => {
+    // The file equivalent has always been the caller's decision; prose alone made this one
+    // weakest on the small or other-family models the pass recommends for decorrelation.
+    const f = finding({ severity: 'SUGGESTION', title: '(standard FUN-1) too long', cites: 'standard', file: 'src/a.ts' });
+    const refuted = { 1: { verdict: 'refuted' as const, verifier_evidence: ['const a = 1;'], verifier_note: 'n' } };
+    const withoutDoc = { shown: new Set(['src/a.ts']), inDiff: new Set<string>(), docs: new Set<DocumentCited>(['charter']), text: 'const a = 1;' };
+    assert.equal(applyVerdicts([f], refuted, withoutDoc, {})[0].verdict, 'unshown');
+    const withDoc = { ...withoutDoc, docs: new Set<DocumentCited>(['standard']) };
+    assert.equal(applyVerdicts([f], refuted, withDoc, {})[0].verdict, 'refuted');
+  });
+
+  test('when the title prefix and the declared field disagree, the title wins', () => {
+    // Display and the filter must not name different documents: the prefix is what every
+    // human surface shows, so it is the one the exemption spends its slot on.
+    assert.equal(citesDoc(finding({ title: '(charter) x', cites: 'ticket' })), true);
+    const out = applyVerdicts(
+      [finding({ severity: 'SUGGESTION', title: '(charter) x', cites: 'ticket' }), finding({ severity: 'SUGGESTION', title: '(charter) y' })],
+      { 1: { verdict: 'unproven', verifier_note: 'n' }, 2: { verdict: 'unproven', verifier_note: 'n' } },
+    );
+    assert.equal(out[0].verifier_dropped, undefined, 'the first charter finding spends the charter slot');
+    assert.equal(out[1].verifier_dropped, true, 'the second is past the cap, so the disagreement did not buy an extra slot');
   });
 
   test('says when the reviewer quoted nothing, so an unevidenced claim is visible as one', () => {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { extractJsonObject, parseReviewForTest } from "./review.js";
+import { extractJsonObject, parseReviewForTest, citedDocument } from "./review.js";
 
 // Guards the resilient JSON extraction that stops a malformed/truncated model
 // response from killing an entire review (the recurring "Failed to parse" bug),
@@ -77,4 +77,44 @@ it('prompt v2: kind, confidence, evidence and fingerprint survive parsing, with 
   assert.equal(r[3].kind, 'added', 'an unknown kind falls back');
   assert.equal(r[3].confidence, 'medium', 'an unknown confidence falls back');
 });
+});
+
+
+describe("citedDocument", () => {
+  it("takes the title prefix when there is one, else the declared field, and normalises both spellings", () => {
+    assert.equal(citedDocument({ cites: "ticket", title: "anything at all" }), "ticket", "the field covers a finding with no prefix");
+    assert.equal(citedDocument({ cites: "standards", title: "x" }), "standard", "either spelling of the middle one");
+    assert.equal(citedDocument({ cites: "STANDARD", title: "x" }), "standard");
+    assert.equal(citedDocument({ title: "(standard FUN-1) too long" }), "standard", "the prefix still works for codex");
+    assert.equal(citedDocument({ title: "(charter) drifted" }), "charter");
+    assert.equal(citedDocument({ cites: "nonsense", title: "(ticket) x" }), "ticket", "a junk field falls through to the prefix");
+    // The reader sees "(charter)"; the filter must not be acting on the ticket's slot.
+    assert.equal(citedDocument({ cites: "ticket", title: "(charter) drifted" }), "charter", "on disagreement, what is SHOWN wins");
+    assert.equal(citedDocument({ title: "(out of scope) x" }), undefined);
+    assert.equal(citedDocument({}), undefined);
+  });
+
+  it("a cites value naming an inherited property is not a document", () => {
+    // `cites` is not schema-constrained on the normal path (the schema is a retry tool, and
+    // codex never gets one), so any string arrives here. A bare object index would return
+    // Object / Object.prototype for these — truthy, and then bound as a finding column,
+    // which throws inside the metrics guard and loses every findings row for the round
+    // while the review row survives as one that "raised nothing".
+    for (const evil of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      assert.equal(citedDocument({ cites: evil, title: "ordinary" }), undefined, evil);
+    }
+    const r = parseReviewForTest(JSON.stringify({ summary: "s", comments: [
+      { file: "a.ts", line: 1, severity: "SUGGESTION", title: "t", body: "b", cites: "constructor" },
+    ] }));
+    assert.equal(r.comments[0].cites, undefined);
+  });
+
+  it("normalizeComment sets cites from either source, so the verifier reads one field", () => {
+    const r = parseReviewForTest(JSON.stringify({ summary: "s", comments: [
+      { file: "a.ts", line: 1, severity: "SUGGESTION", title: "Criterion 2 unaddressed", body: "b", cites: "ticket" },
+      { file: "a.ts", line: 2, severity: "SUGGESTION", title: "(charter) drifted", body: "b" },
+      { file: "a.ts", line: 3, severity: "SUGGESTION", title: "ordinary", body: "b" },
+    ] }));
+    assert.deepEqual(r.comments.map((c) => c.cites), ["ticket", "charter", undefined]);
+  });
 });

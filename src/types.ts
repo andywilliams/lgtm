@@ -21,6 +21,9 @@ export type Confidence = 'high' | 'medium' | 'low';
  */
 export type Verdict = 'confirmed' | 'refuted' | 'unproven' | 'unshown' | 'unverified';
 
+/** A document a finding can be a conformance claim against, rather than a claim about code. */
+export type DocumentCited = 'charter' | 'standard' | 'ticket';
+
 export interface ReviewComment {
   file: string;
   line: number;
@@ -36,6 +39,14 @@ export interface ReviewComment {
   how_to_verify?: string;
   /** Stable identity across rounds: the symbol or construct at fault, not the line. */
   fingerprint?: string;
+  /**
+   * The DOCUMENT this finding is a conformance claim against, rather than the code — what
+   * the verifier's drop exemption keys on. A declared field rather than a convention read
+   * back out of a heading, but see `citedDocument`: a title prefix, when there is one, wins
+   * over this, because the prefix is what every human surface shows and the filter must not
+   * act on a different document from the one the reader is told about.
+   */
+  cites?: DocumentCited;
   // --- set by the verifier pass, never by the reviewer (src/verify.ts) ---
   verdict?: Verdict;
   /** Lines the verifier quoted to confirm or refute the finding. */
