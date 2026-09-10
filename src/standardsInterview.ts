@@ -70,6 +70,77 @@ function stats(values: number[]): Stats {
   return { p50: percentile(sorted, 50), p95: percentile(sorted, 95), max: sorted[sorted.length - 1] ?? 0 };
 }
 
+/** How long the target repo's own ESLint may take over one file before we stop waiting. */
+const LINT_PROBE_TIMEOUT_MS = 60_000;
+
+/**
+ * What the target repo's ESLint made of the fragment we just wrote it.
+ *  - `ok`        — it lints clean; nothing to say.
+ *  - `problems`  — it reports lint findings IN the fragment. Odd for generated code, but
+ *                  survivable: `eslint .` exits 1 and CI goes red, which the operator wants to know.
+ *  - `broken`    — ESLint could not lint the file at all (exit ≥ 2). This is the one that
+ *                  matters: a typed config applies typed rules to a `.js` file in no tsconfig
+ *                  project, every rule throws, and `eslint .` takes the whole lint down with it.
+ *  - `skipped`   — no resolvable ESLint here, so there is nothing to break.
+ */
+export type FragmentLintResult =
+  | { status: 'ok' }
+  | { status: 'skipped'; reason: string }
+  | { status: 'problems' | 'broken'; detail: string };
+
+/**
+ * Lint the generated fragment with the TARGET repo's own ESLint, because that is the only
+ * thing that knows whether the file we just added breaks its build.
+ *
+ * This exists because it happened: `standards init` wrote `.lgtm/standards.eslint.js` into a
+ * repo linting with `recommendedTypeChecked`, every typed rule threw on a file belonging to
+ * no tsconfig project, and the pre-commit hook killed the commit with a stack trace. A
+ * generator that writes a file into someone else's repo owns whether that file passes their
+ * build — and finding out costs one bounded subprocess.
+ */
+export function checkFragmentLints(repoRoot: string, fragmentPath: string): FragmentLintResult {
+  const bin = join(repoRoot, 'node_modules', '.bin', 'eslint');
+  if (!existsSync(bin)) return { status: 'skipped', reason: 'no ESLint installed in this repo' };
+  // Lint the fragment's DIRECTORY, not the file. Naming a file explicitly makes ESLint lint
+  // it even when the config ignores it — which would report `broken` forever in a repo that
+  // has already applied the remedy, the exact false positive this check would then be
+  // famous for. A directory pattern is what `eslint .` does, so it answers the question
+  // actually being asked: will their lint break?
+  const dir = relative(repoRoot, dirname(fragmentPath)) || '.';
+  try {
+    execFileSync(bin, [dir, '--no-error-on-unmatched-pattern'], {
+      cwd: repoRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: LINT_PROBE_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
+    });
+    return { status: 'ok' };
+  } catch (e: any) {
+    // A timeout is not a verdict on the file: say we could not tell rather than accuse it.
+    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', reason: `ESLint did not finish within ${LINT_PROBE_TIMEOUT_MS / 1000}s` };
+    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
+    return { status: e?.status === 1 ? 'problems' : 'broken', detail: firstUsefulLine(out) };
+  }
+}
+
+/**
+ * The line worth showing out of ESLint's output. Its crash banner ("Oops! Something went
+ * wrong! :(", a blank line, then the version) is the first thing printed and says nothing;
+ * the sentence that names the rule and the missing parser option is several lines down.
+ * Showing the banner would reproduce the original problem in miniature — an operator told
+ * something broke and not what.
+ */
+export function firstUsefulLine(output: string): string {
+  const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+  const noise = /^(Oops!|ESLint: |at |\.\.\.)/;
+  const meaty = lines.find((l) => /error/i.test(l) && !noise.test(l));
+  return (meaty ?? lines.find((l) => !noise.test(l)) ?? 'no output').slice(0, 300);
+}
+
+/** The one-line fix for a config that cannot lint the fragment, naming the actual directory. */
+export function ignoreRemedy(repoRoot: string, fragmentPath: string): string {
+  const dir = relative(repoRoot, dirname(fragmentPath)) || '.lgtm';
+  return `add '${dir}' to the \`ignores\` array in your ESLint config — it is a generated config artefact, not source`;
+}
+
 function tryExec(cmd: string, args: string[]): string {
   try {
     return execFileSync(cmd, args, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 10 * 1024 * 1024 });
@@ -582,6 +653,21 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
     console.log(chalk.green(`✓ Wrote ${fragmentPath}`));
     console.log(chalk.gray(`   ${ruleCount} mechanical rules at "${severity}" — spread \`standardsRules\` into your ESLint config (the file's header shows how).`));
     console.log(chalk.gray('   Every rule here is one the standards review no longer has to spend a finding on.'));
+
+    // Does the file we just wrote pass THIS repo's lint? Asked out loud, because the
+    // alternative is the operator meeting the answer as a stack trace from a pre-commit hook.
+    const lint = checkFragmentLints(repoRoot, fragmentPath);
+    if (lint.status === 'broken') {
+      console.log(chalk.red(`\n⚠  Your ESLint cannot lint this file — \`eslint .\` will now FAIL, not warn:`));
+      console.log(chalk.red(`   ${lint.detail}`));
+      console.log(chalk.yellow(`   Fix: ${ignoreRemedy(repoRoot, fragmentPath)}.`));
+      console.log(chalk.gray('   (Not done for you: editing a config lgtm did not generate is your call, not the tool\'s.)'));
+    } else if (lint.status === 'problems') {
+      console.log(chalk.yellow(`\n⚠  Your ESLint reports problems in this generated file: ${lint.detail}`));
+      console.log(chalk.yellow(`   Either fix the rule that fires on it, or ${ignoreRemedy(repoRoot, fragmentPath)}.`));
+    } else if (lint.status === 'skipped') {
+      console.log(chalk.gray(`   Not lint-checked (${lint.reason}) — the mechanical rules have nothing to run in yet.`));
+    }
   }
   const summaryParts = [`Profile ${profile}`];
   if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);
