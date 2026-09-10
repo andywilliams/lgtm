@@ -139,12 +139,21 @@ function migrate(db: Database.Database): void {
       file TEXT NOT NULL,
       line INTEGER NOT NULL,
       fingerprint TEXT NOT NULL,
+      kind TEXT,
+      confidence TEXT,
       disposition TEXT,
       disposed_at_round INTEGER,
       dismissed_reason TEXT
     )
   `);
   db.exec('CREATE INDEX IF NOT EXISTS findings_loop ON findings(repo, round_key, round)');
+  // Findings columns added after the table shipped, applied the same way as the review ones.
+  const findingCols = new Set(
+    (db.prepare('PRAGMA table_info(findings)').all() as { name: string }[]).map((c) => c.name)
+  );
+  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT']] as [string, string][]) {
+    if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
+  }
 }
 
 export function initDb(): Database.Database {
@@ -401,8 +410,11 @@ export function primaryModel(models: string[]): string {
  * a different line is the same finding. (A model-supplied fingerprint would be
  * sharper — that is the prompt-v2 work; this is the matching the log has today.)
  */
-export function fingerprintOf(c: Pick<ReviewComment, 'file' | 'title'>): string {
-  return `${c.file}#${normTitle(c.title)}`;
+export function fingerprintOf(c: Pick<ReviewComment, 'file' | 'title' | 'fingerprint'>): string {
+  // The reviewer names the symbol or construct at fault when it can (prompt v2); the
+  // normalised title is the fallback for older rows, codex, and anything unlabelled.
+  const key = c.fingerprint?.trim() ? normTitle(c.fingerprint) : normTitle(c.title);
+  return `${c.file}#${key}`;
 }
 
 /** Title identity: case-, punctuation- and tag-insensitive, so `(out of scope) Foo!` is `foo`. */
@@ -414,11 +426,11 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
-    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, kind, confidence)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const tx = db.transaction((rows: ReviewComment[]) =>
-    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c)).lastInsertRowid))
+    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.kind ?? null, c.confidence ?? null).lastInsertRowid))
   );
   const ids = tx(comments);
   db.close();
@@ -513,10 +525,10 @@ export function disposePreviousRound(
   const unchanged = Boolean(diffSha && last?.diff_sha && last.diff_sha === diffSha);
   const summary: DispositionSummary = { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 };
   const prev = db.prepare(
-    'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, r.harshness FROM findings f ' +
+    'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, f.kind, r.harshness FROM findings f ' +
     'JOIN reviews r ON r.id = f.review_id ' +
     `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL`
-  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; harshness: string | null }[];
+  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; kind: string | null; harshness: string | null }[];
   if (prev.length === 0) {
     db.close();
     return summary;
@@ -565,6 +577,10 @@ export interface RoundRow {
   failed: boolean;
   bySeverity: Record<Severity, number>;
   findings: number;
+  /** Findings about what the diff removes or omits — the class a diff review skips. */
+  absences: number;
+  /** Findings the reviewer could quote evidence for. */
+  highConfidence: number;
   fixed: number;
   dismissed: number;
   carried: number;
@@ -614,8 +630,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   const marks = keys.map(() => '?').join(', ');
   const reviews = roundsFor(db, repo, keys);
   const findings = db.prepare(
-    `SELECT round_key, round, severity, disposition FROM findings WHERE repo = ? AND round_key IN (${marks})`
-  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null }[];
+    `SELECT round_key, round, severity, disposition, kind, confidence FROM findings WHERE repo = ? AND round_key IN (${marks})`
+  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null; kind: string | null; confidence: string | null }[];
   const inRun = new Set<string>();
   db.close();
 
@@ -630,6 +646,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     failed: Boolean(r.failed),
     bySeverity: { BUG: 0, SECURITY: 0, SUGGESTION: 0, NITPICK: 0 },
     findings: 0,
+    absences: 0,
+    highConfidence: 0,
     fixed: 0,
     dismissed: 0,
     carried: 0,
@@ -642,6 +660,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     const row = byRound.get(`${f.round_key}#${f.round}`);
     if (!row) continue;
     row.findings += 1;
+    if (f.kind === 'removed' || f.kind === 'missing') row.absences += 1;
+    if (f.confidence === 'high') row.highConfidence += 1;
     if (SEVERITIES.includes(f.severity)) row.bySeverity[f.severity] += 1;
     if (f.disposition) row[f.disposition] += 1;
     if (f.round_key === roundKey && (f.severity === 'BUG' || f.severity === 'SECURITY') && (lastBugRound === null || f.round > lastBugRound)) lastBugRound = f.round;

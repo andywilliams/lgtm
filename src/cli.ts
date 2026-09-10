@@ -484,12 +484,19 @@ function formatAgentResult(options: {
     duplicates,
     comments: options.comments.map(c => ({
       id: c.id ?? null,
+      // Triage fields first: what kind of problem, how sure the reviewer is, and the one
+      // check that settles it — read these before the body.
+      kind: c.kind ?? 'added',
+      confidence: c.confidence ?? 'medium',
+      how_to_verify: c.how_to_verify ?? null,
+      evidence: c.evidence ?? [],
       file: c.file,
       line: c.line,
       severity: c.severity,
       title: c.title,
       body: c.body,
       suggestion: c.suggestion,
+      fingerprint: c.fingerprint ?? null,
       duplicate: c.duplicate,
     })),
     context: {
@@ -1654,7 +1661,7 @@ program
     }
     const mixed = summary.rounds.some((r) => r.key !== key);
     console.log(chalk.bold(`\nReview rounds — ${key}${mixed ? ' (with the branch\'s local rounds first)' : ''}\n`));
-    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  fixed dism carr supp    cost  model`);
+    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  abs high  fixed dism carr supp    cost  model`);
     for (const r of summary.rounds) {
       const when = r.reviewedAt.slice(0, 16).replace('T', ' ');
       const s = r.bySeverity;
@@ -1664,6 +1671,7 @@ program
       console.log(
         `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
           `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
+          `${String(r.absences).padStart(3)} ${String(r.highConfidence).padStart(4)}  ` +
           `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${modelCol}`
       );
     }

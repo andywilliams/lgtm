@@ -1,6 +1,6 @@
 import { jsonrepair } from 'jsonrepair';
 import { runAIPrompt, type AIProvider } from './ai.js';
-import type { Harshness, ReviewResult, ReviewComment, Severity, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
+import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
 // Provider plumbing lives in ai.ts; re-exported here so existing importers keep working.
 export { checkClaudeCli, checkCodexCli, getAvailableProviders } from './ai.js';
@@ -8,6 +8,8 @@ export type { AIProvider };
 
 const HARSHNESS_PROMPTS: Record<Harshness, string> = {
   chill: `Only flag issues that are:
+- Reported at "confidence": "high" — at this level a finding you cannot quote evidence for is not worth the author's time
+
 - Definite bugs that will cause runtime errors
 - Security vulnerabilities
 - Breaking changes to public APIs
@@ -55,11 +57,16 @@ export const REVIEW_SCHEMA = {
           file: { type: 'string' },
           line: { type: 'integer' },
           severity: { type: 'string', enum: ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'] },
+          kind: { type: 'string', enum: ['added', 'removed', 'missing'] },
+          confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
           title: { type: 'string' },
           body: { type: 'string' },
+          evidence: { type: 'array', items: { type: 'string' } },
+          how_to_verify: { type: 'string' },
+          fingerprint: { type: 'string' },
           suggestion: { type: 'string' },
         },
-        required: ['file', 'line', 'severity', 'title', 'body'],
+        required: ['file', 'line', 'severity', 'kind', 'confidence', 'title', 'body', 'evidence', 'how_to_verify', 'fingerprint'],
       },
     },
   },
@@ -68,8 +75,42 @@ export const REVIEW_SCHEMA = {
 
 export const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
 
-IMPORTANT RULES:
-- Only comment on lines that are ADDED (start with + in the diff)
+WHAT YOU MAY REPORT — three kinds, and the last two are the ones that get missed:
+- "added": a problem in a line the diff ADDS (starts with +). Anchor it to that line.
+- "removed": a problem the diff CAUSES BY DELETING something — a guard, a null check, a
+  test, an assertion, a call the rest of the code still needs. Anchor it to the nearest
+  surviving line and quote the removed line as evidence.
+- "missing": a problem in what the diff DOES NOT do — a new write path with no reader
+  updated, a new state with no migration, a new branch with no test, a capability added
+  in one place and not registered where its siblings are registered. Anchor it to the
+  most relevant added line and say plainly that the problem is an absence.
+Absence is the highest-value finding class and the easiest to skip. If everything the
+diff does is correct and something it omits is not, report the omission.
+
+EVIDENCE — every finding carries its own proof:
+- "evidence": the exact lines (from the diff or the provided context) that show the
+  problem. Quote them; do not paraphrase. A finding you cannot quote lines for MUST be
+  "confidence": "low", and one you can demonstrate with concrete inputs is "high".
+- "how_to_verify": the single check that settles whether this is real — the input that
+  triggers it, the command to run, the file to open.
+- "fingerprint": the symbol or construct at fault ("parseRow", "CycleStateTable write",
+  "retry ladder"), NOT the line number — it identifies this finding across review rounds
+  as the code moves.
+
+CLAIMS vs CODE — comments are not evidence:
+Code comments, docstrings, commit messages and the PR description are CLAIMS BY THE
+AUTHOR. Check them against the code; never accept them as proof. A comment saying "this
+cannot be null", "no new reads", "safe because X" beside code that does not establish it
+is itself a finding: say the code does not support the claim, and quote both.
+
+TESTS — a change that weakens the net is a defect:
+Flag, as BUG unless the diff explains why: a deleted or skipped test, an assertion made
+weaker (a tightened tolerance loosened, an exact match turned into a substring, an
+expected value replaced by whatever the code now returns), a rewritten snapshot with no
+behavioural reason. For every behavioural change, name the test that would fail without
+it — and if there is none, say so in the finding.
+
+OTHER RULES:
 - Use the line number shown after @@ in the diff hunk header for context
 - Be specific about what's wrong and how to fix it
 - Don't repeat yourself
@@ -224,10 +265,15 @@ ${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
-- "line": the line number in the new version (from diff lines starting with +)
+- "line": the line number in the new version (for a "removed"/"missing" finding, the nearest surviving line)
 - "severity": one of "BUG", "SECURITY", "SUGGESTION", "NITPICK"
+- "kind": "added" | "removed" | "missing" (see above)
+- "confidence": "high" | "medium" | "low" — "low" whenever you cannot quote evidence
 - "title": a brief title (max 50 chars)
 - "body": detailed explanation
+- "evidence": array of exact quoted lines showing the problem (may be empty ONLY at confidence "low")
+- "how_to_verify": the single check that settles it
+- "fingerprint": the symbol or construct at fault, not the line number
 - "suggestion": optional code fix
 
 Respond with this exact JSON structure:
@@ -571,10 +617,24 @@ function normalizeQuestion(q: any): QuizQuestion {
 
 function normalizeComment(comment: any): ReviewComment {
   const validSeverities: Severity[] = ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'];
+  const kinds: FindingKind[] = ['added', 'removed', 'missing'];
+  const confidences: Confidence[] = ['high', 'medium', 'low'];
+  const evidence = Array.isArray(comment.evidence) ? comment.evidence.map(String).filter((e: string) => e.trim() !== '') : [];
+  // A finding with nothing quotable cannot claim high confidence, whatever it says —
+  // the whole point of the field is that it is earned by evidence.
+  const claimed = confidences.includes(comment.confidence) ? comment.confidence : 'medium';
+  const confidence: Confidence = evidence.length === 0 && claimed === 'high' ? 'medium' : claimed;
   return {
     file: String(comment.file || ''),
     line: Number(comment.line) || 1,
     severity: validSeverities.includes(comment.severity) ? comment.severity : 'SUGGESTION',
+    // Older callers and codex (no schema) send neither kind nor confidence: an unlabelled
+    // finding is about added code, which is what every finding was before this.
+    kind: kinds.includes(comment.kind) ? comment.kind : 'added',
+    confidence,
+    evidence,
+    how_to_verify: comment.how_to_verify ? String(comment.how_to_verify) : undefined,
+    fingerprint: comment.fingerprint ? String(comment.fingerprint) : undefined,
     title: String(comment.title || 'Review comment'),
     body: String(comment.body || ''),
     suggestion: comment.suggestion ? String(comment.suggestion) : undefined,
