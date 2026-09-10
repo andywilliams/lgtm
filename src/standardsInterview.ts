@@ -1,11 +1,11 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, readdirSync } from 'node:fs';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
-import { generateEslintFragment, usesEsm, deriveRules } from './standardsLint.js';
+import { generateEslintFragment, usesEsm, deriveRules, hasEslintConfig } from './standardsLint.js';
 
 /**
  * `lgtm standards init` — produce the repo's STANDARDS.md from the catalog.
@@ -68,6 +68,109 @@ function percentile(sorted: number[], p: number): number {
 function stats(values: number[]): Stats {
   const sorted = [...values].sort((a, b) => a - b);
   return { p50: percentile(sorted, 50), p95: percentile(sorted, 95), max: sorted[sorted.length - 1] ?? 0 };
+}
+
+/** How long the target repo's own ESLint may take over one file before we stop waiting. */
+const LINT_PROBE_TIMEOUT_MS = 60_000;
+
+/**
+ * What the target repo's ESLint made of the directory we just wrote the fragment into.
+ *  - `ok`        — it lints clean; nothing to say.
+ *  - `problems`  — it reported lint findings (exit 1). `eslint .` goes red, which the
+ *                  operator wants to know. `namesFragment` says whether the output points
+ *                  at our file or at a neighbour in the same directory.
+ *  - `broken`    — ESLint could not lint at all (exit ≥ 2). The case this check exists for:
+ *                  a typed config applies typed rules to a `.js` file in no tsconfig project,
+ *                  every rule throws, and `eslint .` takes the whole lint down. `namesFragment`
+ *                  false means their lint fails for a reason that may predate this file.
+ *  - `skipped`   — no verdict was reached, for one of five reasons, and the reason says
+ *                  what follows from it. Only ONE of them ("no ESLint configured in this
+ *                  repo") means there is nothing here to break; the others — a preview-run
+ *                  fragment written outside the repo, ESLint configured with no local binary
+ *                  to run it, a timeout, a binary that would not start — leave the question
+ *                  open, and saying otherwise is the reassurance this check exists to stop.
+ */
+export type FragmentLintResult =
+  | { status: 'ok' }
+  | { status: 'skipped'; reason: string }
+  /** `namesFragment` false ⇒ the output points at something else in the directory, or nowhere. */
+  | { status: 'problems' | 'broken'; detail: string; namesFragment: boolean };
+
+/**
+ * Lint the generated fragment with the TARGET repo's own ESLint, because that is the only
+ * thing that knows whether the file we just added breaks its build.
+ *
+ * This exists because it happened: `standards init` wrote `.lgtm/standards.eslint.js` into a
+ * repo linting with `recommendedTypeChecked`, every typed rule threw on a file belonging to
+ * no tsconfig project, and the pre-commit hook killed the commit with a stack trace. A
+ * generator that writes a file into someone else's repo owns whether that file passes their
+ * build — and finding out costs one bounded subprocess.
+ */
+export function checkFragmentLints(repoRoot: string, fragmentPath: string): FragmentLintResult {
+  // A preview run (`--out /tmp/draft/STANDARDS.md`) puts the fragment outside the repo
+  // entirely. Linting it with the repo's cwd would answer a question about a file that is
+  // not in the repo — most likely "ok", because it sits outside the config's base directory,
+  // which is a clean bill of health for a file nothing looked at.
+  const rel = relative(repoRoot, dirname(fragmentPath));
+  if (rel.startsWith('..') || isAbsolute(rel)) return { status: 'skipped', reason: 'the fragment was written outside this repo (preview run)' };
+  const bin = join(repoRoot, 'node_modules', '.bin', 'eslint');
+  if (!existsSync(bin)) {
+    // "I could not find a local binary" is not "this repo has no ESLint": Yarn PnP has no
+    // node_modules at all, and in a workspace ESLint may live in a package below the git
+    // root. Saying "nothing to break" there would be the exact wrong reassurance.
+    return hasEslintConfig(repoRoot)
+      ? { status: 'skipped', reason: 'ESLint is configured here but there is no local binary to run it with (Yarn PnP, or a workspace package) — check it yourself' }
+      : { status: 'skipped', reason: 'no ESLint configured in this repo, so the mechanical rules have nothing to run in yet' };
+  }
+  // Lint the fragment's DIRECTORY, not the file. Naming a file explicitly makes ESLint lint
+  // it even when the config ignores it — which would report `broken` forever in a repo that
+  // has already applied the remedy, the exact false positive this check would then be
+  // famous for. A directory pattern is what `eslint .` does, so it answers the question
+  // actually being asked: will their lint break?
+  const dir = rel || '.';
+  try {
+    execFileSync(bin, [dir, '--no-error-on-unmatched-pattern'], {
+      cwd: repoRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: LINT_PROBE_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
+    });
+    return { status: 'ok' };
+  } catch (e: any) {
+    // A timeout is not a verdict on the file: say we could not tell rather than accuse it.
+    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', reason: `ESLint did not finish within ${LINT_PROBE_TIMEOUT_MS / 1000}s` };
+    // Nor is a failure to START one. A binary that exists but cannot be executed leaves
+    // `status` null and no output, which would otherwise be reported as "your lint will now
+    // FAIL" followed by the words "no output" — an accusation with no evidence behind it.
+    if (typeof e?.status !== 'number') return { status: 'skipped', reason: `ESLint could not be run (${e?.code ?? e?.message ?? 'spawn failed'})` };
+    const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
+    // Whether the output names our file decides whether lgtm may claim responsibility, and
+    // it applies to BOTH exits. `.lgtm/` is not a one-file directory — the answers JSON is
+    // written beside the fragment, `quality baseline` puts its own there — so a rule firing
+    // on a neighbour would otherwise be reported as a problem in the fragment, with a remedy
+    // aimed at the wrong file. Exit >= 2 has the same shape for a different reason: a
+    // missing plugin breaks their lint before the fragment is ever read.
+    const namesFragment = out.includes(basename(fragmentPath));
+    return { status: e.status === 1 ? 'problems' : 'broken', detail: firstUsefulLine(out), namesFragment };
+  }
+}
+
+/**
+ * The line worth showing out of ESLint's output. Its crash banner ("Oops! Something went
+ * wrong! :(", a blank line, then the version) is the first thing printed and says nothing;
+ * the sentence that names the rule and the missing parser option is several lines down.
+ * Showing the banner would reproduce the original problem in miniature — an operator told
+ * something broke and not what.
+ */
+export function firstUsefulLine(output: string): string {
+  const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+  const noise = /^(Oops!|ESLint: |at |\.\.\.)/;
+  const meaty = lines.find((l) => /error/i.test(l) && !noise.test(l));
+  return (meaty ?? lines.find((l) => !noise.test(l)) ?? 'no output').slice(0, 300);
+}
+
+/** The one-line fix for a config that cannot lint the fragment, naming the actual directory. */
+export function ignoreRemedy(repoRoot: string, fragmentPath: string): string {
+  const dir = relative(repoRoot, dirname(fragmentPath)) || '.lgtm';
+  return `add '${dir}' to the \`ignores\` array in your ESLint config — it is a generated config artefact, not source`;
 }
 
 function tryExec(cmd: string, args: string[]): string {
@@ -464,6 +567,73 @@ function parseProfile(raw: string | undefined): RepoProfile | undefined {
   return raw && (['lib', 'service', 'frontend'] as const).includes(raw as RepoProfile) ? (raw as RepoProfile) : undefined;
 }
 
+/**
+ * Write the mechanical half — the ESLint fragment and the answers that generated it — and
+ * say what it will do to this repo. Split out of `runStandardsInit` because that function
+ * was doing the interview, the document, the fragment and the reporting; this is the one
+ * piece with its own subject (the target repo's lint) and its own failure modes.
+ */
+function writeMechanicalHalf(opts: {
+  repoRoot: string; repoName: string; outPath: string; profile: RepoProfile;
+  selections: StandardsSelections; severity: 'warn' | 'error';
+}): void {
+  const { repoRoot, repoName, outPath, profile, selections, severity } = opts;
+
+  // The fragment follows the DOCUMENT. With `--out /tmp/draft/STANDARDS.md`
+  // (a preview run), writing the fragment into the real repo would be an
+  // unrequested side effect on the working tree.
+  const fragmentDir = join(dirname(outPath), '.lgtm');
+  const fragmentPath = join(fragmentDir, 'standards.eslint.js');
+  const fragment = generateEslintFragment({
+    repoName,
+    profile,
+    selections,
+    esm: usesEsm(repoRoot),
+    severity,
+    fragmentRelPath: relative(repoRoot, fragmentPath) || 'standards.eslint.js',
+  });
+  mkdirSync(fragmentDir, { recursive: true });
+  writeFileSync(fragmentPath, fragment);
+
+  // Persist the answers next to the outputs. Both artefacts are GENERATED, so a
+  // hand-edit to either is silently reverted by the next re-run unless the
+  // inputs live somewhere durable and versioned — which is exactly how an
+  // improvement to a house rule can be lost.
+  const answersPath = join(fragmentDir, 'standards.answers.json');
+  writeFileSync(
+    answersPath,
+    JSON.stringify({ profile, ...selections.askChoices, ...selections.thresholds, houseRules: selections.houseRules }, null, 2) + '\n'
+  );
+  console.log(chalk.green(`✓ Wrote ${answersPath}`));
+  console.log(chalk.gray('   Commit it: these documents are generated, so EDIT THE ANSWERS and re-run rather than hand-editing the output.'));
+  const ruleCount = deriveRules(selections, severity).length;
+  console.log(chalk.green(`✓ Wrote ${fragmentPath}`));
+  console.log(chalk.gray(`   ${ruleCount} mechanical rules at "${severity}" — spread \`standardsRules\` into your ESLint config (the file's header shows how).`));
+  console.log(chalk.gray('   Every rule here is one the standards review no longer has to spend a finding on.'));
+
+  // Does the file we just wrote pass THIS repo's lint? Asked out loud, because the
+  // alternative is the operator meeting the answer as a stack trace from a pre-commit hook.
+  const lint = checkFragmentLints(repoRoot, fragmentPath);
+  if (lint.status === 'broken') {
+    console.log(chalk.red(lint.namesFragment
+      ? `\n⚠  Your ESLint cannot lint this file — \`eslint .\` will now FAIL, not warn:`
+      : `\n⚠  Your ESLint exits with an error over ${relative(repoRoot, dirname(fragmentPath)) || '.'} — this may predate the file just written:`));
+    console.log(chalk.red(`   ${lint.detail}`));
+    console.log(chalk.yellow(`   ${lint.namesFragment ? 'Fix' : 'If it is this file'}: ${ignoreRemedy(repoRoot, fragmentPath)}.`));
+    console.log(chalk.gray('   (Not done for you: editing a config lgtm did not generate is your call, not the tool\'s.)'));
+  } else if (lint.status === 'problems') {
+    console.log(chalk.yellow(lint.namesFragment
+      ? `\n⚠  Your ESLint reports problems in this generated file: ${lint.detail}`
+      : `\n⚠  Your ESLint reports problems under ${relative(repoRoot, dirname(fragmentPath)) || '.'} — not necessarily this file: ${lint.detail}`));
+    console.log(chalk.yellow(`   Either fix the rule that fires, or ${ignoreRemedy(repoRoot, fragmentPath)}.`));
+  } else if (lint.status === 'skipped') {
+    // The reason carries its own consequence. A fixed tail here once said "the mechanical
+    // rules have nothing to run in yet", false for three of the four reasons — including
+    // the one added precisely to stop giving that reassurance.
+    console.log(chalk.gray(`   Not lint-checked: ${lint.reason}.`));
+  }
+}
+
 /** `lgtm standards init` — scan, ask the contested toggles, write STANDARDS.md. */
 export async function runStandardsInit(options: StandardsInitOptions): Promise<void> {
   const repoRoot = tryExec('git', ['rev-parse', '--show-toplevel']).trim() || process.cwd();
@@ -550,38 +720,7 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
 
   // The mechanical half, derived from the same selections so the two can't drift.
   if (!options.noEslint) {
-    // The fragment follows the DOCUMENT. With `--out /tmp/draft/STANDARDS.md`
-    // (a preview run), writing the fragment into the real repo would be an
-    // unrequested side effect on the working tree.
-    const fragmentDir = join(dirname(outPath), '.lgtm');
-    const fragmentPath = join(fragmentDir, 'standards.eslint.js');
-    const severity = options.severity ?? 'warn';
-    const fragment = generateEslintFragment({
-      repoName,
-      profile,
-      selections,
-      esm: usesEsm(repoRoot),
-      severity,
-      fragmentRelPath: relative(repoRoot, fragmentPath) || 'standards.eslint.js',
-    });
-    mkdirSync(fragmentDir, { recursive: true });
-    writeFileSync(fragmentPath, fragment);
-
-    // Persist the answers next to the outputs. Both artefacts are GENERATED, so a
-    // hand-edit to either is silently reverted by the next re-run unless the
-    // inputs live somewhere durable and versioned — which is exactly how an
-    // improvement to a house rule can be lost.
-    const answersPath = join(fragmentDir, 'standards.answers.json');
-    writeFileSync(
-      answersPath,
-      JSON.stringify({ profile, ...selections.askChoices, ...selections.thresholds, houseRules: selections.houseRules }, null, 2) + '\n'
-    );
-    console.log(chalk.green(`✓ Wrote ${answersPath}`));
-    console.log(chalk.gray('   Commit it: these documents are generated, so EDIT THE ANSWERS and re-run rather than hand-editing the output.'));
-    const ruleCount = deriveRules(selections, severity).length;
-    console.log(chalk.green(`✓ Wrote ${fragmentPath}`));
-    console.log(chalk.gray(`   ${ruleCount} mechanical rules at "${severity}" — spread \`standardsRules\` into your ESLint config (the file's header shows how).`));
-    console.log(chalk.gray('   Every rule here is one the standards review no longer has to spend a finding on.'));
+    writeMechanicalHalf({ repoRoot, repoName, outPath, profile, selections, severity: options.severity ?? 'warn' });
   }
   const summaryParts = [`Profile ${profile}`];
   if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);

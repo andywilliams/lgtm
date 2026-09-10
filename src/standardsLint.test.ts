@@ -1,11 +1,12 @@
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, after } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
 import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
+import { checkFragmentLints, ignoreRemedy, firstUsefulLine } from './standardsInterview.js';
 import { askEntries } from './standardsCatalog.js';
 
 // Guards the deterministic half: that the emitted rules actually track the
@@ -241,5 +242,158 @@ describe('collectTargets', () => {
     for (const n of ['a', 'b', 'c']) writeFileSync(join(dir, 'src', `${n}.js`), 'x');
     assert.strictEqual(collectTargets(join(dir, 'src'), 2).length, 2);
     assert.throws(() => collectTargets(join(dir, 'nope'), 5), /No such file or directory/);
+  });
+});
+
+describe('checkFragmentLints — does the file we just wrote break their build?', () => {
+  const repos: string[] = [];
+  const scratch = (files: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-fraglint-'));
+    repos.push(dir);
+    for (const [rel, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, rel)), { recursive: true });
+      writeFileSync(join(dir, rel), body);
+    }
+    return dir;
+  };
+  after(() => { for (const d of repos) rmSync(d, { recursive: true, force: true }); });
+
+  it('says nothing when the repo has no ESLint to break', () => {
+    const dir = scratch({ '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n' });
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'skipped');
+  });
+
+  it('reports BROKEN when the repo\'s eslint cannot lint the file at all', () => {
+    // The real case, reduced: an eslint that exits 2 the way a typed config does on a .js
+    // file in no tsconfig project. Exit 2 is the distinction that matters — `eslint .`
+    // fails outright rather than reporting warnings, and takes the commit with it.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho "Error: parserServices required for @typescript-eslint/await-thenable" >&2\nexit 2\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'broken');
+    assert.match((out as { detail: string }).detail, /parserServices/);
+  });
+
+  it('tells lint PROBLEMS (exit 1) apart from a config that cannot run (exit 2)', () => {
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho "1:1 error Unexpected thing no-thing"\nexit 1\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    assert.equal(checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js')).status, 'problems');
+  });
+
+  it('is OK when their lint is happy', () => {
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\nexit 0\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    assert.equal(checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js')).status, 'ok');
+  });
+
+  it('lints the DIRECTORY, so a repo that already applied the remedy is not accused forever', () => {
+    // Naming the file explicitly makes ESLint lint it even when the config ignores it, so
+    // the probe would keep reporting `broken` after the fix. Caught in live verification
+    // against dwlf-indicators, which reported broken while its own `pnpm lint` passed.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\ncase "$1" in\n  *.js) echo "crash" >&2; exit 2 ;;\n  *) exit 0 ;;\nesac\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    assert.equal(checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js')).status, 'ok');
+  });
+
+  it('quotes the sentence that explains the crash, not ESLint\'s banner', () => {
+    // Verbatim shape of the real failure. "Oops! Something went wrong! :(" is what ESLint
+    // prints first and it tells the operator nothing — showing it would reproduce the
+    // original problem in miniature: told something broke, not what.
+    const real = [
+      'Oops! Something went wrong! :(', '', 'ESLint: 8.57.1', '',
+      "Error: Error while loading rule '@typescript-eslint/await-thenable': You have used a rule which requires parserServices to be generated.",
+      '    at throwError (/x/y/z.js:38:11)',
+    ].join('\n');
+    assert.match(firstUsefulLine(real), /parserServices/);
+    assert.doesNotMatch(firstUsefulLine(real), /Oops/);
+    assert.equal(firstUsefulLine(''), 'no output');
+  });
+
+  it('a binary that cannot be RUN is "could not tell", not "your lint is broken"', () => {
+    // spawnSync leaves status null and no output on EACCES/ENOEXEC. Classified as broken,
+    // the operator gets "your lint will now FAIL" followed by the words "no output" — an
+    // accusation with no evidence behind it.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': 'not executable\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o644);
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'skipped');
+  });
+
+  it('does not blame the fragment for a lint that was already broken', () => {
+    // A missing plugin or unparseable config also exits 2, before the fragment is read.
+    // Claiming this file did it comes with a remedy that will not fix anything.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho "Error: Cannot find package \'eslint-plugin-nope\'" >&2\nexit 2\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'broken');
+    assert.equal((out as { namesFragment: boolean }).namesFragment, false, 'nothing in the output points at our file');
+
+    const ours = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho "Error while loading rule: .lgtm/standards.eslint.js" >&2\nexit 2\n',
+    });
+    chmodSync(join(ours, 'node_modules/.bin/eslint'), 0o755);
+    assert.equal((checkFragmentLints(ours, join(ours, '.lgtm/standards.eslint.js')) as { namesFragment: boolean }).namesFragment, true);
+  });
+
+  it('does not blame the fragment for a neighbour in the same directory', () => {
+    // `.lgtm/` is not a one-file directory: the answers JSON is written beside the fragment
+    // and `quality baseline` puts its own file there. A rule firing on a neighbour exits 1,
+    // and asserting "problems in this generated file" aims the remedy at the wrong file.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      '.lgtm/standards.answers.json': '{}\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho ".lgtm/standards.answers.json 1:1 error Bad jsonc/no-comments"\nexit 1\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'problems');
+    assert.equal((out as { namesFragment: boolean }).namesFragment, false);
+  });
+
+  it('does not probe a fragment written outside the repo by a preview run', () => {
+    // `--out /tmp/draft/STANDARDS.md` puts the fragment in /tmp. Linting it with the repo's
+    // cwd answers a question about a file that is not in the repo — most likely "ok",
+    // because it sits outside the config's base directory. A clean bill for nothing.
+    const dir = scratch({ 'node_modules/.bin/eslint': '#!/bin/sh\nexit 2\n' });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    const out = checkFragmentLints(dir, join(tmpdir(), 'draft', '.lgtm', 'standards.eslint.js'));
+    assert.equal(out.status, 'skipped');
+    assert.match((out as { reason: string }).reason, /outside this repo/);
+  });
+
+  it('tells "no ESLint here" apart from "configured but I cannot run it"', () => {
+    // Yarn PnP has no node_modules at all, and in a workspace ESLint may live below the git
+    // root. Reporting "nothing to break" there is the exact wrong reassurance.
+    const bare = scratch({ '.lgtm/standards.eslint.js': '' });
+    assert.match((checkFragmentLints(bare, join(bare, '.lgtm/standards.eslint.js')) as { reason: string }).reason, /no ESLint configured/);
+
+    const pnp = scratch({ '.lgtm/standards.eslint.js': '', 'eslint.config.js': 'export default [];\n' });
+    assert.match((checkFragmentLints(pnp, join(pnp, '.lgtm/standards.eslint.js')) as { reason: string }).reason, /no local binary/);
+  });
+
+  it('names the real directory in the remedy, not a guessed one', () => {
+    const dir = scratch({ '.lgtm/standards.eslint.js': '' });
+    assert.match(ignoreRemedy(dir, join(dir, '.lgtm/standards.eslint.js')), /add '\.lgtm' to the `ignores` array/);
+    assert.match(ignoreRemedy(dir, join(dir, 'tools/gen/standards.eslint.js')), /add 'tools\/gen'/);
   });
 });
