@@ -86,6 +86,10 @@ export interface ArchReviewContext {
   systemBlock?: string;
   /** Optional descriptive handbook context from the second brain (may be ''). */
   handbookBlock?: string;
+  /** The ticket this change was asked to deliver (may be ''); see ticket.ts. */
+  ticketBlock?: string;
+  /** A ticket ref was found but the board could not be read — named in skipped_checks. */
+  ticketSkipReason?: string;
   /** Full contents of changed files, for pattern-counting and placement checks. */
   fileContents?: Record<string, string>;
 }
@@ -118,7 +122,7 @@ export async function archReview(
   // Stable-first for the prompt cache: system prompt, charter, system doc, handbook and
   // the changed files' contents before the diff and title, which change every round.
   const prompt = `${ARCH_SYSTEM_PROMPT}
-${context.charterBlock || ''}${context.systemBlock || ''}${context.repoMapBlock || ''}${context.handbookBlock || ''}${fileContextSection}
+${context.charterBlock || ''}${context.systemBlock || ''}${context.repoMapBlock || ''}${context.ticketBlock || ''}${context.handbookBlock || ''}${fileContextSection}
 ## Change title
 ${title}
 
@@ -138,6 +142,7 @@ ${ARCH_OUTPUT_FORMAT}`;
     charter: Boolean(context.charterBlock),
     system: Boolean(context.systemBlock),
     map: context.repoMapBlock ? (context.repoMapTruncated ? 'truncated' : true) : false,
+    ticket: context.ticketBlock ? true : context.ticketSkipReason ?? false,
   });
 }
 
@@ -147,6 +152,10 @@ const CHARTER_SKIP = 'charter-grounded checks — no charter resolvable';
 const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
 const MAP_SKIP = 'placement and codebase-pattern counts — no repository map (not a git checkout, or it could not be listed)';
 const MAP_TRUNCATED = 'placement and codebase-pattern counts — the repository map was TRUNCATED, so a directory missing from it may still exist';
+// Only said when a ticket ref WAS found: a change with no ticket reference is not a change
+// whose ticket could not be read, and conflating them would put a permanent line in the
+// output of every repo that does not use the board.
+const ticketSkip = (why: string) => `rationale and completeness checks — the ticket could not be read (${why})`;
 
 /**
  * The skipped_checks honesty contract is enforced from ground truth, not model
@@ -159,14 +168,17 @@ export interface ContextPresence {
   system: boolean;
   /** false when no map could be built; 'truncated' when only part of one was shown. */
   map: boolean | 'truncated';
+  /** true when the ticket was provided; a string when one was named but unreadable; false when none was named. */
+  ticket?: boolean | string;
 }
 
 export function enforceSkippedChecks(result: ArchResult, present: ContextPresence): ArchResult {
-  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map/i.test(s));
+  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map|the ticket could not be read/i.test(s));
   const canonical = [
     ...(present.charter ? [] : [CHARTER_SKIP]),
     ...(present.system ? [] : [SYSTEM_SKIP]),
     ...(present.map === true ? [] : [present.map === 'truncated' ? MAP_TRUNCATED : MAP_SKIP]),
+    ...(typeof present.ticket === 'string' ? [ticketSkip(present.ticket)] : []),
   ];
   result.skipped_checks = [...canonical, ...rest];
   return result;
