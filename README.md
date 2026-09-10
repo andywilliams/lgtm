@@ -243,11 +243,14 @@ Each finding comes back with a verdict:
 | verdict | what it means | what happens |
 |---|---|---|
 | `confirmed` | the verifier quoted lines showing the problem is real | shown, confidence raised to `high` |
-| `unproven` | it could neither show it nor disprove it | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped |
 | `refuted` | it quoted lines that contradict the finding | dropped |
+| `unshown` | the code that would settle it was not in front of it | **shown unchanged** |
+| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped |
 | `unverified` | the pass did not run, failed, or said nothing about this finding | shown unchanged |
 
-Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`.
+Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`, and a finding whose proof was never in front of the verifier is `unshown`, which drops nothing.
+
+That last distinction was bought with data. On this feature's own third review round, before `unshown` existed, the verifier dropped three findings — and all three were true, dropped only because their proof sat in a file it had not been given. So it is now also **shown the whole of any other file a finding names**, and told exactly which files it has, because a verdict about its own context is only honest if it knows what its context is.
 
 Drops are never silent. They are stored in `reviews.db` (so the false-positive share per round is a number, not a memory), listed under `verify.dropped` in agent output, and any dropped BUG/SECURITY prints a line on stderr. `lgtm rounds` divides the drops only by the findings a pass actually adjudicated, and names any round whose verifier ran and could not answer — those findings are *unchecked*, which is not the same as clean. A dropped finding is **not** fed back as a dismissal — the next round is free to raise it again, so one bad drop cannot silence a real bug for the rest of a loop.
 
@@ -664,11 +667,17 @@ On success:
       "severity": "BUG",
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
-      "suggestion": "if (!input) return null;"
+      "suggestion": "if (!input) return null;",
+      "verdict": "confirmed",
+      "verifier_note": "parse() is called with the raw header on line 40",
+      "dropped": false
     }
-  ]
+  ],
+  "verify": { "model": "claude-sonnet-5", "failed": null, "checked": 3, "dropped": [] }
 }
 ```
+
+`verify` is `null` when the verifier pass did not run, and findings it dropped are never posted — see [the verifier pass](#the-verifier-pass--a-finding-is-proved-before-you-read-it).
 
 On error:
 ```json

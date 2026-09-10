@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, referencedPaths, extraFilesFor, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -23,6 +23,26 @@ describe('applyVerdicts — what may drop a finding', () => {
     assert.equal(out[0].verdict, 'unproven');
     assert.equal(out[0].verifier_dropped, undefined);
     assert.equal(out[0].confidence, 'low');
+  });
+
+  test('"unshown" never drops anything — the verifier is describing its own context, not the code', () => {
+    // Round 3 of this feature's own loop dropped three TRUE findings as "unproven"
+    // because their proof was in files it was never given. That is the failure this
+    // verdict exists to make impossible.
+    const out = applyVerdicts(
+      [finding({ severity: 'SUGGESTION', title: 'stale docs' }), finding({ severity: 'NITPICK', title: 'nit' }), finding({ severity: 'BUG', title: 'bug' })],
+      { 1: { verdict: 'unshown', verifier_note: 'README.md was not among the files' },
+        2: { verdict: 'unshown', verifier_note: 'not shown' },
+        3: { verdict: 'unshown', verifier_note: 'not shown' } },
+    );
+    assert.deepEqual(dropped(out), []);
+    assert.deepEqual(out.map((c) => c.confidence), ['medium', 'medium', 'medium'], 'and it is not downgraded either');
+  });
+
+  test('an unrecognised verdict is "unshown", so a garbled reply cannot delete a finding', () => {
+    const v = parseVerdicts(JSON.stringify({ verdicts: [{ id: 1, verdict: 'probably fine', verifier_note: 'a' }] }), 1);
+    assert.equal(v[1].verdict, 'unshown');
+    assert.deepEqual(dropped(applyVerdicts([finding({ severity: 'NITPICK' })], v)), []);
   });
 
   test('an unproven BUG is kept at low confidence; an unproven SUGGESTION is dropped', () => {
@@ -84,11 +104,6 @@ describe('parseVerdicts', () => {
     assert.deepEqual(Object.keys(v), ['1']);
   });
 
-  test('an unrecognised verdict string reads as unproven, not as a drop', () => {
-    const v = parseVerdicts(JSON.stringify({ verdicts: [{ id: 1, verdict: 'nonsense', verifier_note: 'a' }] }), 1);
-    assert.equal(v[1].verdict, 'unproven');
-  });
-
   test('reads a fenced, chatty reply', () => {
     const v = parseVerdicts('Sure!\n```json\n{"verdicts":[{"id":1,"verdict":"refuted","verifier_evidence":["ok"],"verifier_note":"n"}]}\n```\n', 1);
     assert.equal(v[1].verdict, 'refuted');
@@ -121,9 +136,40 @@ describe('buildWindows', () => {
     assert.doesNotMatch(out, /src\/gone\.ts/);
   });
 
+  test('a file a finding NAMES is shown whole, even though the finding is anchored elsewhere', () => {
+    // The failure this fixes, measured on this feature's own round 3: all three drops were
+    // true findings whose proof was in another file — "getMonthlyStats counts only
+    // usage_source = 'measured'", raised against a line in cli.ts.
+    const f = finding({ file: 'src/a.ts', line: 5, body: 'the reader is getMonthlyStats in src/db.ts, which counts only measured rows' });
+    const out = buildWindows([f], { 'src/a.ts': 'a\nb\nc', 'src/db.ts': 'const measured = 1;' }, 100_000);
+    assert.match(out, /src\/db\.ts — whole file \(named by a finding\)/);
+    assert.match(out, /const measured = 1;/);
+    assert.match(out, /Files below: src\/a\.ts, src\/db\.ts/);
+  });
+
+  test('a named file already windowed is not sent twice, and an ambiguous name is not guessed', () => {
+    const f = finding({ file: 'src/a.ts', line: 1, body: 'see src/a.ts and also index.ts' });
+    const out = buildWindows([f], { 'src/a.ts': 'x', 'one/index.ts': 'y', 'two/index.ts': 'z' }, 100_000);
+    assert.equal(out.match(/### src\/a\.ts/g)?.length, 1);
+    assert.doesNotMatch(out, /index\.ts/, 'a basename shared by two files resolves to neither');
+  });
+
+  test('referencedPaths reads paths out of the finding\'s own text, wherever they appear', () => {
+    const paths = referencedPaths(finding({
+      title: 'README.md is stale', body: 'compare src/db.ts:863 with the docs',
+      evidence: ['- import x from "./cache.js";'], how_to_verify: 'grep ARCHITECTURE.md',
+    }));
+    for (const p of ['README.md', 'src/db.ts', 'ARCHITECTURE.md']) assert.ok(paths.includes(p), `missing ${p}`);
+  });
+
+  test('extraFilesFor never returns a pseudo-path block', () => {
+    const f = finding({ body: 'the charter says so' });
+    assert.deepEqual(extraFilesFor([f], { '@charter': 'x', 'src/a.ts': 'y' }, new Set()), []);
+  });
+
   test('a window that does not fit the cap is left out and the header says so', () => {
     const out = buildWindows([finding({ line: 200 })], { 'src/a.ts': file }, 10);
-    assert.match(out, /some windows did not fit within the size cap/);
+    assert.match(out, /did not fit within the size cap/);
     assert.doesNotMatch(out, /^200\tline 200$/m);
     assert.notEqual(out, '', 'a block that vanished under the cap must still say it existed');
   });

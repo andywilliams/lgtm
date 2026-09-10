@@ -1741,7 +1741,7 @@ program
     console.log(`False Negative Rate:    ${falseNegativeRate}%`);
     console.log(`Context Expansion Used: ${contextCoverage}%`);
     // Measured figures cover only rows with a provider envelope; the rest carry the old diff-length estimate.
-    console.log(`Measured reviews:       ${stats.measured} of ${stats.total}`);
+    console.log(`Measured reviews:       ${stats.measured} of ${stats.total}${stats.partial > 0 ? `  (${stats.partial} with an unmeasured verifier half)` : ''}`);
     if (stats.measured > 0) {
       console.log(`Prompt tokens (billed): ${stats.promptTokens.toLocaleString()}`);
       console.log(`Output tokens:          ${stats.outputTokens.toLocaleString()}`);

@@ -18,10 +18,16 @@ import type { ReviewComment, Severity, Verdict } from './types.js';
  *  2. It may only lower a severity, never raise one, and the DROP decision is taken on
  *     the severity the REVIEWER gave — so "downgrade, then drop as an opinion" is not a
  *     route by which a BUG can disappear.
- *  3. Absence of proof is not refutation. A finding it can neither show nor disprove is
- *     "unproven": an opinion (SUGGESTION/NITPICK) is dropped, but a BUG/SECURITY is KEPT
- *     with its confidence lowered. A false drop of a real bug is the one failure this
- *     pass must not have, and it is far more expensive than a surviving false positive.
+ *  3. Absence of proof is not refutation, and "I was not shown it" is not "I looked".
+ *     A finding whose proof lay outside the verifier's context is "unshown" and is never
+ *     dropped; only "unproven" — the relevant code WAS shown and still does not establish
+ *     the claim — drops anything, and then only an opinion (SUGGESTION/NITPICK); a
+ *     BUG/SECURITY is kept with its confidence lowered. A false drop of a real finding is
+ *     the failure this pass must not have, and it costs more than a surviving false
+ *     positive. Measured on this feature's own third round, before "unshown" existed:
+ *     all three drops were true findings whose proof was in a file the verifier was not
+ *     given. Hence both halves of the fix — a verdict for it, and the files a finding
+ *     NAMES are now part of what it is shown.
  */
 
 /** How many lines either side of a finding the verifier is shown from the current file. */
@@ -77,7 +83,7 @@ export const VERIFY_SCHEMA = {
         type: 'object',
         properties: {
           id: { type: 'integer' },
-          verdict: { type: 'string', enum: ['confirmed', 'refuted', 'unproven'] },
+          verdict: { type: 'string', enum: ['confirmed', 'refuted', 'unproven', 'unshown'] },
           severity: { type: 'string', enum: ['BUG', 'SECURITY', 'SUGGESTION', 'NITPICK'] },
           verifier_evidence: { type: 'array', items: { type: 'string' } },
           verifier_note: { type: 'string' },
@@ -99,10 +105,18 @@ VERDICTS — exactly one per finding:
   present, the caller it says does not exist is there, the line it quotes does not appear in the file,
   the behaviour it predicts cannot happen on this code. Quote them. A refutation with nothing quoted is
   not a refutation; it is "unproven".
-- "unproven": you can neither show it nor disprove it from what you were given.
+- "unshown": the code, document or section that would settle this is NOT among what you were given.
+  You did not look and fail — you had nothing to look at.
+- "unproven": the relevant code WAS in front of you, you read it, and it still does not establish the
+  claim.
 
-ABSENCE OF PROOF IS NOT REFUTATION. If a finding's proof would lie in a file you were not shown, that is
-"unproven", not "refuted". Do not reason from what is missing from your context.
+THE LINE BETWEEN "unshown" AND "unproven" IS THE MOST IMPORTANT JUDGEMENT YOU MAKE HERE, because an
+"unproven" opinion is discarded and an "unshown" one is not. Before you answer "unproven", name to
+yourself the file you read to decide it. If you cannot, the answer is "unshown". A finding about a file,
+section or document that is not listed above is ALWAYS "unshown", never "unproven" and never "refuted".
+
+ABSENCE OF PROOF IS NOT REFUTATION. Do not reason from what is missing from your context: a thing you
+were not given is not a thing that does not exist.
 
 WHAT YOU MAY NOT DO:
 - You may NOT add findings. If you notice a different problem, ignore it — that is not this job.
@@ -141,11 +155,41 @@ function mergeRanges(ranges: [number, number][]): [number, number][] {
   return out;
 }
 
+/** Repo-ish paths named anywhere in a finding's own text: "src/db.ts", "README.md:42". */
+export function referencedPaths(f: ReviewComment): string[] {
+  const text = [f.title, f.body, f.how_to_verify ?? '', ...(f.evidence ?? [])].join('\n');
+  const out = new Set<string>();
+  for (const m of text.matchAll(/[\w.@/-]+\.[A-Za-z][\w]{0,5}\b/g)) out.add(m[0]);
+  return [...out];
+}
+
 /**
- * The file text around the findings, not the whole files. The verifier's question is
- * per-finding, so its context should scale with the number of findings rather than with
- * the size of the repository — which is what keeps review + verify inside its cost budget
- * on a late round, where the review itself is nearly all prompt-cache reads.
+ * The files a finding NAMES but is not anchored in. A finding's proof is very often in
+ * another file — "getMonthlyStats counts only usage_source = 'measured'", "the README's
+ * auto-mode example was left stale" — and without them the verifier can only answer
+ * "unshown", which is a wasted verdict when the file is sitting in the review's own
+ * context. Matched by exact path or by unambiguous suffix, so "db.ts" resolves and a name
+ * shared by two files resolves to neither.
+ */
+export function extraFilesFor(findings: ReviewComment[], contents: Record<string, string>, alreadyShown: Set<string>): string[] {
+  const keys = Object.keys(contents).filter((k) => !k.startsWith('@'));
+  const out = new Set<string>();
+  for (const f of findings) {
+    for (const raw of referencedPaths(f)) {
+      if (alreadyShown.has(raw)) continue;
+      const matches = keys.includes(raw) ? [raw] : keys.filter((k) => k.endsWith(`/${raw}`) || k === raw);
+      if (matches.length === 1 && !alreadyShown.has(matches[0])) out.add(matches[0]);
+    }
+  }
+  return [...out].sort((a, b) => contents[a].length - contents[b].length);
+}
+
+/**
+ * What the verifier is shown: a window around each finding, then — smallest first, until
+ * the cap — the whole of any other file a finding names. The question is per-finding, so
+ * the context scales with the number of findings rather than with the size of the
+ * repository, which is what keeps review + verify inside its cost budget on a late round
+ * where the review itself is nearly all prompt-cache reads.
  */
 export function buildWindows(findings: ReviewComment[], contents: Record<string, string>, maxBytes: number): string {
   const byFile = new Map<string, [number, number][]>();
@@ -160,23 +204,37 @@ export function buildWindows(findings: ReviewComment[], contents: Record<string,
     const to = Math.min(total, f.line + WINDOW_LINES);
     byFile.set(f.file, [...(byFile.get(f.file) ?? []), [from, to]]);
   }
-  if (byFile.size === 0) return '';
+  const extras = extraFilesFor(findings, contents, new Set(byFile.keys()));
+  if (byFile.size === 0 && extras.length === 0) return '';
   let out = '';
   let truncated = false;
+  const shown: string[] = [];
+  const numberFrom = (lines: string[], from: number, to: number) =>
+    lines.slice(from - 1, to).map((l, i) => `${from + i}\t${l}`).join('\n');
   for (const [file, ranges] of [...byFile.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     const lines = contents[file]!.split('\n');
     for (const [from, to] of mergeRanges(ranges)) {
-      const numbered = lines.slice(from - 1, to).map((l, i) => `${from + i}\t${l}`).join('\n');
-      const block = `### ${file} — lines ${from}-${to} (current contents)\n\`\`\`\n${numbered}\n\`\`\`\n\n`;
+      const block = `### ${file} — lines ${from}-${to} (current contents)\n\`\`\`\n${numberFrom(lines, from, to)}\n\`\`\`\n\n`;
       if (out.length + block.length > maxBytes) { truncated = true; continue; }
       out += block;
+      if (!shown.includes(file)) shown.push(file);
     }
+  }
+  for (const file of extras) {
+    const lines = contents[file].split('\n');
+    const block = `### ${file} — whole file (named by a finding)\n\`\`\`\n${numberFrom(lines, 1, lines.length)}\n\`\`\`\n\n`;
+    if (out.length + block.length > maxBytes) { truncated = true; continue; }
+    out += block;
+    shown.push(file);
   }
   // The header is emitted even when NOTHING fit. A block that silently vanishes under the
   // cap reads to the verifier as "this file has no such code", which is the difference
   // between "I was shown nothing" and "I looked and it is not there" — and that
   // difference is the whole basis of the refuted/unproven split.
-  const header = `## Current file contents around each finding\nLine numbers are the file's own. Only the neighbourhood of each finding is shown${truncated ? ', and some windows did not fit within the size cap' : ''} — a finding whose proof lies outside these windows is "unproven", never "refuted".\n\n`;
+  // The list of what was provided is not decoration: the verdict rules turn on whether the
+  // thing that would settle a finding was in front of the verifier, and the only way it can
+  // answer that honestly is to be told exactly what it has.
+  const header = `## The code you were given\nLine numbers are each file's own. You have the neighbourhood of each finding, plus the whole of any other file a finding names${truncated ? ', except some blocks that did not fit within the size cap' : ''}.\nFiles below: ${shown.length > 0 ? shown.join(', ') : '(none)'}. **Anything not in that list and not in the diff you have NOT been shown** — a finding about it is "unshown".\n\n`;
   return header + out;
 }
 
@@ -223,13 +281,14 @@ ${list}
 
 OUTPUT FORMAT: respond with ONLY a valid JSON object, no other text before or after. Include exactly one
 verdict per finding, using the finding's number as "id":
-{"verdicts": [{"id": 1, "verdict": "confirmed" | "refuted" | "unproven", "severity": "BUG" | "SECURITY" | "SUGGESTION" | "NITPICK", "verifier_evidence": ["exact quoted lines"], "verifier_note": "one sentence"}]}
+{"verdicts": [{"id": 1, "verdict": "confirmed" | "refuted" | "unshown" | "unproven", "severity": "BUG" | "SECURITY" | "SUGGESTION" | "NITPICK", "verifier_evidence": ["exact quoted lines"], "verifier_note": "one sentence"}]}
 
-"severity" is optional and may only be LOWER than the reviewer's. "verifier_evidence" may be empty only for "unproven".`;
+"severity" is optional and may only be LOWER than the reviewer's. "verifier_evidence" may be empty only for
+"unproven" and "unshown"; for "unshown" the note must name what you would have needed to see.`;
 }
 
 const SEVERITY_RANK: Record<Severity, number> = { SECURITY: 3, BUG: 3, SUGGESTION: 1, NITPICK: 0 };
-const VERDICTS: Verdict[] = ['confirmed', 'refuted', 'unproven'];
+const VERDICTS: Verdict[] = ['confirmed', 'refuted', 'unproven', 'unshown'];
 const isSeverity = (v: unknown): v is Severity => typeof v === 'string' && v in SEVERITY_RANK;
 
 /** True when a finding's severity, as the REVIEWER gave it, makes it an opinion rather than a defect. */
@@ -249,7 +308,9 @@ export function parseVerdicts(output: string, count: number): Verdicts {
   for (const r of rows) {
     const id = Number(r?.id);
     if (!Number.isInteger(id) || id < 1 || id > count) continue; // a verdict for a finding that does not exist
-    const verdict = VERDICTS.includes(r?.verdict) ? (r.verdict as Verdict) : 'unproven';
+    // An unrecognised verdict string is 'unshown', not 'unproven': the safe default is the
+    // one that keeps the finding, since a garbled reply is not evidence about the code.
+    const verdict = VERDICTS.includes(r?.verdict) ? (r.verdict as Verdict) : 'unshown';
     const evidence = Array.isArray(r?.verifier_evidence) ? r.verifier_evidence.map(String).filter((e: string) => e.trim() !== '') : [];
     out[id] = {
       verdict,
@@ -279,7 +340,8 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts): Re
     // it is exactly the "I could not find it" case, which is unproven.
     const verdict: Verdict = v.verdict === 'refuted' && evidence.length === 0 ? 'unproven' : v.verdict;
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
-    // SUGGESTION can never be the step that makes it droppable.
+    // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
+    // the verifier is saying it had nothing to look at, which is a fact about the prompt.
     const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed));
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)

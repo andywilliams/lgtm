@@ -846,7 +846,10 @@ export function getMonthlyStats(year: number, month: number): {
   total: number;
   falseNegatives: number;
   withContextExpansion: number;
+  /** Reviews whose own model calls reported usage — 'measured' and 'partial' rows alike. */
   measured: number;
+  /** Of those, the ones whose VERIFIER half reported nothing (a codex verifier). */
+  partial: number;
   promptTokens: number;
   outputTokens: number;
   costUsd: number;
@@ -860,7 +863,11 @@ export function getMonthlyStats(year: number, month: number): {
       COUNT(*) as total,
       SUM(false_negative) as false_negatives,
       SUM(used_context_expansion) as with_context,
-      SUM(CASE WHEN usage_source = 'measured' THEN 1 ELSE 0 END) as measured,
+      -- A 'partial' row's REVIEW figures are measured; only its verifier half was not
+      -- (codex reports no usage). Counting it as unmeasured would understate the coverage
+      -- of every figure below it, all of which come from the review's own envelope.
+      SUM(CASE WHEN usage_source IN ('measured', 'partial') THEN 1 ELSE 0 END) as measured,
+      SUM(CASE WHEN usage_source = 'partial' THEN 1 ELSE 0 END) as partial,
       SUM(prompt_tokens) as prompt_tokens,
       SUM(output_tokens) as output_tokens,
       SUM(cost_usd) as cost_usd
@@ -868,7 +875,7 @@ export function getMonthlyStats(year: number, month: number): {
     WHERE reviewed_at >= ? AND reviewed_at < ?
   `).get(startDate, endDate) as {
     total: number; false_negatives: number; with_context: number;
-    measured: number; prompt_tokens: number; output_tokens: number; cost_usd: number;
+    measured: number; partial: number; prompt_tokens: number; output_tokens: number; cost_usd: number;
   };
   db.close();
   return {
@@ -876,6 +883,7 @@ export function getMonthlyStats(year: number, month: number): {
     falseNegatives: stats.false_negatives || 0,
     withContextExpansion: stats.with_context || 0,
     measured: stats.measured || 0,
+    partial: stats.partial || 0,
     promptTokens: stats.prompt_tokens || 0,
     outputTokens: stats.output_tokens || 0,
     costUsd: stats.cost_usd || 0,

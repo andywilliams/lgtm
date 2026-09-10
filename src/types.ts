@@ -6,12 +6,20 @@ export type FindingKind = 'added' | 'removed' | 'missing';
 export type Confidence = 'high' | 'medium' | 'low';
 
 /**
- * What the verifier pass made of a finding (see src/verify.ts). 'unverified' is not a
- * verdict the verifier gives — it is what a finding carries when the pass did not run,
- * failed, or said nothing about it, and it is deliberately distinct from 'unproven' so
- * that silence can never be the thing that deletes a finding.
+ * What the verifier pass made of a finding (see src/verify.ts).
+ *
+ * The three that matter are 'confirmed' (proved from the shown code), 'refuted' (the
+ * shown code contradicts it) and 'unshown' (the code that would settle it was not in
+ * front of the verifier). 'unproven' is the narrow one: the relevant code WAS shown and
+ * still does not establish the claim. Keeping 'unshown' separate is what stops the pass
+ * deleting a true finding for the sole reason that its proof lives in another file —
+ * measured on this feature's own round 3, where all three drops were of that kind.
+ *
+ * 'unverified' is not a verdict the verifier gives at all: it is what a finding carries
+ * when the pass did not run, failed, or said nothing about it, and it is distinct again
+ * so that silence can never be the thing that deletes a finding.
  */
-export type Verdict = 'confirmed' | 'refuted' | 'unproven' | 'unverified';
+export type Verdict = 'confirmed' | 'refuted' | 'unproven' | 'unshown' | 'unverified';
 
 export interface ReviewComment {
   file: string;
