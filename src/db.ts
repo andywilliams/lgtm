@@ -228,13 +228,16 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     // context_tokens is the last call's prompt (older rows only carry the summed
     // prompt_tokens); an unmeasured or failed round records neither, so the budget reads
     // the latest round of this session that measured anything.
-    // The session's held context is what we SENT across its rounds plus the replies —
-    // never the envelope's prompt_tokens, which sums the CLI's internal turns.
+    // The session's held context is what we SENT across its rounds plus the replies.
+    // The envelope's prompt_tokens sums the CLI's internal turns and over-states it, so
+    // it is only the fallback for rows written before sent_tokens existed — over-stating
+    // is the safe direction here: the session restarts earlier than it strictly must.
     let held: number | null = null;
     for (const r of run) {
       if (r.session_id !== sessionRow.session_id) continue;
-      if (r.sent_tokens === null && r.output_tokens === null) continue;
-      held = (held ?? 0) + (r.sent_tokens ?? 0) + (r.output_tokens ?? 0);
+      const sent = r.sent_tokens ?? r.context_tokens ?? r.prompt_tokens;
+      if (sent === null && r.output_tokens === null) continue;
+      held = (held ?? 0) + (sent ?? 0) + (r.sent_tokens === null ? 0 : r.output_tokens ?? 0);
     }
     session = {
       id: sessionRow.session_id,
