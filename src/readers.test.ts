@@ -200,3 +200,23 @@ describe('readers: structure that lives on context lines', () => {
     }
   });
 });
+
+describe('readers: comments are never writes', () => {
+  it('ignores a spread written inside a comment, in added and context lines alike', async () => {
+    const { hunkLines, extractWriteIdentifiers } = await import('./readers.js');
+    const diff = [
+      '+++ b/src/e.ts',
+      '+  // emit({ ...createPayload(x) }) — how it used to work',
+      "+  const real = 'a.b.c';",
+      " // context comment mentioning 'ctx.only.event'",
+    ].join('\n');
+    const lines = hunkLines(diff);
+    assert.ok(!lines.some((l) => l.text.includes('createPayload')), 'a comment contributes no source');
+    assert.ok(lines.some((l) => l.text.includes("'a.b.c'")));
+    // Line count and length are preserved so offsets stay aligned with the file.
+    assert.equal(lines.length, 3);
+    assert.equal(lines[0].text.length, '  // emit({ ...createPayload(x) }) — how it used to work'.length);
+    const ids = extractWriteIdentifiers(diff).map((i) => i.id);
+    assert.deepEqual(ids, ['a.b.c']);
+  });
+});

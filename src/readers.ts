@@ -39,8 +39,13 @@ export function hunkLines(diff: string): { text: string; added: boolean }[] {
     if (header) { inTest = TEST_FILE.test(header[1]); continue; }
     if (inTest || line.startsWith('+++ ') || line.startsWith('--- ') || line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index ')) continue;
     if (line.startsWith('-')) continue; // removed: no longer part of the file
-    if (line.startsWith('+')) out.push({ text: line.slice(1), added: true });
-    else if (line.startsWith(' ')) out.push({ text: line.slice(1), added: false });
+    if (!line.startsWith('+') && !line.startsWith(' ')) continue;
+    const text = line.slice(1);
+    // Prose about a write is not a write — the same rule addedProductionLines applies.
+    // A comment keeps its LINE (so offsets and the bracket scan stay aligned with the
+    // file) but not its text, so `// ...createPayload(x) does the thing` mines nothing.
+    const isComment = /^\s*(\/\/|\*|\/\*|#)/.test(text);
+    out.push({ text: isComment ? ' '.repeat(text.length) : text, added: line.startsWith('+') });
   }
   return out;
 }
