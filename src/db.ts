@@ -143,6 +143,8 @@ function migrate(db: Database.Database): void {
       fingerprint TEXT NOT NULL,
       fingerprint_raw TEXT,
       kind TEXT,
+      evidence TEXT,
+      how_to_verify TEXT,
       confidence TEXT,
       disposition TEXT,
       disposed_at_round INTEGER,
@@ -154,7 +156,7 @@ function migrate(db: Database.Database): void {
   const findingCols = new Set(
     (db.prepare('PRAGMA table_info(findings)').all() as { name: string }[]).map((c) => c.name)
   );
-  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT']] as [string, string][]) {
+  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT'], ['evidence', 'TEXT'], ['how_to_verify', 'TEXT']] as [string, string][]) {
     if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
   }
 }
@@ -446,11 +448,17 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
-    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  // The evidence is stored with the finding, not just shown: `confidence` is a verdict
+  // derived from it, and a later round marking the finding fixed or suppressed is only
+  // checkable if what the reviewer actually quoted survives.
   const tx = db.transaction((rows: ReviewComment[]) =>
-    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.fingerprint ?? null, c.kind ?? null, c.confidence ?? null).lastInsertRowid))
+    rows.map((c) => Number(ins.run(
+      reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.fingerprint ?? null,
+      c.kind ?? null, c.confidence ?? null, c.evidence && c.evidence.length > 0 ? JSON.stringify(c.evidence) : null, c.how_to_verify ?? null,
+    ).lastInsertRowid))
   );
   const ids = tx(comments);
   db.close();
@@ -559,11 +567,24 @@ export function disposePreviousRound(
   // ASKS for high-confidence findings only (a prompt instruction, not an enforced filter).
   // Both make absence uninformative, so the finding stays open rather than reading as fixed
   // — the conservative direction: a finding kept open costs a look, a false 'fixed' hides a bug.
-  const suppressedBy = (severity: Severity, prevHarshness: string | null, prevConfidence: string | null) => {
-    if (currentHarshness === undefined) return false;
-    const lowerHarshness = rank(currentHarshness) < rank(prevHarshness) && (severity === 'SUGGESTION' || severity === 'NITPICK');
-    const belowChillBar = currentHarshness === 'chill' && prevConfidence !== null && prevConfidence !== 'high';
-    return lowerHarshness || belowChillBar;
+  const isOpinion = (severity: Severity) => severity === 'SUGGESTION' || severity === 'NITPICK';
+  /**
+   * What this round's silence about an earlier finding means, when the code HAS changed
+   * and the finding was neither re-raised nor dismissed:
+   *  - 'suppressed': this round would not have raised it anyway — an opinion below a
+   *    lower harshness, or below chill's confidence bar. Silence, not a fix.
+   *  - 'open': the round cannot speak to it and it matters — an unverified BUG/SECURITY
+   *    under chill's confidence bar. It stays open, keeps counting in openBugs, and the
+   *    model policy therefore keeps the full model on the loop until it is settled.
+   *  - null: this round would have raised it, so absence means fixed.
+   */
+  const silenceMeans = (severity: Severity, prevHarshness: string | null, prevConfidence: string | null): 'suppressed' | 'open' | null => {
+    if (currentHarshness === undefined) return null;
+    if (rank(currentHarshness) < rank(prevHarshness) && isOpinion(severity)) return 'suppressed';
+    if (currentHarshness === 'chill' && prevConfidence !== null && prevConfidence !== 'high') {
+      return isOpinion(severity) ? 'suppressed' : 'open';
+    }
+    return null;
   };
   // Both spellings of every current finding: a row logged before prompt v2 carries the
   // title key, one logged after carries the fingerprint key, and the same complaint must
@@ -588,8 +609,11 @@ export function disposePreviousRound(
         disposition = 'dismissed';
         reason = dismissed;
       } else if (unchanged) continue; // absent on identical code: still open
-      else if (suppressedBy(f.severity, f.harshness, f.confidence)) disposition = 'suppressed';
-      else disposition = 'fixed';
+      else {
+        const silence = silenceMeans(f.severity, f.harshness, f.confidence);
+        if (silence === 'open') continue;
+        disposition = silence === 'suppressed' ? 'suppressed' : 'fixed';
+      }
       upd.run(disposition, round, reason, f.id);
       summary[disposition] += 1;
     }

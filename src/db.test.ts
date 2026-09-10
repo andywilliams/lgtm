@@ -385,7 +385,17 @@ test('prompt v2: a medium-confidence finding absent from a chill round is suppre
     { severity: 'BUG', title: 'Maybe a race', file: 'a.ts', line: 1, body: '', confidence: 'medium', kind: 'missing' },
     { severity: 'BUG', title: 'Demonstrated crash', file: 'a.ts', line: 2, body: '', confidence: 'high' },
   ]);
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'SUGGESTION', title: 'Could be clearer', file: 'a.ts', line: 3, body: '', confidence: 'medium' },
+  ]);
   logReview({ ...base, reviewedAt: '2026-09-10T10:10:00.000Z', harshness: 'chill', diffSha: 'b' });
   assert.deepEqual(disposePreviousRound(repo, key, 2, [], { harshness: 'chill', diffSha: 'b' }),
-    { fixed: 1, dismissed: 0, carried: 0, suppressed: 1 }, 'chill raises only high-confidence findings, so a medium one going quiet proves nothing');
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 1 },
+    'the high-confidence BUG is fixed; the medium SUGGESTION is suppressed; the medium BUG is neither');
+
+  // The medium-confidence BUG is still OPEN: a chill round asks only for high-confidence
+  // findings, so its silence cannot close an unverified bug — and openBugs keeps the
+  // model policy on the full model until it is settled.
+  const { getLoopSummary } = await import('./db.js');
+  assert.equal(getLoopSummary(repo, key).openBugs, 1, 'the unverified BUG stays open rather than reading as fixed');
 });
