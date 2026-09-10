@@ -122,3 +122,38 @@ describe('readers: following the payload helper', () => {
     assert.ok(roots.includes(process.cwd()));
   });
 });
+
+describe('readers: bracket scanning', () => {
+  it('tells an object spread from an array spread and an argument list', async () => {
+    const { enclosingOpener } = await import('./readers.js');
+    const cases: [string, string | null][] = [
+      ['{ ...createPayload(x) }', '{'],
+      ['[...buildList(x)]', '['],
+      ['g(a, ...spreadArgs(x))', '('],
+      ['{ a: fn(1), ...createPayload(x) }', '{'],
+      ['emit({\n  ...createPayload(next),\n})', '{'],
+      ['...topLevel(x)', null],
+    ];
+    for (const [src, expected] of cases) {
+      assert.equal(enclosingOpener(src, src.indexOf('...')), expected, src);
+    }
+  });
+
+  it('reads the payload fields of a helper with a destructured parameter list', async () => {
+    const { fieldsFromHelpers } = await import('./readers.js');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-readers-'));
+    try {
+      writeFileSync(join(dir, 'h.ts'), 'export function createPayload({ state, candle }) {\n  return {\n    pivotTime: state.t,\n    price: candle.c,\n  };\n}\n');
+      const diff = ['+++ b/src/e.ts', '+  emit({', '+    ...createPayload(next),', '+  });'].join('\n');
+      const fields = fieldsFromHelpers(diff, dir).map((f) => f.id);
+      assert.ok(fields.includes('pivotTime'), `got ${fields.join(',') || '(none)'}`);
+      assert.ok(!fields.includes('state'), 'a destructured parameter is not a payload field');
+      assert.ok(!fields.includes('candle'));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

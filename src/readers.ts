@@ -97,7 +97,12 @@ export function fieldsFromHelpers(diff: string, repoRoot: string, maxHelpers = 3
   const spread = new Set<string>();
   const named = new Set<string>();
   const blob = added.join('\n');
-  for (const m of blob.matchAll(/\{(?:[^{}[\]]|\n){0,400}?\.\.\.(\w{4,})\s*\(/g)) spread.add(m[1]);
+  for (const m of blob.matchAll(/\.\.\.(\w{4,})\s*\(/g)) {
+    // Exactly: is the nearest unclosed bracket an object's? `{ ...f(x) }` is the emitted
+    // payload; `[...f(x)]` is an array and `g(a, ...f(x))` an argument list, and no gap
+    // pattern separates those once the values contain parens of their own.
+    if (enclosingOpener(blob, m.index!) === '{') spread.add(m[1]);
+  }
   for (const line of added) {
     for (const m of line.matchAll(/\b((?:create|build|make|to)[A-Z]\w+)\s*\(/g)) named.add(m[1]);
   }
@@ -136,6 +141,25 @@ function definitionFiles(name: string, repoRoot: string): string[] {
   return files;
 }
 
+/**
+ * The nearest unclosed bracket to the left of `index` — `{`, `[`, `(` or null. Quotes
+ * and comments are not parsed: this is a bracket scan, and a bracket inside a string is
+ * its known limit.
+ */
+export function enclosingOpener(text: string, index: number): '{' | '[' | '(' | null {
+  let curly = 0, square = 0, round = 0;
+  for (let i = index - 1; i >= 0; i--) {
+    const ch = text[i];
+    if (ch === '}') curly++;
+    else if (ch === ']') square++;
+    else if (ch === ')') round++;
+    else if (ch === '{') { if (curly === 0) return '{'; curly--; }
+    else if (ch === '[') { if (square === 0) return '['; square--; }
+    else if (ch === '(') { if (round === 0) return '('; round--; }
+  }
+  return null;
+}
+
 /** The `{...}` literals in a chunk of source, brace-matched and bounded. */
 function objectLiterals(body: string, max = 4): string[] {
   const out: string[] = [];
@@ -158,10 +182,12 @@ function fieldsAssignedIn(file: string, helper: string, maxFields = 8): string[]
   try { text = readFileSync(file, 'utf-8'); } catch { return []; }
   const start = text.search(new RegExp(`(function\\s+${helper}\\b|const\\s+${helper}\\s*=|\\b${helper}\\s*[:=]\\s*\\()`));
   if (start === -1) return [];
-  // The helper's OWN body: brace-matched from its opening `{`, so a window does not run
-  // on into the next function and mine its object literals as this payload's fields.
+  // The helper's OWN body, and not its parameter list: a destructured signature
+  // (`function createPayload({ state })`) opens a brace before the body does, and taking
+  // that one yields the parameter names instead of the payload's fields.
   const window = text.slice(start, start + 6000);
-  const [body = window] = objectLiterals(window, 1);
+  const afterParams = window.indexOf(')');
+  const [body = window] = objectLiterals(window.slice(afterParams === -1 ? 0 : afterParams), 1);
   const fields = new Set<string>();
   // Keys of the object literals the helper builds — brace-matched, so a payload written
   // on one line (`return { pivotTime: t, price: p };`) is read as well as a multi-line one.
@@ -197,8 +223,13 @@ export function searchRoots(repoRoot: string, addDirs: string[] = []): { roots: 
 
 /** True once a search tool has actually run — so "nothing reads this" is a result, not a silence. */
 let searchToolWorked = false;
+/** Roots whose search itself failed (not "no matches") — their silence means nothing. */
+const failedRoots = new Set<string>();
 export function readersSearchRan(): boolean {
   return searchToolWorked;
+}
+export function failedSearchRoots(): string[] {
+  return [...failedRoots];
 }
 
 function grepFor(id: string, root: string, maxFiles: number, maxPerFile = 6): { file: string; line: number; text: string }[] {
@@ -225,6 +256,8 @@ function grepFor(id: string, root: string, maxFiles: number, maxPerFile = 6): { 
       // A missing binary falls through to the next candidate.
     }
   }
+  // Neither tool ran here: record the root so its silence is never read as an answer.
+  failedRoots.add(root);
   return [];
 }
 
@@ -236,7 +269,6 @@ export interface FindReadersOptions {
   maxTotalLines?: number;
 }
 
-/** Where each written identifier is read, outside the files the diff changes. */
 /** Dedupe by id and cap the combined list — helper fields can otherwise add dozens. */
 export function mergeIdentifiers(...lists: WriteIdentifier[][]): WriteIdentifier[] {
   const seen = new Map<string, WriteIdentifier>();

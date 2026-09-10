@@ -24,7 +24,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
 import { planSession, modelRoleOf } from './session.js';
-import { extractWriteIdentifiers, fieldsFromHelpers, findReaders, formatReadersContext, mergeIdentifiers, readersSearchRan, searchRoots } from './readers.js';
+import { extractWriteIdentifiers, failedSearchRoots, fieldsFromHelpers, findReaders, formatReadersContext, mergeIdentifiers, readersSearchRan, searchRoots } from './readers.js';
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
@@ -761,6 +761,10 @@ async function runReview(options: RunOptions): Promise<void> {
         log(chalk.blue(`\n📡 Readers of what this diff writes:`));
         // The same foreign test the prompt uses — the carried root, not a path prefix.
         for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.root === repoRootForReaders ? relative(repoRootForReaders, h.file) : `${h.file} (another repo)`}`));
+      }
+      for (const f of failedSearchRoots()) console.error(chalk.yellow(`⚠  the reader search failed under ${f} — this review is blind to consumers there.`));
+      if (hits.length > 0) {
+        // reported above
       } else if (readersSearchRan()) {
         log(chalk.gray(`\n📡 Nothing outside the changed files reads what this diff writes (${identifiers.length} identifier(s) searched)`));
       } else {
