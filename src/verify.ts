@@ -286,10 +286,14 @@ export function citesDocs(findings: ReviewComment[]): boolean {
   return findings.some(citesDoc);
 }
 
-export function buildVerifyPrompt(input: VerifyInput, shownOut?: Set<string>): string {
+export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string>; code?: string }): string {
   const { diff, prTitle, findings, contents = {}, readersContext, docs } = input;
   const maxBytes = input.maxContextBytes ?? verifyMaxContextBytes();
-  const windows = buildWindows(findings, contents, maxBytes, shownOut);
+  const windows = buildWindows(findings, contents, maxBytes, out?.shown);
+  // The CODE the verifier was shown, and nothing else. Deliberately excludes the ticket
+  // data and the findings list: a quote check whose haystack contained attacker-writable
+  // text would accept a refutation quoting the attacker's own planted lines.
+  if (out) out.code = `${diff}\n${windows}\n${readersContext ?? ''}`;
   // The charter and standards are the ONLY evidence a "(charter)" / "(standard …)"
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
@@ -340,6 +344,31 @@ export function isOpinion(severity: Severity): boolean {
 }
 
 /**
+ * Collapse whitespace so a quote can be compared against the text it claims to come from
+ * without failing on re-indentation.
+ */
+const flat = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Does a refutation actually quote something the verifier was shown? `refuted` is the only
+ * verdict that deletes a BUG outright, and it is the one an INJECTED instruction would aim
+ * for: ticket text is attacker-writable, reaches this pass, and could supply invented
+ * "quoted lines" refuting a finding about a file that WAS sent — so `wasShown` cannot catch
+ * it. A quote that appears nowhere in what was sent is not evidence, so the refutation
+ * falls back to `unproven`, which keeps a BUG and keeps a doc-tagged finding.
+ *
+ * One quote is enough to stand it up: models re-wrap and elide, and requiring every line to
+ * match exactly would reject honest refutations far more often than dishonest ones.
+ */
+export function quotesShownText(evidence: string[], haystack: string): boolean {
+  const hay = flat(haystack);
+  return evidence.some((e) => {
+    const q = flat(e);
+    return q.length >= 12 && hay.includes(q);
+  });
+}
+
+/**
  * What the verifier was actually given, so a verdict about its own context can be checked
  * rather than trusted. `buildWindows` computes this exactly; leaving it in the prompt as a
  * sentence and nowhere else would make the safety property model-dependent — weakest in
@@ -351,6 +380,8 @@ export interface ShownContext {
   shown: Set<string>;
   /** Files the diff touches — in front of the verifier whether or not a window fitted. */
   inDiff: Set<string>;
+  /** Everything the verifier was sent, for checking that a refutation quotes real text. */
+  text?: string;
 }
 
 /**
@@ -417,6 +448,10 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // A refutation is a claim about the code and must be quotable; without quoted lines
     // it is exactly the "I could not find it" case, which is unproven.
     let verdict: Verdict = v.verdict === 'refuted' && evidence.length === 0 ? 'unproven' : v.verdict;
+    // A refutation must quote text that actually exists in what was sent. Otherwise the
+    // one verdict that deletes a BUG outright can be produced from invented lines — which
+    // is what an instruction planted in a ticket body would aim to do.
+    if (verdict === 'refuted' && ctx?.text && !quotesShownText(evidence, ctx.text)) verdict = 'unproven';
     // The caller knows what it sent, so it decides — not the prose. A judgement about code
     // the verifier never held is recorded as what it is, whatever the model called it.
     if (ctx && verdict !== 'unverified' && verdict !== 'unshown' && !wasShown(f, ctx, contents)) verdict = 'unshown';
@@ -476,7 +511,9 @@ export function verifyFindings(input: VerifyInput & {
     // Inside the guard, not above it: this is the statement that consumes untrusted model
     // output (a finding's `file` and `line`), and the function's contract is that a review
     // already paid for is never lost to something that happens after it.
-    const prompt = buildVerifyPrompt(input, shown);
+    const out: { shown?: Set<string>; code?: string } = { shown };
+    const prompt = buildVerifyPrompt(input, out);
+    ctx.text = out.code;
     if (ai === 'claude') setModelOverride(model);
     let output: string;
     try {

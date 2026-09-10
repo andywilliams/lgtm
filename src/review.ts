@@ -1,4 +1,5 @@
 import { jsonrepair } from 'jsonrepair';
+import { fenced } from './ticket.js';
 import { runAIPrompt, type AIProvider } from './ai.js';
 import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
@@ -268,7 +269,7 @@ ${items}
 ${prTitle}
 
 ## PR Description
-${prBody || '(no description)'}
+${prBody ? fenced('PULL REQUEST DESCRIPTION', prBody) : '(no description)'}
 
 ## Diff
 \`\`\`diff

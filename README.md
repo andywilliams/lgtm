@@ -200,8 +200,10 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
 | `LGTM_VERIFY_MODEL` | `claude-sonnet-5` | model for the verifier pass that proves or drops each finding (see below); `off` = no verifier pass |
 | `LGTM_VERIFY_MAX_BYTES` | `60000` | cap on the file windows the verifier is shown around each finding |
+| `LGTM_TICKETS_CMD` | — | command that prints a ticket given its number — any tracker; tried before the API |
 | `LGTM_TICKETS_API` | — | ticket board API base; with the token below, turns on the check against the ticket |
 | `LGTM_TICKETS_TOKEN` | — | bearer token for that board (`DWLF_TICKETS_API` / `DWLF_TICKETS_TOKEN` also work) |
+| `LGTM_TICKET_PREFIX` | `DWLF` | ref prefix to look for in a PR title or branch, e.g. `PROJ-14` |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 | `LGTM_TIMEOUT_MS` | 15 minutes | how long one model call may take before lgtm gives up and says why |
@@ -267,9 +269,11 @@ The verifier is deliberately given the diff and a window around each finding rat
 `lgtm review` asks whether the code is correct and `lgtm arch` asks whether it was the right thing to build. "Did it actually do what was asked?" was left to the same agent that wrote it. When a PR title, branch or body names a ticket, lgtm fetches it and asks for **one** capped, question-shaped finding naming acceptance criteria the diff does not visibly address.
 
 ```bash
-export LGTM_TICKETS_API=https://your-board/v1   # off entirely unless both are set
+export LGTM_TICKETS_CMD='my-tracker show'       # any tracker: prints the ticket, given its number
+export LGTM_TICKETS_API=https://your-board/v1   # or a board API, with a token
 export LGTM_TICKETS_TOKEN=…
-lgtm review 86                  # ref parsed from "feat: thing (DWLF-210)" or the branch name
+export LGTM_TICKET_PREFIX=PROJ                  # the ref shape to look for (default DWLF)
+lgtm review 86                  # ref parsed from "feat: thing (PROJ-210)" or the branch name
 lgtm review 86 --ticket 210     # say it explicitly
 lgtm review 86 --no-ticket      # skip the check
 lgtm arch review --local        # the arch altitude gets the same block
@@ -277,7 +281,9 @@ lgtm arch review --local        # the arch altitude gets the same block
 
 The finding is prefixed `(ticket)`, always `SUGGESTION`, never more than one, and phrased as a question — a criterion may be met by another PR or by work already merged, so it asks the author to confirm rather than asserting a defect. It is never a reason to withhold approval.
 
-**Ticket text is untrusted input.** Anyone with board access can write it, and it lands in a prompt that is otherwise all instructions. It is fenced in explicit data markers, labelled as data, and the reviewer is told that an instruction found inside it is a red flag to report, not something to obey — with lgtm's own instruction stated *after* the data, so the last thing the reviewer reads is not the ticket's.
+**Ticket text is untrusted input** — and so is a pull request description, which is written by whoever opened the PR and, in Action mode, could be a fork. Both are fenced in markers their content cannot close, labelled with who wrote them, and preceded by an explicit refusal instruction; lgtm's own instruction is stated *after* the data, so the last thing the reviewer reads is not the author's.
+
+The verifier gets the same treatment, because it is the model whose answers *delete* findings. Two code-side checks back the prose there: a verdict about a file that was never sent becomes `unshown`, and a **refutation must quote text that actually appears in the code the verifier was shown** — the haystack deliberately excludes the ticket, so a planted "quote" cannot stand up a refutation. `refuted` is the only verdict that drops a BUG outright.
 
 Everything about it is best-effort, like the brain integration: no configuration, no ref, an unreachable board, a timeout or a 404 all mean the check is simply not made. `lgtm arch` records an unreadable ticket in `skipped_checks`; a change with no ticket ref says nothing at all, because not every repo uses a board.
 

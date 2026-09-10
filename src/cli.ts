@@ -16,7 +16,7 @@ import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
 import { buildRepoMap } from './repoMap.js';
-import { ticketContext } from './ticket.js';
+import { ticketContext, ticketPrefix } from './ticket.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -115,8 +115,10 @@ program.addHelpText(
     '  LGTM_TIMEOUT_MS               how long one model call may take before lgtm gives up and says so (default 15 minutes)\n' +
     '  LGTM_VERIFY_MODEL             model for the verifier pass that proves or drops each finding (default claude-sonnet-5; "off" = no verifier pass)\n' +
     '  LGTM_VERIFY_MAX_BYTES         cap on the file windows the verifier is shown around each finding (default 60000)\n' +
+    '  LGTM_TICKETS_CMD              command that prints a ticket given its number (any tracker); the escape hatch\n' +
     '  LGTM_TICKETS_API              ticket board API base — with the token below, reviews check the diff against the ticket they name\n' +
     '  LGTM_TICKETS_TOKEN            bearer token for that board (DWLF_TICKETS_API / DWLF_TICKETS_TOKEN are also read)\n' +
+    '  LGTM_TICKET_PREFIX            ref prefix to look for in a PR title or branch (default DWLF, e.g. PROJ-14)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -139,7 +141,7 @@ program
   .option('--verify-model <id>', `Model for the verifier pass (default: LGTM_VERIFY_MODEL, else ${DEFAULT_LATE_MODEL})`)
   .option('--verify-ai <provider>', 'AI provider for the verifier pass: claude, codex (default: the review provider)')
   .option('--show-dropped', 'Show the findings the verifier dropped instead of hiding them', false)
-  .option('--ticket <n>', 'DWLF ticket this change delivers (default: parsed from the PR title, branch or body)')
+  .option('--ticket <n>', 'Ticket number this change delivers (default: parsed from the PR title, branch or body)')
   .option('--no-ticket', 'Skip the check against the ticket (on by default when the board is configured)')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
@@ -204,7 +206,7 @@ program
     const batch = auto || options.batch;
     if (options.model && !isModelId(options.model)) exitWithError(`--model ${JSON.stringify(options.model)} is not a model id`);
     if (options.verifyModel && !isModelId(options.verifyModel)) exitWithError(`--verify-model ${JSON.stringify(options.verifyModel)} is not a model id`);
-    if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of DWLF-<n>)`);
+    if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of ${ticketPrefix()}-<n>)`);
 
 
     // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
@@ -629,8 +631,10 @@ function recordReviewMetrics(opts: {
   usage?: AIUsage;
   /** The verifier pass, when it ran — its own half of the spend, recorded beside the total. */
   verify?: { model?: string; usage: AIUsage; failed?: string };
+  /** The ticket this round was judged against, when one was named. */
+  ticket?: { ref: number | null; present: boolean };
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole, verify } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole, verify, ticket } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
@@ -682,6 +686,7 @@ function recordReviewMetrics(opts: {
         tokens: verify.usage.measured && verify.usage.calls > 0 ? promptTokens(verify.usage) + verify.usage.outputTokens : null,
         failed: verify.failed,
       },
+      ticket: ticket && ticket.ref !== null ? ticket : undefined,
     });
     const round = allocated ?? 1;
     if (failed) return { tokenEstimate, usage, loop: null };
@@ -898,12 +903,12 @@ async function runReview(options: RunOptions): Promise<void> {
     prTitle: pr.title, prBody: pr.body,
     branch: local ? getCurrentBranch() : pr.headRef,
   });
-  if (ticket.block) log(chalk.blue(`\n🎫 Ticket DWLF-${ticket.ref} — checking the diff against what it asked for`));
+  if (ticket.block) log(chalk.blue(`\n🎫 Ticket ${ticketPrefix()}-${ticket.ref} — checking the diff against what it asked for`));
   else if (ticket.reason && ticket.skipped !== 'not-configured') {
     // Only a CONFIGURED board that failed is worth a line. Having no board is the default
     // state and an opt-out, not a failure — warning about it would put a yellow line on
     // every review in every repo whose branches happen to carry a DWLF ref.
-    const line = `🎫 DWLF-${ticket.ref}: ${ticket.reason} — the completeness check is skipped`;
+    const line = `🎫 ${ticketPrefix()}-${ticket.ref}: ${ticket.reason} — the completeness check is skipped`;
     if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
   }
 
@@ -1058,6 +1063,7 @@ async function runReview(options: RunOptions): Promise<void> {
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(choice),
     usage: mergeRoundUsage(reviewUsage, verifyUsage),
     verify: verifyOutcome ? { model: verifyOutcome.model, usage: verifyUsage, failed: verifyOutcome.failed } : undefined,
+    ticket: { ref: ticket.ref, present: Boolean(ticket.block) },
   });
   // Built after the round is logged so each drop carries its finding id: a wrong drop has
   // to be quotable and joinable to its row, not just readable.
@@ -2181,11 +2187,11 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     explicit: options.ticketRef, enabled: options.ticketEnabled,
     prTitle: pr.title, prBody: pr.body, branch: local ? getCurrentBranch() : pr.headRef,
   });
-  if (archTicket.block) log(chalk.blue(`🎫 Ticket DWLF-${archTicket.ref}`));
+  if (archTicket.block) log(chalk.blue(`🎫 Ticket ${ticketPrefix()}-${archTicket.ref}`));
   // Silent for an unconfigured board, exactly as the review path is: it is the default
   // state and an opt-out, not a failure. It is still recorded in `skipped_checks`, which is
   // arch's structured record of what it could not ground rather than a warning to the operator.
-  else if (archTicket.reason && archTicket.skipped !== 'not-configured') log(chalk.yellow(`🎫 DWLF-${archTicket.ref}: ${archTicket.reason}`));
+  else if (archTicket.reason && archTicket.skipped !== 'not-configured') log(chalk.yellow(`🎫 ${ticketPrefix()}-${archTicket.ref}: ${archTicket.reason}`));
 
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
@@ -2262,7 +2268,7 @@ arch
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('--model <id>', 'Model to review with (default: your settings model)')
   .option('--max-map-bytes <n>', 'Cap the repository map block (default 8000 bytes)')
-  .option('--ticket <n>', 'DWLF ticket this change delivers (default: parsed from the PR title, branch or body)')
+  .option('--ticket <n>', 'Ticket number this change delivers (default: parsed from the PR title, branch or body)')
   .option('--no-ticket', 'Skip the ticket context')
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
@@ -2284,7 +2290,7 @@ arch
     // Same reason: a rejected value here would otherwise fall through to a ref parsed from
     // the PR title, and the review would run against a DIFFERENT ticket than the one named.
     if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) {
-      exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of DWLF-<n>)`);
+      exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of ${ticketPrefix()}-<n>)`);
     }
 
     const local = options.local;

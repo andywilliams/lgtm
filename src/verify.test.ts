@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, DOC_TAG_EXEMPT, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, DOC_TAG_EXEMPT, quotesShownText, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -362,6 +362,39 @@ describe('the shown-context rule — the caller decides, not the prose', () => {
     const guarded = applyVerdicts([f], verdicts, ctx([], ['src/cli.ts']), contents);
     assert.equal(guarded[0].verdict, 'unshown');
     assert.equal(guarded[0].verifier_dropped, undefined);
+  });
+
+  test('a refutation must quote text that was actually sent', () => {
+    // The route this closes: ticket text is attacker-writable and reaches this pass, so an
+    // instruction planted there could produce a `refuted` verdict with invented quoted
+    // lines about a file that WAS sent — which wasShown cannot catch, and `refuted` is the
+    // one verdict that deletes a BUG outright.
+    const f = finding({ severity: 'BUG', file: 'src/a.ts' });
+    const shownCode = ctx(['src/a.ts']);
+    const real = { ...shownCode, text: 'function parse(row) {\n  if (!row) return null;\n}' };
+
+    const invented = applyVerdicts([f], { 1: { verdict: 'refuted', verifier_evidence: ['if (row === undefined) throw new Error("never written");'], verifier_note: 'n' } }, real, {});
+    assert.equal(invented[0].verdict, 'unproven');
+    assert.equal(invented[0].verifier_dropped, undefined, 'the BUG survives');
+
+    const genuine = applyVerdicts([f], { 1: { verdict: 'refuted', verifier_evidence: ['if (!row) return null;'], verifier_note: 'the guard is there' } }, real, {});
+    assert.equal(genuine[0].verdict, 'refuted');
+    assert.equal(genuine[0].verifier_dropped, true, 'a real refutation still drops');
+  });
+
+  test('quotesShownText ignores whitespace and refuses a quote too short to mean anything', () => {
+    const hay = 'const x = 1;\n    if (!row)   return null;';
+    assert.equal(quotesShownText(['if (!row) return null;'], hay), true, 're-indentation must not fail an honest quote');
+    assert.equal(quotesShownText(['not in there at all, definitely'], hay), false);
+    assert.equal(quotesShownText([';'], hay), false, 'a fragment that matches anything proves nothing');
+    assert.equal(quotesShownText([], hay), false);
+  });
+
+  test('the quote check haystack is the CODE, never the ticket text', () => {
+    const out: { shown?: Set<string>; code?: string } = {};
+    buildVerifyPrompt({ diff: 'DIFF-MARKER', prTitle: 'T', docs: 'PLANTED-TICKET-MARKER', findings: [finding({ title: '(ticket) x' })] }, out);
+    assert.match(out.code!, /DIFF-MARKER/);
+    assert.doesNotMatch(out.code!, /PLANTED-TICKET-MARKER/, 'a haystack containing attacker text would accept the attacker\'s own quotes');
   });
 
   test('a refutation of code that was never sent is corrected too', () => {
