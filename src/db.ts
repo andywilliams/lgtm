@@ -49,7 +49,7 @@ export interface ReviewLog {
   fileShas?: Record<string, string>;
   modelRole?: string;
   /** The verifier pass, when it ran: its model, its own spend, and why it could not answer. */
-  verify?: { model?: string; costUsd: number | null; tokens: number | null; failed?: string };
+  verify?: { model?: string; measured: boolean; costUsd: number | null; tokens: number | null; failed?: string };
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -62,8 +62,10 @@ const REVIEW_COLUMNS: [string, string][] = [
   ['cost_usd', 'REAL'],
   ['duration_ms', 'INTEGER'],
   ['model_id', 'TEXT'],
-  // 'measured' when every model call reported usage; 'estimate' otherwise (codex, or a
-  // provider reply with no envelope) — so a query never mixes the two silently.
+  // 'measured' when every model call reported usage; 'estimate' when the REVIEW's own
+  // calls did not (codex, or a provider reply with no envelope); 'partial' when the review
+  // was measured and the verifier pass was not — so a query never mixes the three silently,
+  // and a round is not thrown away as unmeasured because its second half ran on codex.
   ['usage_source', 'TEXT'],
   ['mode', 'TEXT'],
   ['round_key', 'TEXT'],
@@ -420,7 +422,7 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     m?.durationMs ?? null,
     // The primary model, not the helper: the CLI lists a small model alongside it.
     m && m.models.length > 0 ? primaryModel(m.models) : null,
-    m ? 'measured' : 'estimate',
+    m ? (data.verify && !data.verify.measured ? 'partial' : 'measured') : 'estimate',
     data.mode ?? null,
     data.roundKey ?? null,
     round,

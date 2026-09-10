@@ -409,13 +409,18 @@ test('a verifier-dropped finding is logged, but is not part of what the round fo
 
   // One round: a BUG the verifier refuted, and a SUGGESTION it confirmed.
   const r1 = logReview({ ...base, reviewedAt: '2026-09-10T11:00:00.000Z', harshness: 'medium', diffSha: 'a',
-    verify: { model: 'claude-sonnet-5', costUsd: 0.04, tokens: 9000 } });
+    verify: { model: 'claude-sonnet-5', measured: true, costUsd: 0.04, tokens: 9000 } });
   logFindings(r1.id, repo, key, 1, [
     { severity: 'BUG', title: 'Refuted crash', file: 'a.ts', line: 1, body: '', confidence: 'high', verdict: 'refuted', verifier_note: 'the guard is on line 8', verifier_dropped: true },
     { severity: 'SUGGESTION', title: 'Real nit', file: 'a.ts', line: 2, body: '', confidence: 'medium', verdict: 'confirmed' },
   ]);
 
   const s = getLoopSummary(repo, key);
+  // Without `verified` the drop rate has no denominator: a round that never ran the pass
+  // and a round that ran it and dropped nothing would look identical, and the metric this
+  // feature is justified by would silently stop printing rather than print a wrong number.
+  assert.equal(s.rounds[0].verified, true);
+  assert.equal(s.rounds[0].verifyFailed, null);
   assert.equal(s.rounds[0].dropped, 1, 'the drop is on the row — that is what makes the false-positive rate measurable');
   assert.equal(s.rounds[0].confirmed, 1);
   assert.equal(s.rounds[0].findings, 1, 'a dropped finding is not something the round found');
@@ -457,7 +462,7 @@ test('the verifier severity stored is the final one; the reviewer claim survives
   const key = 'pr:11';
   const r = logReview({ repo, prNumber: 11, reviewedAt: '2026-09-10T13:00:00.000Z', filesReviewed: 1, contextFilesAdded: 0,
     contextReasons: '[]', tokenCount: 1, model: 'claude', usedContextExpansion: false, falseNegative: false,
-    mode: 'pr', roundKey: key, harshness: 'medium', diffSha: 'a', verify: { costUsd: null, tokens: null, failed: 'the verifier returned no verdicts' } });
+    mode: 'pr', roundKey: key, harshness: 'medium', diffSha: 'a', verify: { measured: true, costUsd: null, tokens: null, failed: 'the verifier returned no verdicts' } });
   logFindings(r.id, repo, key, 1, [
     { severity: 'SUGGESTION', title: 'Downgraded', file: 'a.ts', line: 1, body: '', verdict: 'confirmed', original_severity: 'BUG', verifier_evidence: ['x'] },
   ]);
@@ -471,4 +476,53 @@ test('the verifier severity stored is the final one; the reviewer claim survives
   assert.deepEqual(JSON.parse(row.verifier_evidence), ['x']);
   assert.equal(review.verify_failed, 'the verifier returned no verdicts', 'a pass that ran and could not answer is not the same round as one that did not run');
   assert.equal(review.verify_cost_usd, null);
+});
+
+test('a round that ran no verifier, one whose verifier failed, and one that verified are three different rounds', async () => {
+  const { logReview, logFindings, getLoopSummary } = await import('./db.js');
+  const repo = 'verify4/repo';
+  const key = 'pr:12';
+  const base = { repo, prNumber: 12, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key, harshness: 'medium' };
+  const one = { severity: 'SUGGESTION' as const, title: 'a', file: 'a.ts', line: 1, body: '' };
+
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T14:00:00.000Z', diffSha: 'a' }); // no pass at all
+  logFindings(r1.id, repo, key, 1, [one]);
+  const r2 = logReview({ ...base, reviewedAt: '2026-09-10T14:10:00.000Z', diffSha: 'b',
+    verify: { model: 'claude-sonnet-5', measured: true, costUsd: null, tokens: null, failed: 'the verifier returned no verdicts' } });
+  logFindings(r2.id, repo, key, 2, [{ ...one, title: 'b' }]);
+  const r3 = logReview({ ...base, reviewedAt: '2026-09-10T14:20:00.000Z', diffSha: 'c',
+    verify: { model: 'claude-sonnet-5', measured: true, costUsd: 0.02, tokens: 5000 } });
+  logFindings(r3.id, repo, key, 3, [{ ...one, title: 'c', verdict: 'refuted', verifier_dropped: true }]);
+
+  const rounds = getLoopSummary(repo, key).rounds;
+  assert.deepEqual(rounds.map((r) => [r.verified, r.verifyFailed !== null]), [[false, false], [true, true], [true, false]]);
+  // The rate is 1 of 1 on the one round that was adjudicated — not 1 of 3 across a loop
+  // where two rounds were never checked.
+  const adjudicated = rounds.filter((r) => r.verified && !r.verifyFailed);
+  assert.equal(adjudicated.reduce((n, r) => n + r.findings + r.dropped, 0), 1);
+  assert.equal(adjudicated.reduce((n, r) => n + r.dropped, 0), 1);
+});
+
+test('a codex verifier does not cost the round its measured review numbers', async () => {
+  const { logReview, initDb } = await import('./db.js');
+  const { mergeRoundUsage, emptyUsage } = await import('./ai.js');
+  const repo = 'verify5/repo';
+  const measuredReview = { ...emptyUsage(), calls: 1, inputTokens: 1000, outputTokens: 100, costUsd: 1.25, durationMs: 900, models: ['claude-opus-5'], sentTokens: 400, lastPromptTokens: 1000 };
+  const unmeasuredVerify = { ...emptyUsage(), calls: 1, measured: false, sentTokens: 40 };
+  const r = logReview({
+    repo, prNumber: 12, reviewedAt: '2026-09-10T15:00:00.000Z', filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]',
+    tokenCount: 1, model: 'claude', usedContextExpansion: false, falseNegative: false, mode: 'pr', roundKey: 'pr:13', harshness: 'medium',
+    usage: mergeRoundUsage(measuredReview, unmeasuredVerify),
+    verify: { model: undefined, measured: false, costUsd: null, tokens: null },
+  });
+  const db = initDb();
+  const row = db.prepare('SELECT usage_source, cost_usd, model_id, sent_tokens FROM reviews WHERE id = ?').get(r.id) as any;
+  db.close();
+  // codex reports no usage. Before this, one unmeasured half threw away the claude half
+  // too — so the flag the feature recommends for decorrelation made the round cost-blind.
+  assert.equal(row.cost_usd, 1.25);
+  assert.equal(row.model_id, 'claude-opus-5');
+  assert.equal(row.usage_source, 'partial', 'and the row says which half was not measured');
+  assert.equal(row.sent_tokens, 400, 'the session still holds only what the review sent');
 });

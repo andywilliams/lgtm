@@ -134,7 +134,11 @@ export function mergeRoundUsage(session: AIUsage, outside: AIUsage): AIUsage {
     // Session-shaped fields: the first window's, never the sum. See above.
     lastPromptTokens: session.lastPromptTokens,
     sentTokens: session.sentTokens,
-    measured: session.measured && outside.measured,
+    // Only the SESSION window decides whether this reads as a bill. The outside call has
+    // its own columns, and a provider that reports nothing (codex) would otherwise erase
+    // a fully-measured claude review from the log — making `--verify-ai codex`, the
+    // decorrelation move this feature recommends, the one that costs the round its numbers.
+    measured: session.measured,
   };
 }
 

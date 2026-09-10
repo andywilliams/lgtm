@@ -112,6 +112,8 @@ program.addHelpText(
     '  LGTM_SESSIONS                 "off" = every round is a one-off call (default: one Claude session per loop, resumed each round for the prompt cache)\n' +
     '  LGTM_SIBLING_DIRS             colon-separated repos to also search for readers of what a diff writes (same as repeating --add-dir)\n' +
     '  LGTM_TIMEOUT_MS               how long one model call may take before lgtm gives up and says so (default 15 minutes)\n' +
+    '  LGTM_VERIFY_MODEL             model for the verifier pass that proves or drops each finding (default claude-sonnet-5; "off" = no verifier pass)\n' +
+    '  LGTM_VERIFY_MAX_BYTES         cap on the file windows the verifier is shown around each finding (default 60000)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -446,6 +448,7 @@ function formatAutoResult(options: {
   duplicatesSkipped?: number;
   dryRun?: boolean;
   comments: ReviewComment[];
+  verify?: VerifySummary | null;
   error?: string;
 }): string {
   return JSON.stringify({
@@ -454,7 +457,14 @@ function formatAutoResult(options: {
     dryRun: options.dryRun ?? false,
     commentsPosted: options.commentsPosted,
     duplicatesSkipped: options.duplicatesSkipped ?? 0,
-    comments: options.comments.map(c => ({ file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion })),
+    // The verdict travels with the finding here too: a script reading this JSON must be
+    // able to tell a refuted finding from a confirmed one, and `--show-dropped` puts
+    // refuted findings in this list.
+    comments: options.comments.map(c => ({
+      file: c.file, line: c.line, severity: c.severity, title: c.title, body: c.body, suggestion: c.suggestion,
+      verdict: c.verdict ?? 'unverified', verifier_note: c.verifier_note ?? null, dropped: Boolean(c.verifier_dropped),
+    })),
+    verify: options.verify ?? null,
     ...(options.error ? { error: options.error } : {}),
   });
 }
@@ -462,6 +472,15 @@ function formatAutoResult(options: {
 // A finding plus whether it duplicates a comment already on the PR, and its id in the
 // review log (so `lgtm dismiss <id>` can settle it) when the log recorded it.
 type AnnotatedComment = ReviewComment & { duplicate: boolean; id?: number };
+
+/** What the verifier pass did this round — the same shape in every output mode. */
+interface VerifySummary {
+  model: string | null;
+  failed: string | null;
+  /** Every finding the reviewer raised, dropped ones included: the drop rate's denominator. */
+  checked: number;
+  dropped: { file: string; line: number; severity: Severity; title: string; verdict: string; reason: string | null }[];
+}
 
 /**
  * Agent-mode payload. Unlike formatAutoResult (which reports what was *posted*),
@@ -478,12 +497,7 @@ function formatAgentResult(options: {
   loop?: LoopState | null;
   recovered?: boolean;
   /** The verifier pass and what it dropped — present so a bad drop is auditable, never silent. */
-  verify?: {
-    model: string | null;
-    failed: string | null;
-    checked: number;
-    dropped: { file: string; line: number; severity: Severity; title: string; verdict: string; reason: string | null }[];
-  } | null;
+  verify?: VerifySummary | null;
   error?: string;
 }): string {
   const duplicates = options.comments.filter(c => c.duplicate).length;
@@ -642,6 +656,9 @@ function recordReviewMetrics(opts: {
       modelRole,
       verify: verify && {
         model: verify.model,
+        // A pass that made no call at all (it failed before one) is not "unmeasured" —
+        // there was nothing to measure, and the round's own numbers stay a clean bill.
+        measured: verify.usage.calls === 0 || verify.usage.measured,
         costUsd: verify.usage.measured && verify.usage.calls > 0 ? verify.usage.costUsd : null,
         tokens: verify.usage.measured && verify.usage.calls > 0 ? promptTokens(verify.usage) + verify.usage.outputTokens : null,
         failed: verify.failed,
@@ -982,6 +999,17 @@ async function runReview(options: RunOptions): Promise<void> {
     const line = `   dropped: ${d.original_severity ?? d.severity} "${d.title}" (${d.file}:${d.line}) — ${d.verifier_note ?? d.verdict}`;
     if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
   }
+  const verifySummary: VerifySummary | null = verifyOutcome
+    ? {
+        model: verifyOutcome.model ?? null,
+        failed: verifyOutcome.failed ?? null,
+        checked: result.comments.length,
+        dropped: droppedComments.map((d) => ({
+          file: d.file, line: d.line, severity: d.original_severity ?? d.severity, title: d.title,
+          verdict: d.verdict ?? 'unproven', reason: d.verifier_note ?? null,
+        })),
+      }
+    : null;
   if (verifyOutcome && !verifyOutcome.failed) {
     const line = `⚖  ${droppedComments.length} of ${result.comments.length} finding(s) dropped, ${result.comments.filter((c) => c.verdict === 'confirmed').length} confirmed`;
     if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
@@ -1042,17 +1070,7 @@ async function runReview(options: RunOptions): Promise<void> {
       usage: metrics.usage,
       loop: metrics.loop,
       recovered: result.recovered,
-      verify: verifyOutcome
-        ? {
-            model: verifyOutcome.model ?? null,
-            failed: verifyOutcome.failed ?? null,
-            checked: result.comments.length,
-            dropped: droppedComments.map((d) => ({
-              file: d.file, line: d.line, severity: d.original_severity ?? d.severity, title: d.title,
-              verdict: d.verdict ?? 'unproven', reason: d.verifier_note ?? null,
-            })),
-          }
-        : null,
+      verify: verifySummary,
     }));
     return;
   }
@@ -1061,7 +1079,7 @@ async function runReview(options: RunOptions): Promise<void> {
   // a rendered list otherwise) and stop before any dedup/posting logic.
   if (local) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: shownComments }));
+      console.log(formatAutoResult({ success: true, dryRun: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: shownComments, verify: verifySummary }));
       return;
     }
     if (shownComments.length === 0) {
@@ -1082,6 +1100,9 @@ async function runReview(options: RunOptions): Promise<void> {
       );
       log(chalk.white('─'.repeat(60)));
       log(chalk.bold(comment.title));
+      if (comment.verifier_dropped) log(chalk.yellow(`DROPPED by the verifier (${comment.verdict}) — shown because --show-dropped: ${comment.verifier_note ?? 'no reason given'}`));
+      else if (comment.verdict === 'confirmed') log(chalk.gray(`confirmed by the verifier: ${comment.verifier_note ?? ''}`));
+      else if (comment.verdict === 'unproven') log(chalk.gray(`the verifier could not prove this: ${comment.verifier_note ?? ''}`));
       log(chalk.white(comment.body));
       if (comment.suggestion) {
         log(chalk.green('\nSuggested fix:'));
@@ -1094,7 +1115,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (postableComments.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [], verify: verifySummary }));
     } else {
       log(chalk.green('✓ LGTM — no issues found'));
     }
@@ -1112,7 +1133,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (commentsToReview.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [], verify: verifySummary }));
     } else {
       log(chalk.green('✓ All detected issues were already commented on'));
     }
@@ -1193,7 +1214,7 @@ async function runReview(options: RunOptions): Promise<void> {
 
   if (selectedComments.length === 0) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [] }));
+      console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: duplicateCount, comments: [], verify: verifySummary }));
     } else {
       log(chalk.gray('\nNo comments to post.'));
     }
@@ -1209,6 +1230,7 @@ async function runReview(options: RunOptions): Promise<void> {
         commentsPosted: 0,
         duplicatesSkipped: duplicateCount,
         comments: selectedComments,
+        verify: verifySummary,
       }));
     } else {
       log(chalk.yellow('\n(dry-run mode — skipping post)'));
@@ -1264,7 +1286,7 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   } catch (uploadError: any) {
     if (auto) {
-      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: selectedComments.slice(0, commentsPostedCount) }));
+      console.log(formatAutoResult({ success: false, error: uploadError?.message ?? String(uploadError), summary: result.summary, commentsPosted: commentsPostedCount, duplicatesSkipped: duplicateCount, comments: selectedComments.slice(0, commentsPostedCount), verify: verifySummary }));
     } else {
       logErr(chalk.red(`\n✗ Upload failed: ${uploadError?.message ?? String(uploadError)}`));
       log(chalk.yellow(`\n💾 Comments saved locally. Retry with:`));
@@ -1284,6 +1306,7 @@ async function runReview(options: RunOptions): Promise<void> {
       commentsPosted: commentsPostedCount,
       duplicatesSkipped: duplicateCount,
       comments: selectedComments,
+      verify: verifySummary,
     }));
   } else {
     log(chalk.green(`\n✓ Posted ${selectedComments.length} comment(s)`));

@@ -198,6 +198,8 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_MODEL` | your `~/.claude/settings.json` `model` | model id to review with |
 | `LGTM_EFFORT` | your settings' effort for that model | `low`/`medium`/`high`/`xhigh`/`max` |
 | `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
+| `LGTM_VERIFY_MODEL` | `claude-sonnet-5` | model for the verifier pass that proves or drops each finding (see below); `off` = no verifier pass |
+| `LGTM_VERIFY_MAX_BYTES` | `60000` | cap on the file windows the verifier is shown around each finding |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 | `LGTM_TIMEOUT_MS` | 15 minutes | how long one model call may take before lgtm gives up and says why |

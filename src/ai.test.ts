@@ -341,8 +341,12 @@ describe('mergeRoundUsage', () => {
     assert.equal(merged.costUsd, 1.54, 'the money is still the total');
   });
 
-  test('an unmeasured half taints the total rather than reading as a low bill', () => {
-    assert.equal(mergeRoundUsage(u({ costUsd: 1 }), u({ measured: false })).measured, false);
+  test('only the SESSION half decides whether the round reads as a bill', () => {
+    // An unmeasured OUTSIDE call (codex reports no usage) must not throw away a fully
+    // measured review: the outside half has its own columns, and `usage_source` records
+    // that it was not measured. An unmeasured review is a different matter — nothing on
+    // the row is then a bill, and it must not read as one.
+    assert.equal(mergeRoundUsage(u({ costUsd: 1 }), u({ measured: false })).measured, true);
     assert.equal(mergeRoundUsage(u({ measured: false }), u({ costUsd: 1 })).measured, false);
   });
 
