@@ -38,8 +38,14 @@ export interface AIUsage {
   /** Distinct model ids the CLI reported (a print run may also use a small helper model). */
   models: string[];
   calls: number;
-  /** Prompt tokens of the LAST call in the window — the context a session actually holds, where the totals above sum every attempt. */
+  /** Prompt tokens of the LAST call in the window — the totals above sum every attempt. */
   lastPromptTokens: number;
+  /**
+   * Rough tokens of prompt text lgtm SENT in this window (chars/4). The envelope's
+   * prompt_tokens sums the CLI's internal turns — a single round can bill 1.2M for a
+   * 250k prompt — so this, plus the output, is what tracks a session's growth.
+   */
+  sentTokens: number;
   /** False when any call in the window had no envelope to read (codex, or a non-JSON reply). */
   measured: boolean;
 }
@@ -55,6 +61,7 @@ export function emptyUsage(): AIUsage {
     models: [],
     calls: 0,
     lastPromptTokens: 0,
+    sentTokens: 0,
     measured: true,
   };
 }
@@ -72,8 +79,9 @@ export function promptTokens(u: AIUsage): number {
 let ledger: AIUsage = emptyUsage();
 
 /** Fold one call's usage into the ledger. Exported for tests only. */
-export function addUsage(u: AIUsage | null): void {
+export function addUsage(u: AIUsage | null, promptChars = 0): void {
   ledger.calls += 1;
+  ledger.sentTokens += Math.ceil(promptChars / 4);
   // An unmeasured call (no envelope, or an envelope with no usage block) taints the
   // whole window: its numbers are zeros, not a bill, and must not read as one.
   if (!u || !u.measured) {
@@ -320,6 +328,7 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
     models: d.modelUsage && typeof d.modelUsage === 'object' ? Object.keys(d.modelUsage) : [],
     calls: 1,
     lastPromptTokens: num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens),
+    sentTokens: 0, // filled by the ledger from the prompt we sent
     measured: Boolean(hasUsage),
   };
   return { text, usage };
@@ -401,7 +410,7 @@ function runClaude(prompt: string, opts: RunOptions): string {
       maxBuffer: 10 * 1024 * 1024,
     });
     const { text, usage } = parsePrintEnvelope(raw);
-    addUsage(usage);
+    addUsage(usage, prompt.length);
     return text;
   } catch (error: any) {
     // A non-zero exit usually still carries the JSON envelope on stdout; surface its
@@ -411,7 +420,7 @@ function runClaude(prompt: string, opts: RunOptions): string {
     if (stdout.trim()) {
       const { text, usage } = parsePrintEnvelope(stdout); // throws with the envelope's reason
       if (usage && text.trim()) {
-        addUsage(usage);
+        addUsage(usage, prompt.length);
         return text;
       }
     }
@@ -431,7 +440,7 @@ function runCodex(prompt: string, label: string): string {
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
     });
-    addUsage(null);
+    addUsage(null, prompt.length);
     return readFileSync(outputFile, 'utf-8');
   } finally {
     try { unlinkSync(outputFile); } catch { /* ignore */ }

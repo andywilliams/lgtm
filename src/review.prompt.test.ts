@@ -74,9 +74,13 @@ test('a resumed round renders updated repo context as context, not as a file', a
 
 test('a reviewed file that contains the prompt\'s own headings does not leak into the resumed round', async () => {
   const { buildResumePrompt } = await import('./review.js');
-  const trap = { 'src/review.ts': 'const t = `\n## PR Title\n${x}\n## Diff\n`; // template' };
-  const full = { ...base, fileContents: trap };
+  const body = `const t = \`\n## PR Title\n\${x}\n## Diff\n\`; // template\n` + 'const filler = 1;\n'.repeat(2000);
+  const full = { ...base, fileContents: { 'src/review.ts': body } };
   const p = buildResumePrompt({ ...full, round: 2, changedSinceLast: {}, unchangedFiles: ['src/review.ts'] });
-  assert.ok(!p.includes('// template'), 'the unchanged file is not re-sent even though it contains the headings');
-  assert.ok(p.length < 3000, `resumed prompt should be small, was ${p.length}`);
+  // The invariant is that an unchanged file's CONTENTS are not re-sent — even one whose
+  // text contains the prompt's own headings, which is how the marker-slicing bug hid.
+  assert.ok(!p.includes('// template'), 'the unchanged file is not re-sent');
+  assert.ok(!p.includes('const filler'), 'nor any of its body');
+  const fullPrompt = buildReviewPrompt(full);
+  assert.ok(p.length < fullPrompt.length / 5, `resumed ${p.length} vs full ${fullPrompt.length}`);
 });

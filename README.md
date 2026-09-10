@@ -214,6 +214,8 @@ lgtm rounds --local     # the same for the current branch's working-tree reviews
 lgtm rounds 86 --json
 ```
 
+Each finding carries its own triage fields: `kind` (`added`, or `removed` / `missing` for a deleted guard or an absent reader), `confidence` (`high` only when the reviewer could quote evidence — enforced on parse), `evidence` (the quoted lines), `how_to_verify` (the one check that settles it) and `fingerprint` (the symbol at fault, used to match the finding across rounds). Posted comments carry them too. `lgtm rounds` counts absences and high-confidence findings per round.
+
 Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
 
 ### One session per loop — the prompt cache does the rest

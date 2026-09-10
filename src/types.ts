@@ -1,6 +1,10 @@
 export type Harshness = 'chill' | 'medium' | 'pedantic';
 export type Severity = 'BUG' | 'SECURITY' | 'SUGGESTION' | 'NITPICK';
 
+/** What the finding is about: code the diff ADDS, code it REMOVES, or something MISSING from it. */
+export type FindingKind = 'added' | 'removed' | 'missing';
+export type Confidence = 'high' | 'medium' | 'low';
+
 export interface ReviewComment {
   file: string;
   line: number;
@@ -8,6 +12,14 @@ export interface ReviewComment {
   title: string;
   body: string;
   suggestion?: string;
+  kind?: FindingKind;
+  confidence?: Confidence;
+  /** Lines quoted from the diff or the provided context that show the problem. */
+  evidence?: string[];
+  /** The one check that settles whether this is real. */
+  how_to_verify?: string;
+  /** Stable identity across rounds: the symbol or construct at fault, not the line. */
+  fingerprint?: string;
 }
 
 export interface ReviewResult {

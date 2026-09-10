@@ -74,11 +74,11 @@ test('logReview stores measured usage separately from the historical estimate, a
     ...base,
     usage: {
       inputTokens: 10, cacheCreationTokens: 90_000, cacheReadTokens: 10_000, outputTokens: 1_200,
-      costUsd: 1.25, durationMs: 42_000, models: ['claude-haiku-4-5-20251001', 'claude-fable-5-1'], calls: 1, lastPromptTokens: 100_010, measured: true,
+      costUsd: 1.25, durationMs: 42_000, models: ['claude-haiku-4-5-20251001', 'claude-fable-5-1'], calls: 1, lastPromptTokens: 100_010, sentTokens: 90_000, measured: true,
     },
   });
   // A codex round (no envelope) — recorded as an estimate, never as a suspiciously cheap measurement.
-  logReview({ ...base, prNumber: 8, model: 'codex', usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, models: [], calls: 1, lastPromptTokens: 0, measured: false } });
+  logReview({ ...base, prNumber: 8, model: 'codex', usage: { inputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 0, models: [], calls: 1, lastPromptTokens: 0, sentTokens: 0, measured: false } });
 
   const db = new Database(dbPath, { readonly: true });
   const measured = db.prepare('SELECT * FROM reviews WHERE pr_number = 7').get() as any;
@@ -115,7 +115,7 @@ test('findings are logged per round and the previous round is disposed: fixed / 
   const c = (severity: any, title: string, file = 'src/a.ts', line = 10) => ({ severity, title, file, line, body: '' });
 
   const r1 = logReview({ ...base, reviewedAt: '2026-09-09T10:00:00.000Z', harshness: 'medium',
-    usage: { inputTokens: 0, cacheCreationTokens: 1000, cacheReadTokens: 0, outputTokens: 10, costUsd: 2, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, lastPromptTokens: 1000, measured: true } });
+    usage: { inputTokens: 0, cacheCreationTokens: 1000, cacheReadTokens: 0, outputTokens: 10, costUsd: 2, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, lastPromptTokens: 1000, sentTokens: 900, measured: true } });
   assert.equal(r1.round, 1, 'round allocated inside the insert when not supplied');
   logFindings(r1.id, repo, key, 1, [
     c('BUG', 'Null deref on empty list'),
@@ -320,14 +320,14 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
 
   // The loop's session: latest round with one, file shas accumulated across its rounds; a PR round finds the local loop's.
   logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:25:00.000Z', sessionId: 'sess-1', fileShas: { 'a.ts': 'a1', 'b.ts': 'b1' },
-    usage: { inputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 1, costUsd: 0.1, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, lastPromptTokens: 1000, measured: true } });
+    usage: { inputTokens: 1, cacheCreationTokens: 0, cacheReadTokens: 0, outputTokens: 1, costUsd: 0.1, durationMs: 1, models: ['claude-fable-5-1'], calls: 1, lastPromptTokens: 1000, sentTokens: 900, measured: true } });
   logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:26:00.000Z', sessionId: 'sess-1', fileShas: { 'a.ts': 'a2' } });
   const sess = loopContext(lrepo, 'pr:77', 'feat/w').session;
   assert.ok(sess);
   assert.equal(sess.id, 'sess-1');
   assert.equal(sess.model, 'claude-fable-5-1');
   assert.equal(sess.role, null, 'no model_role recorded ⇒ null, never inferred');
-  assert.equal(sess.lastPromptTokens, 1000, 'read from the latest MEASURED round of the session, not the latest row');
+  assert.equal(sess.lastPromptTokens, 901, 'what we SENT plus the reply, not the envelope\'s per-turn sum');
   assert.deepEqual(sess.fileShas, { 'a.ts': 'a2', 'b.ts': 'b1' }, 'latest sha per file across the session');
   logReview({ ...base, repo: lrepo, prNumber: 0, mode: 'local', roundKey: 'local:feat/w', reviewedAt: '2026-09-09T14:27:00.000Z', sessionId: 'sess-1', modelRole: 'full' });
   assert.equal(loopContext(lrepo, 'pr:77', 'feat/w').session?.role, 'full', 'the column wins when present');
@@ -338,4 +338,64 @@ test('loopContext hands the next round its scope and every dismissal; dismissFin
   const aged = loopContext(lrepo, 'pr:77', 'feat/w');
   assert.equal(aged.lastScope, null, 'scope from before the gap is not inherited');
   assert.deepEqual(aged.dismissed.map((d) => d.title), ['Trailing comma'], 'dismissals persist');
+});
+
+test('prompt v2: a finding logged under the old title key is still matched by a fingerprinted round', async () => {
+  const { logReview, logFindings, disposePreviousRound, getLoopSummary, keysFor } = await import('./db.js');
+  const repo = 'v2/repo';
+  const key = 'pr:1';
+  const base = { repo, prNumber: 1, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+
+  // Round 1, pre-v2: no fingerprint, so the row's key is file#title.
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T09:00:00.000Z', harshness: 'medium', diffSha: 'a' });
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'BUG', title: 'Null deref in parseRow', file: 'a.ts', line: 1, body: '' },
+    { severity: 'SUGGESTION', title: 'Name the constant', file: 'a.ts', line: 5, body: '', confidence: 'medium' },
+  ]);
+
+  // Round 2, v2: the same complaint arrives with a fingerprint and a different title.
+  const same = { severity: 'BUG' as const, title: 'parseRow dereferences a null row', file: 'a.ts', line: 2, body: '', fingerprint: 'Null deref in parseRow', confidence: 'high' as const };
+  assert.ok(keysFor(same).length === 2, 'both spellings are offered');
+  const r2 = logReview({ ...base, reviewedAt: '2026-09-10T09:10:00.000Z', harshness: 'medium', diffSha: 'b' });
+  logFindings(r2.id, repo, key, 2, [same]);
+  assert.deepEqual(disposePreviousRound(repo, key, 2, [same], { harshness: 'medium', diffSha: 'b' }),
+    { fixed: 1, dismissed: 0, carried: 1, suppressed: 0 }, 'carried, not silently fixed');
+
+  // Round 3 at chill: the round-2 BUG is high confidence so its absence is a fix; a
+  // medium-confidence finding would only be below chill's bar.
+  const r3 = logReview({ ...base, reviewedAt: '2026-09-10T09:20:00.000Z', harshness: 'chill', diffSha: 'c' });
+  logFindings(r3.id, repo, key, 3, []);
+  assert.deepEqual(disposePreviousRound(repo, key, 3, [], { harshness: 'chill', diffSha: 'c' }),
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 0 });
+
+  const s = getLoopSummary(repo, key);
+  assert.equal(s.rounds[1].absences, 0);
+  assert.equal(s.rounds[1].highConfidence, 1, 'kind and confidence are recorded per finding');
+});
+
+test('prompt v2: a medium-confidence finding absent from a chill round is suppressed, not fixed', async () => {
+  const { logReview, logFindings, disposePreviousRound } = await import('./db.js');
+  const repo = 'v2b/repo';
+  const key = 'pr:2';
+  const base = { repo, prNumber: 2, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T10:00:00.000Z', harshness: 'medium', diffSha: 'a' });
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'BUG', title: 'Maybe a race', file: 'a.ts', line: 1, body: '', confidence: 'medium', kind: 'missing' },
+    { severity: 'BUG', title: 'Demonstrated crash', file: 'a.ts', line: 2, body: '', confidence: 'high' },
+  ]);
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'SUGGESTION', title: 'Could be clearer', file: 'a.ts', line: 3, body: '', confidence: 'medium' },
+  ]);
+  logReview({ ...base, reviewedAt: '2026-09-10T10:10:00.000Z', harshness: 'chill', diffSha: 'b' });
+  assert.deepEqual(disposePreviousRound(repo, key, 2, [], { harshness: 'chill', diffSha: 'b' }),
+    { fixed: 1, dismissed: 0, carried: 0, suppressed: 1 },
+    'the high-confidence BUG is fixed; the medium SUGGESTION is suppressed; the medium BUG is neither');
+
+  // The medium-confidence BUG is still OPEN: a chill round asks only for high-confidence
+  // findings, so its silence cannot close an unverified bug — and openBugs keeps the
+  // model policy on the full model until it is settled.
+  const { getLoopSummary } = await import('./db.js');
+  assert.equal(getLoopSummary(repo, key).openBugs, 1, 'the unverified BUG stays open rather than reading as fixed');
 });

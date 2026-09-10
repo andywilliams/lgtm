@@ -22,11 +22,13 @@ export function modelRoleOf(choice: RoundModelChoice, fullModel: string | undefi
 export const SYSTEM_PROMPT_KEY = '@system-prompt';
 
 /**
- * Tokens of context a session may hold before the next round starts a fresh one. The
- * CLI compacts a conversation that nears the 1M window — measured: a 883k-token session
- * plus a 150k message came back as 228k with the whole cache lost — and a compacted
- * session reviews from a summary instead of the files. A fresh full prompt is both
- * cheaper and better than that. Rough token estimate: 4 chars per token.
+ * Tokens of context a session may hold before the next round starts a fresh one, against
+ * the CLI's 1M window. Measured in the same unit the log records: the prompt text lgtm
+ * SENT (chars/4) plus the replies — NOT the envelope's billed prompt_tokens, which sums
+ * the CLI's internal turns and read 1.2M for a 250k prompt. The CLI compacts a
+ * conversation that nears the window (measured: an 883k-token session plus a 150k
+ * message came back as 228k with the whole cache lost) and a compacted session reviews
+ * from a summary instead of the files, so a fresh full prompt is cheaper and better.
  */
 export const SESSION_CONTEXT_BUDGET = 700_000;
 const CHARS_PER_TOKEN = 4;

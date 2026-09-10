@@ -24,6 +24,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
 import { planSession, modelRoleOf } from './session.js';
+import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
@@ -405,30 +406,7 @@ function loopIdentity(repo: string | undefined, local: boolean, prNumber: number
   return { repoName, roundKey };
 }
 
-function formatReviewCommentBody(comment: ReviewComment): string {
-  let body = `**${comment.title}**\n\n${comment.body}`;
-  if (comment.suggestion) {
-    body += `\n\n**Suggested fix:**\n\`\`\`suggestion\n${comment.suggestion}\n\`\`\``;
-  }
-  return body;
-}
 
-function normalizeFingerprintText(text: string): string {
-  return text.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewComment[]): boolean {
-  const candidateKey = `${candidate.file}:${candidate.line}`;
-  const fingerprint = normalizeFingerprintText(formatReviewCommentBody(candidate)).slice(0, 50);
-  if (!fingerprint) return false;
-
-  return existing.some((comment) => {
-    if (comment.line == null) return false;
-    const existingKey = `${comment.path}:${comment.line}`;
-    if (existingKey !== candidateKey) return false;
-    return normalizeFingerprintText(comment.body).includes(fingerprint);
-  });
-}
 
 function formatAutoResult(options: {
   success: boolean;
@@ -484,12 +462,19 @@ function formatAgentResult(options: {
     duplicates,
     comments: options.comments.map(c => ({
       id: c.id ?? null,
+      // Triage fields first: what kind of problem, how sure the reviewer is, and the one
+      // check that settles it — read these before the body.
+      kind: c.kind ?? 'added',
+      confidence: c.confidence ?? 'medium',
+      how_to_verify: c.how_to_verify ?? null,
+      evidence: c.evidence ?? [],
       file: c.file,
       line: c.line,
       severity: c.severity,
       title: c.title,
       body: c.body,
       suggestion: c.suggestion,
+      fingerprint: c.fingerprint ?? null,
       duplicate: c.duplicate,
     })),
     context: {
@@ -1654,7 +1639,7 @@ program
     }
     const mixed = summary.rounds.some((r) => r.key !== key);
     console.log(chalk.bold(`\nReview rounds — ${key}${mixed ? ' (with the branch\'s local rounds first)' : ''}\n`));
-    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  fixed dism carr supp    cost  model`);
+    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  abs high  fixed dism carr supp    cost  model`);
     for (const r of summary.rounds) {
       const when = r.reviewedAt.slice(0, 16).replace('T', ' ');
       const s = r.bySeverity;
@@ -1664,6 +1649,7 @@ program
       console.log(
         `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
           `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
+          `${String(r.absences).padStart(3)} ${String(r.highConfidence).padStart(4)}  ` +
           `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${modelCol}`
       );
     }
