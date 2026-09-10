@@ -155,7 +155,13 @@ const MAP_TRUNCATED = 'placement and codebase-pattern counts — the repository 
 // Only said when a ticket ref WAS found: a change with no ticket reference is not a change
 // whose ticket could not be read, and conflating them would put a permanent line in the
 // output of every repo that does not use the board.
-const ticketSkip = (why: string) => `rationale and completeness checks — the ticket could not be read (${why})`;
+// Two shapes on purpose: a board nobody configured is an opt-out, and reads differently
+// from a configured board that failed. Both are recorded — `skipped_checks` is arch's
+// structured honesty record, not a warning, so absence of a check belongs in it either way.
+const ticketSkip = (why: string) =>
+  /no board access/i.test(why)
+    ? 'ticket check — no board access'
+    : `ticket check — the ticket could not be read (${why})`;
 
 /**
  * The skipped_checks honesty contract is enforced from ground truth, not model
@@ -173,7 +179,14 @@ export interface ContextPresence {
 }
 
 export function enforceSkippedChecks(result: ArchResult, present: ContextPresence): ArchResult {
-  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map|the ticket could not be read/i.test(s));
+  // Fragments, not whole sentences: these strip the MODEL's own phrasings of the four
+  // canonical checks as well as lgtm's, which is what makes "the canonical entries are set
+  // here" true. Matching the exact emitted sentence would let a paraphrase survive and
+  // claim a check was skipped when its context was in fact provided.
+  // Phrases specific to the canonical entries and the paraphrases of them — not the bare
+  // word "ticket", which would also swallow an honest, different self-report such as
+  // "could not check whether the linked ticket's epic is affected".
+  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map|ticket (could not be|check|completeness|was not)|no board access/i.test(s));
   const canonical = [
     ...(present.charter ? [] : [CHARTER_SKIP]),
     ...(present.system ? [] : [SYSTEM_SKIP]),

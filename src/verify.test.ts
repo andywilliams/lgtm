@@ -205,10 +205,18 @@ describe('buildVerifyPrompt', () => {
     assert.match(p, /Findings to verify \(2\)/);
   });
 
-  test('citesDocs recognises both tag spellings and nothing else', () => {
+  test('citesDocs recognises every document tag and nothing else', () => {
+    // Each of these is a finding whose ONLY evidence is a document. Miss one and the drop
+    // rule deletes that whole class as unprovable opinion, since they are all SUGGESTIONs.
     assert.equal(citesDocs([finding({ title: '(charter) x' })]), true);
     assert.equal(citesDocs([finding({ title: '(standard NAM-2) x' })]), true);
+    assert.equal(citesDocs([finding({ title: '(ticket) x' })]), true);
     assert.equal(citesDocs([finding({ title: '(out of scope) x' })]), false);
+  });
+
+  test('a (ticket) finding is verified WITH the ticket in front of the verifier', () => {
+    const p = buildVerifyPrompt({ diff: 'd', prTitle: 'T', docs: 'TICKET-TEXT-MARKER', findings: [finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' })] });
+    assert.match(p, /TICKET-TEXT-MARKER/);
   });
 });
 

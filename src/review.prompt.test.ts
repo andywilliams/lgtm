@@ -85,3 +85,15 @@ test('a reviewed file that contains the prompt\'s own headings does not leak int
   const fullPrompt = buildReviewPrompt(full);
   assert.ok(p.length < fullPrompt.length / 5, `resumed ${p.length} vs full ${fullPrompt.length}`);
 });
+
+
+test('the ticket block is in the STABLE prefix, so a resumed round reads it from cache', () => {
+  // It belongs with the charter and standards: a ticket does not move while the change
+  // does, and putting it in the volatile tail would re-send it uncached every round.
+  const withTicket = { ...base, extra: { ...(base as any).extra, ticket: '## TICKET-BLOCK-MARKER\ndata' } } as any;
+  assert.match(buildStablePrefix(withTicket), /TICKET-BLOCK-MARKER/);
+  assert.doesNotMatch(buildVolatileTail(withTicket), /TICKET-BLOCK-MARKER/);
+  assert.match(buildReviewPrompt(withTicket), /TICKET-BLOCK-MARKER/);
+  // And no ticket means no trace of one — most repos do not use a board.
+  assert.doesNotMatch(buildStablePrefix(base as any), /TICKET|asked to deliver/);
+});

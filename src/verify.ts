@@ -247,9 +247,14 @@ export function diffFiles(diff: string): Set<string> {
   return out;
 }
 
-/** Does any finding cite a document (charter / STANDARDS.md) rather than the code? */
+/**
+ * Does any finding cite a DOCUMENT — the charter, STANDARDS.md, or the ticket — rather
+ * than the code? Those documents are the only evidence such a finding can have, so they
+ * travel with it; without them the finding is an unprovable opinion and the drop rule
+ * deletes the whole class.
+ */
 export function citesDocs(findings: ReviewComment[]): boolean {
-  return findings.some((f) => /^\((charter|standard\b[^)]*)\)/i.test(f.title));
+  return findings.some((f) => /^\((charter|ticket|standard\b[^)]*)\)/i.test(f.title));
 }
 
 export function buildVerifyPrompt(input: VerifyInput, shownOut?: Set<string>): string {

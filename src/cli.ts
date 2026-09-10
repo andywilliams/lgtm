@@ -16,7 +16,7 @@ import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
 import { buildRepoMap } from './repoMap.js';
-import { ticketContext, ticketRefFrom } from './ticket.js';
+import { ticketContext } from './ticket.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -205,6 +205,7 @@ program
     if (options.model && !isModelId(options.model)) exitWithError(`--model ${JSON.stringify(options.model)} is not a model id`);
     if (options.verifyModel && !isModelId(options.verifyModel)) exitWithError(`--verify-model ${JSON.stringify(options.verifyModel)} is not a model id`);
     if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of DWLF-<n>)`);
+
 
     // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
     // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
@@ -508,6 +509,8 @@ function formatAgentResult(options: {
   usage?: AIUsage;
   loop?: LoopState | null;
   recovered?: boolean;
+  /** The ticket the change names, and whether its text reached the reviewer. */
+  ticket?: { ref: number | null; present: boolean; reason: string | null } | null;
   /** The verifier pass and what it dropped — present so a bad drop is auditable, never silent. */
   verify?: VerifySummary | null;
   error?: string;
@@ -553,6 +556,10 @@ function formatAgentResult(options: {
     })),
     context: {
       maxContext: true,
+      // Whether the completeness check ran at all. Without this, "no (ticket) finding
+      // because the diff covers the ticket" and "no (ticket) finding because the board
+      // 404'd" are the same payload — a clean bill and total silence look identical.
+      ticket: options.ticket ?? null,
       relatedFiles: (options.relatedFiles ?? []).map(f => ({ path: f.path, reason: f.reason })),
       tokenEstimate: options.tokenEstimate ?? 0,
       // What the provider billed for this run — tokenEstimate above is only the diff+context size.
@@ -892,7 +899,10 @@ async function runReview(options: RunOptions): Promise<void> {
     branch: local ? getCurrentBranch() : pr.headRef,
   });
   if (ticket.block) log(chalk.blue(`\n🎫 Ticket DWLF-${ticket.ref} — checking the diff against what it asked for`));
-  else if (ticket.reason) {
+  else if (ticket.reason && ticket.skipped !== 'not-configured') {
+    // Only a CONFIGURED board that failed is worth a line. Having no board is the default
+    // state and an opt-out, not a failure — warning about it would put a yellow line on
+    // every review in every repo whose branches happen to carry a DWLF ref.
     const line = `🎫 DWLF-${ticket.ref}: ${ticket.reason} — the completeness check is skipped`;
     if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
   }
@@ -1002,7 +1012,9 @@ async function runReview(options: RunOptions): Promise<void> {
     verifyOutcome = verifyFindings({
       diff: truncatedDiff, prTitle: pr.title, findings: result.comments, contents: contentsSeen,
       readersContext: readersContextStr || undefined,
-      docs: [charterContextStr, standardsContextStr].filter(Boolean).join('\n') || undefined,
+      // The ticket's DATA, never its instruction half: the reviewer is told to add one
+      // (ticket) finding, and the verifier's own first rule is that it may not add any.
+      docs: [charterContextStr, standardsContextStr, ticket.data].filter(Boolean).join('\n') || undefined,
       ai: vAi, model: chosen,
     });
     verifyUsage = takeUsage();
@@ -1101,6 +1113,7 @@ async function runReview(options: RunOptions): Promise<void> {
       usage: metrics.usage,
       loop: metrics.loop,
       recovered: result.recovered,
+      ticket: { ref: ticket.ref, present: Boolean(ticket.block), reason: ticket.reason },
       verify: verifySummary,
     }));
     return;
@@ -2261,6 +2274,11 @@ arch
     if (options.maxMapBytes !== undefined && (!/^\d+$/.test(String(options.maxMapBytes).trim()) || Number(options.maxMapBytes) < 1)) {
       exitWithError('--max-map-bytes must be a positive integer');
     }
+    // Same reason: a rejected value here would otherwise fall through to a ref parsed from
+    // the PR title, and the review would run against a DIFFERENT ticket than the one named.
+    if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) {
+      exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of DWLF-<n>)`);
+    }
 
     const local = options.local;
     let prNumber = 0;
@@ -2293,6 +2311,10 @@ arch
         ai,
         maxMapBytes: options.maxMapBytes ? Number(options.maxMapBytes) : undefined,
         ticketEnabled: options.ticket !== false,
+        // Rejected, not guessed: a bad value would otherwise fall through to a ref parsed
+        // from the title, and the operator would get a review against a DIFFERENT ticket
+        // than the one they named, with nothing said.
+
         ticketRef: typeof options.ticket === 'string' && /^\d+$/.test(options.ticket) ? Number(options.ticket) : undefined,
       });
     } catch (error: any) {
