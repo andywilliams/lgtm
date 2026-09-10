@@ -713,7 +713,11 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
-  // Auto-expand context if requested
+  // Auto-expand context if requested. Related files come back with absolute paths;
+  // everything downstream (the prompt heading and the session's file keys) uses the
+  // repo-relative form, so the same file is one identity in both.
+  const repoRootForKeys = getRepoRoot();
+  const relKey = (p: string) => (p.startsWith('/') && p.startsWith(repoRootForKeys) ? relative(repoRootForKeys, p) : p);
   let expandedContextStr = '';
   let expanded: { path: string; reason: string; content: string }[] = [];
   if (relatedFiles) {
@@ -734,8 +738,8 @@ async function runReview(options: RunOptions): Promise<void> {
       expandedContextStr = `\n## Expanded Context (Auto-discovered)\n`;
       expandedContextStr += `The following files were automatically discovered as relevant context:\n\n`;
       for (const file of expanded) {
-        log(chalk.gray(`   • ${file.path} (${file.reason})`));
-        expandedContextStr += `### ${file.path}\n`;
+        log(chalk.gray(`   • ${relKey(file.path)} (${file.reason})`));
+        expandedContextStr += `### ${relKey(file.path)}\n`;
         expandedContextStr += `_Reason: ${file.reason}_\n\n`;
         expandedContextStr += `\`\`\`\n${file.content}\n\`\`\`\n\n`;
         tokenEstimate += Math.ceil(file.content.length / 4);
@@ -799,9 +803,6 @@ async function runReview(options: RunOptions): Promise<void> {
   // related files too, so a newly discovered import is sent to a resumed session.
   // Related files come back with absolute paths; key them like the changed files (repo-relative)
   // or the same file is hashed twice and "changed" forever.
-  // getRepoRoot() falls back to cwd outside a checkout (`--repo owner/repo` from elsewhere); keys are then as given.
-  const repoRootForKeys = getRepoRoot();
-  const relKey = (p: string) => (p.startsWith('/') && p.startsWith(repoRootForKeys) ? relative(repoRootForKeys, p) : p);
   const contentsSeen: Record<string, string> = { ...(fileContents ?? {}) };
   for (const f of expanded) { const k = relKey(f.path); if (!(k in contentsSeen)) contentsSeen[k] = f.content; }
   // The stable prefix is fingerprinted like a file, under pseudo-paths: a charter edited
@@ -827,6 +828,10 @@ async function runReview(options: RunOptions): Promise<void> {
     if (ai === 'claude') setModelOverride(attempt.model);
     const session = attempt.fresh ? freshSession : sessionPlan;
     sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
+    // The first fresh attempt CREATES the session; a later rung must continue it, not
+    // pass --session-id again (the CLI refuses an id that already exists). It holds the
+    // full prompt from that first attempt, so the resume form is also the cheap one.
+    if (session && session === freshSession && !session.resume) freshSession!.resume = true;
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
       scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
       session: session ? { ...session, round: policy?.loopRound ?? 1 } : undefined,

@@ -390,7 +390,7 @@ function runClaude(prompt: string, opts: RunOptions): string {
   warnIfSettingsRoute(settings);
   if (!model && !announcedModel) {
     announcedModel = true;
-    process.stderr.write('lgtm: no model configured (LGTM_MODEL or ~/.claude/settings.json) — the claude CLI will pick its default.\n');
+    process.stderr.write('lgtm: no model configured — the claude CLI picks its default, and lgtm cannot tell when you change it (a loop session opened on the old one would then review with a cold cache). Set LGTM_MODEL, or "model" in ~/.claude/settings.json, to pin it.\n');
   }
   const args = claudePrintArgs(model, effort, settingSources(), opts.schema, opts.session);
   try {

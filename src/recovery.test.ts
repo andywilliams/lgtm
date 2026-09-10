@@ -47,7 +47,7 @@ test('when the policy chose the cheaper model and the schema retry also fails, t
   const { choice } = await h.run(cheaper);
   assert.equal(choice.model, undefined);
   assert.match(choice.reason, /fell back to the full model/);
-  assert.deepEqual(h.attempts[2], { enforceSchema: true, model: undefined });
+  assert.deepEqual(h.attempts[2], { enforceSchema: true, model: undefined, fresh: true });
   assert.deepEqual(h.failed.map((f) => f.model), ['claude-sonnet-5', 'claude-sonnet-5'], 'both failed attempts name the model that failed');
 });
 
@@ -55,7 +55,7 @@ test('a non-parse failure of the cheaper model skips the schema rung and goes st
   const h = harness([new Error('model not available in this region'), ok]);
   const { choice } = await h.run(cheaper);
   assert.equal(choice.model, undefined);
-  assert.deepEqual(h.attempts, [{ model: 'claude-sonnet-5' }, { enforceSchema: true, model: undefined }]);
+  assert.deepEqual(h.attempts, [{ model: 'claude-sonnet-5' }, { enforceSchema: true, model: undefined, fresh: true }]);
 });
 
 test('a failure on the operator\'s own model is logged and rethrown — nothing cheaper was chosen', async () => {
@@ -92,4 +92,32 @@ test('when the fresh session also fails, the error that surfaces is the latest o
   const h = harness([new Error('No conversation found with session ID'), new Error('529 overloaded on the fresh call')], true);
   await assert.rejects(() => h.run(full), /529 overloaded/);
   assert.equal(h.failed.length, 2);
+});
+
+test('every fresh rung after the first continues the session the first one created', async () => {
+  // Mirrors runReview's `review` closure: one fresh session, created once then resumed.
+  const freshSession = { id: 'fresh-1', resume: false };
+  const seen: Array<{ id: string; resume: boolean }> = [];
+  const script: Array<Error | typeof ok> = [new Error('No conversation found with session ID'), parseError(), ok];
+  const review = async (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean }) => {
+    const session = attempt.fresh ? freshSession : { id: 'loop-1', resume: true };
+    seen.push({ ...session });
+    if (session === freshSession && !session.resume) freshSession.resume = true;
+    const next = script.shift();
+    if (next instanceof Error) throw next;
+    return next ?? ok;
+  };
+  await reviewWithRecovery({ review, ai: 'claude', choice: full, initialChoice: full, resuming: true, logFailedRound: () => {}, say: () => {} });
+  assert.deepEqual(seen, [
+    { id: 'loop-1', resume: true },    // the loop's session — not found
+    { id: 'fresh-1', resume: false },  // created by the freshen rung
+    { id: 'fresh-1', resume: true },   // the schema rung continues it, never re-creates it
+  ]);
+});
+
+test('the full-model fallback always opens its own session — a cheaper session\'s cache is model-scoped', async () => {
+  const h = harness([parseError(), parseError(), ok]);
+  const { choice } = await h.run(cheaper);
+  assert.equal(choice.model, undefined);
+  assert.equal(h.attempts[2].fresh, true, 'the fallback rung is fresh');
 });

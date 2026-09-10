@@ -213,8 +213,17 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
     // No role recorded (a row from before the column existed) ⇒ null; planSession then
     // opens a new session rather than guess from the reported id's family name.
-    // context_tokens is the last call's prompt; older rows only have the summed prompt_tokens.
-    session = { id: sessionRow.session_id, model: modelRow?.model_id ?? null, role: roleRow?.model_role ?? null, fileShas, lastPromptTokens: sessionRow.context_tokens ?? sessionRow.prompt_tokens };
+    // context_tokens is the last call's prompt (older rows only carry the summed
+    // prompt_tokens); an unmeasured or failed round records neither, so the budget reads
+    // the latest round of this session that measured anything.
+    const ctxRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && (r.context_tokens ?? r.prompt_tokens) !== null);
+    session = {
+      id: sessionRow.session_id,
+      model: modelRow?.model_id ?? null,
+      role: roleRow?.model_role ?? null,
+      fileShas,
+      lastPromptTokens: ctxRow ? ctxRow.context_tokens ?? ctxRow.prompt_tokens : null,
+    };
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(

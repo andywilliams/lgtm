@@ -61,7 +61,10 @@ export async function reviewWithRecovery(opts: {
   choice = { model: undefined, source: 'policy', reason: `fell back to the full model after ${choice.model} produced no usable review (${lastError?.message ?? lastError}; ${initialChoice.reason})` };
   say(`↺  ${choice.reason}`);
   try {
-    return { result: await review({ enforceSchema: true, model: undefined, ...(freshened ? { fresh: true } : {}) }), choice, freshened };
+    // A new session for the full model: the existing one's transcript was created under
+    // the cheaper model, and the prompt cache is model-scoped.
+    freshened = true;
+    return { result: await review({ enforceSchema: true, model: undefined, fresh: true }), choice, freshened };
   } catch (e3: any) {
     logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
     throw e3;
