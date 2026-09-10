@@ -46,15 +46,36 @@ describe('repository map', () => {
 });
 
 describe('repository map: what it refuses to guess', () => {
-  it('names how many directories it left out, so absence is never evidence', () => {
-    const files = Array.from({ length: 60 }, (_, i) => `dir${i}/file.ts`);
-    const { block } = buildRepoMap(process.cwd());
-    assert.ok(/\d+ tracked files, \d+ directories/.test(block), block.slice(0, 120));
-    // The caveat covers directories, not just files — a 40-dir cap drops the rest.
-    assert.ok(/absence of a file, or of a directory, is not evidence/.test(block));
-    const census = directoryCensus(files);
-    assert.equal(census.length, 40, 'capped');
-    assert.equal(new Set(files.map((f) => f.split('/')[0])).size, 60, 'but the true count is reported in the header');
+  it('names how many directories it left out, so absence is never evidence', async () => {
+    // A repo with more directories than the census shows — the branch the caveat exists
+    // for. Built for real, so a regression in the header or the caveat fails this test.
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
+    const { execFileSync } = await import('node:child_process');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-map-big-'));
+    try {
+      execFileSync('git', ['-C', dir, 'init', '-q'], { stdio: 'ignore' });
+      for (let i = 0; i < 50; i++) {
+        mkdirSync(join(dir, `d${i}`));
+        writeFileSync(join(dir, `d${i}`, 'f.ts'), 'export const a = 1;\n');
+      }
+      execFileSync('git', ['-C', dir, 'add', '-A'], { stdio: 'ignore' });
+      const { block } = buildRepoMap(dir, 100_000);
+      assert.ok(block.includes('50 tracked files, 50 directories, 40 largest shown'), block.slice(0, 200));
+      assert.ok(block.includes('10 smaller directories are not listed'), block.slice(0, 400));
+      assert.ok(/absence of a file, or of a directory, is not evidence/.test(block));
+      assert.equal((block.match(/^- /gm) ?? []).length, 40, 'the census itself is capped');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('says every directory is listed when none were dropped', () => {
+    const { block } = buildRepoMap(process.cwd(), 100_000);
+    const capped = block.includes('largest shown');
+    assert.equal(capped, false, 'this repo has fewer than 40 directories');
+    assert.ok(block.includes('every directory is listed'));
   });
 
   it('renders a string or array exports field without character indices', async () => {

@@ -31,13 +31,21 @@ function trackedFiles(repoRoot: string): string[] | null {
   }
 }
 
+/**
+ * Which directory a file is counted under: two levels, because `src/services` tells you
+ * where handlers live and `src` alone does not. One definition — the census and the
+ * "how many were left out" count must never disagree about what a directory is.
+ */
+function directoryKey(file: string): string {
+  const parts = file.split('/');
+  return parts.length === 1 ? '(root)' : parts.slice(0, Math.min(2, parts.length - 1)).join('/');
+}
+
 /** Directory census, two levels deep, biggest first — the shape a placement claim needs. */
 export function directoryCensus(files: string[], maxDirs = 40): { dir: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const f of files) {
-    const parts = f.split('/');
-    // Two levels: `src/services` tells you where handlers live; `src` alone does not.
-    const dir = parts.length === 1 ? '(root)' : parts.slice(0, Math.min(2, parts.length - 1)).join('/');
+    const dir = directoryKey(f);
     counts.set(dir, (counts.get(dir) ?? 0) + 1);
   }
   return [...counts.entries()]
@@ -46,12 +54,9 @@ export function directoryCensus(files: string[], maxDirs = 40): { dir: string; c
     .slice(0, maxDirs);
 }
 
-/** How many distinct two-level directories the repo has, so the caveat can be exact. */
+/** How many distinct directories the repo has, so the caveat can be exact. */
 export function directoryCount(files: string[]): number {
-  return new Set(files.map((f) => {
-    const parts = f.split('/');
-    return parts.length === 1 ? '(root)' : parts.slice(0, Math.min(2, parts.length - 1)).join('/');
-  })).size;
+  return new Set(files.map(directoryKey)).size;
 }
 
 /** What this package exposes — the interface a placement decision is judged against. */
