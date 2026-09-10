@@ -74,14 +74,21 @@ function stats(values: number[]): Stats {
 const LINT_PROBE_TIMEOUT_MS = 60_000;
 
 /**
- * What the target repo's ESLint made of the fragment we just wrote it.
+ * What the target repo's ESLint made of the directory we just wrote the fragment into.
  *  - `ok`        — it lints clean; nothing to say.
- *  - `problems`  — it reports lint findings IN the fragment. Odd for generated code, but
- *                  survivable: `eslint .` exits 1 and CI goes red, which the operator wants to know.
- *  - `broken`    — ESLint could not lint the file at all (exit ≥ 2). This is the one that
- *                  matters: a typed config applies typed rules to a `.js` file in no tsconfig
- *                  project, every rule throws, and `eslint .` takes the whole lint down with it.
- *  - `skipped`   — no resolvable ESLint here, so there is nothing to break.
+ *  - `problems`  — it reported lint findings (exit 1). `eslint .` goes red, which the
+ *                  operator wants to know. `namesFragment` says whether the output points
+ *                  at our file or at a neighbour in the same directory.
+ *  - `broken`    — ESLint could not lint at all (exit ≥ 2). The case this check exists for:
+ *                  a typed config applies typed rules to a `.js` file in no tsconfig project,
+ *                  every rule throws, and `eslint .` takes the whole lint down. `namesFragment`
+ *                  false means their lint fails for a reason that may predate this file.
+ *  - `skipped`   — no verdict was reached, for one of five reasons, and the reason says
+ *                  what follows from it. Only ONE of them ("no ESLint configured in this
+ *                  repo") means there is nothing here to break; the others — a preview-run
+ *                  fragment written outside the repo, ESLint configured with no local binary
+ *                  to run it, a timeout, a binary that would not start — leave the question
+ *                  open, and saying otherwise is the reassurance this check exists to stop.
  */
 export type FragmentLintResult =
   | { status: 'ok' }
