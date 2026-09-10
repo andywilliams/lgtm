@@ -1,17 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AIProvider, RoundModelChoice } from './ai.js';
+import { resolveModel, type AIProvider, type RoundModelChoice } from './ai.js';
 import type { LoopSession } from './db.js';
 
 /**
- * What a round ASKED the CLI for, as a comparable string: 'full' (the operator's
- * default model), 'late:<id>' (the round policy's cheaper model) or 'explicit:<id>'
- * (--model). Compared instead of the CLI-reported id, because settings may name the
- * default as an alias ('opus', 'opusplan') and the envelope reports the real id.
+ * What a round ASKED the CLI for, as a comparable string: 'full:<id>' (the operator's
+ * default model, named), 'late:<id>' (the round policy's cheaper model) or
+ * 'explicit:<id>' (--model). Compared instead of the CLI-reported id, because settings
+ * may name the default as an alias ('opus', 'opusplan') and the envelope reports the
+ * real id. The full model is NAMED rather than left implicit so that changing the
+ * operator's default mid-loop restarts the session: the prompt cache is model-scoped,
+ * and a resumed session on another model would replay its whole context uncached.
  */
-export function modelRoleOf(choice: RoundModelChoice): string {
-  if (choice.source === 'explicit' && choice.model) return `explicit:${choice.model.replace(/\[.*\]$/, '')}`;
-  if (choice.model) return `late:${choice.model.replace(/\[.*\]$/, '')}`;
-  return 'full';
+export function modelRoleOf(choice: RoundModelChoice, fullModel: string | undefined = resolveModel()): string {
+  const bare = (id: string) => id.replace(/\[.*\]$/, '');
+  if (choice.source === 'explicit' && choice.model) return `explicit:${bare(choice.model)}`;
+  if (choice.model) return `late:${bare(choice.model)}`;
+  return `full:${fullModel ? bare(fullModel) : 'cli-default'}`;
 }
 
 /** Pseudo-path under which the reviewer's own system prompt is fingerprinted; a change restarts the session. */
@@ -54,6 +58,8 @@ export function planSession(input: {
   fresh?: boolean;
   choice: RoundModelChoice;
   newId?: () => string;
+  /** The operator's default model; defaults to the resolved one. */
+  fullModel?: string;
 }): SessionPlan {
   const { prior, contents, ai, fresh, choice, newId = randomUUID } = input;
   const fileShas: Record<string, string> = {};
@@ -61,10 +67,15 @@ export function planSession(input: {
   const sessionsOff = (process.env.LGTM_SESSIONS ?? '').toLowerCase() === 'off';
   if (sessionsOff || ai !== 'claude') return { fileShas, session: null, choice };
 
-  const wanted = modelRoleOf(choice);
+  const fullModel = 'fullModel' in input ? input.fullModel : undefined;
+  const wanted = modelRoleOf(choice, fullModel);
+  // The role this round would have used had the policy not gone cheaper.
+  const fullRole = modelRoleOf({ model: undefined, source: 'policy', reason: '' }, fullModel);
   const sessionRole = prior?.role ?? null;
   const sameRole = sessionRole === wanted;
-  const fullBeatsCheaper = sessionRole === 'full' && wanted.startsWith('late:');
+  // A full-model session carries a round that would merely have gone cheaper — but only
+  // while it is the SAME full model; a changed default is a different cache.
+  const fullBeatsCheaper = sessionRole === fullRole && wanted.startsWith('late:');
   // The reviewer's own rules changed (lgtm upgraded mid-loop): the session's earlier
   // instructions would contradict this round's — start over.
   const rulesChanged = Boolean(prior && SYSTEM_PROMPT_KEY in fileShas && prior.fileShas[SYSTEM_PROMPT_KEY] !== undefined && prior.fileShas[SYSTEM_PROMPT_KEY] !== fileShas[SYSTEM_PROMPT_KEY]);
