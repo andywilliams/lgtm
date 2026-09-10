@@ -15,6 +15,7 @@ import { runStandardsInit } from './standardsInterview.js';
 import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
+import { buildRepoMap } from './repoMap.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -1855,6 +1856,8 @@ function formatArchAgentResult(opts: {
   charterPath?: string;
   charterSource?: string;
   systemPath?: string;
+  /** Whether the review was grounded by a repository map — structured, not only prose in skipped_checks. */
+  repoMap?: { present: boolean; truncated: boolean };
   error?: string;
 }): string {
   const r = opts.result;
@@ -1871,6 +1874,7 @@ function formatArchAgentResult(opts: {
       charter: opts.charterPath ?? null,
       charterSource: opts.charterSource ?? null,
       system: opts.systemPath ?? null,
+      repoMap: opts.repoMap ?? { present: false, truncated: false },
     },
     ...(opts.error ? { error: opts.error } : {}),
   });
@@ -1913,6 +1917,8 @@ interface ArchRunOptions {
   dryRun: boolean;
   fullContext: boolean;
   ai: AIProvider;
+  /** Cap on the repository-map block; undefined uses the module default. */
+  maxMapBytes?: number;
 }
 
 async function runArchReview(options: ArchRunOptions): Promise<void> {
@@ -1953,6 +1959,13 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   }
   if (archCtx.systemPath) log(chalk.blue(`🗺  System doc: ${archCtx.systemPath}`));
 
+  // A directory census, so placement and pattern claims can be COUNTED rather than felt.
+  // Only for the repo under review: charterRepoRoot returns null when --repo names another
+  // repository, and mapping the cwd checkout there would describe the wrong codebase.
+  const repoMap = repoRoot ? buildRepoMap(repoRoot, options.maxMapBytes) : { block: '', truncated: false };
+  if (repoMap.block) log(chalk.blue(`🧭 Repository map${repoMap.truncated ? ' (truncated)' : ''}`));
+  else log(chalk.yellow(`🧭 No repository map${repoRoot ? '' : ' (--repo names a repository this checkout is not)'} — placement and pattern counts will be skipped`));
+
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
 
@@ -1961,6 +1974,8 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   const result = await archReview(truncatedDiff, pr.title, pr.body, ai, {
     charterBlock: archCtx.charterBlock,
     systemBlock: archCtx.systemBlock,
+    repoMapBlock: repoMap.block,
+    repoMapTruncated: repoMap.truncated,
     handbookBlock,
     fileContents,
   });
@@ -1972,6 +1987,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
       charterPath: archCtx.charterPath,
       charterSource: archCtx.charterSource,
       systemPath: archCtx.systemPath,
+      repoMap: { present: Boolean(repoMap.block), truncated: repoMap.truncated },
     }));
     return;
   }
@@ -2017,6 +2033,7 @@ arch
   .option('--full-context', 'Include full contents of changed files (always on in agent mode)', false)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('--model <id>', 'Model to review with (default: your settings model)')
+  .option('--max-map-bytes <n>', 'Cap the repository map block (default 8000 bytes)')
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
     function exitWithError(message: string): never {
@@ -2029,6 +2046,10 @@ arch
     }
     if (options.model) {
       try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
+    }
+    // Number('abc') is NaN and would silently disable the cap; reject rather than guess.
+    if (options.maxMapBytes !== undefined && (!/^\d+$/.test(String(options.maxMapBytes).trim()) || Number(options.maxMapBytes) < 1)) {
+      exitWithError('--max-map-bytes must be a positive integer');
     }
 
     const local = options.local;
@@ -2060,6 +2081,7 @@ arch
         dryRun: options.dryRun,
         fullContext: options.fullContext,
         ai,
+        maxMapBytes: options.maxMapBytes ? Number(options.maxMapBytes) : undefined,
       });
     } catch (error: any) {
       exitWithError(error?.message ?? String(error));

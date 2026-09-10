@@ -38,7 +38,7 @@ What to look for, ranked by value:
 
 AUTHORITY — the rule that matters most. Every decision must declare its "authority" rung:
 - "charter" — you can cite a specific line of the Architecture Charter or System Architecture Context provided below. Quote it in the evidence. Be assertive.
-- "codebase-pattern" — you can cite an observed, COUNTED fact from the provided context ("6 of 7 handlers do X; this doesn't"). State the count. If you cannot count it, this is not your rung.
+- "codebase-pattern" — you can cite an observed, COUNTED fact from the provided context ("6 of 7 handlers do X; this doesn't"; "11 files live under src/handlers/, this one is under src/services/"). The Repository map below is a countable source for placement and for where a kind of file lives; the file contents are countable for what the code does. State the count and where you got it. If you cannot count it, this is not your rung.
 - "diff-evidence" — the evidence is in the change itself, but the CONSEQUENCE is deduced. State the evidence assertively; phrase the consequence as a question.
 - "judgement" — generic engineering opinion with no authority in this repo. Phrase the whole finding as a question ("what made X right here?"). Never say "violates", "should", "convention", or "standard".
 
@@ -78,6 +78,10 @@ If there are no architectural decisions in this change:
 export interface ArchReviewContext {
   /** Prompt-ready charter block from charter.ts (may be ''). */
   charterBlock?: string;
+  /** Directory census + entry points, so placement and pattern claims can be counted (may be ''). */
+  repoMapBlock?: string;
+  /** True when the map above was cut short — the reviewer must not read absence as evidence. */
+  repoMapTruncated?: boolean;
   /** Prompt-ready system block from charter.ts (may be ''). */
   systemBlock?: string;
   /** Optional descriptive handbook context from the second brain (may be ''). */
@@ -114,7 +118,7 @@ export async function archReview(
   // Stable-first for the prompt cache: system prompt, charter, system doc, handbook and
   // the changed files' contents before the diff and title, which change every round.
   const prompt = `${ARCH_SYSTEM_PROMPT}
-${context.charterBlock || ''}${context.systemBlock || ''}${context.handbookBlock || ''}${fileContextSection}
+${context.charterBlock || ''}${context.systemBlock || ''}${context.repoMapBlock || ''}${context.handbookBlock || ''}${fileContextSection}
 ## Change title
 ${title}
 
@@ -130,13 +134,19 @@ ${ARCH_OUTPUT_FORMAT}`;
 
   const output = runAIPrompt(prompt, ai, 'arch');
   const result = parseArchResponse(output);
-  return enforceSkippedChecks(result, Boolean(context.charterBlock), Boolean(context.systemBlock));
+  return enforceSkippedChecks(result, {
+    charter: Boolean(context.charterBlock),
+    system: Boolean(context.systemBlock),
+    map: context.repoMapBlock ? (context.repoMapTruncated ? 'truncated' : true) : false,
+  });
 }
 
 // "no charter RESOLVABLE", not "repo has none" — with --repo pointing away from the
 // cwd checkout the target repo may well have a charter lgtm never looked at.
 const CHARTER_SKIP = 'charter-grounded checks — no charter resolvable';
 const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
+const MAP_SKIP = 'placement and codebase-pattern counts — no repository map (not a git checkout, or it could not be listed)';
+const MAP_TRUNCATED = 'placement and codebase-pattern counts — the repository map was TRUNCATED, so a directory missing from it may still exist';
 
 /**
  * The skipped_checks honesty contract is enforced from ground truth, not model
@@ -144,11 +154,19 @@ const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
  * canonical entries are set here (and the model's own phrasings of them dropped).
  * Exported for tests.
  */
-export function enforceSkippedChecks(result: ArchResult, hasCharter: boolean, hasSystem: boolean): ArchResult {
-  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit/i.test(s));
+export interface ContextPresence {
+  charter: boolean;
+  system: boolean;
+  /** false when no map could be built; 'truncated' when only part of one was shown. */
+  map: boolean | 'truncated';
+}
+
+export function enforceSkippedChecks(result: ArchResult, present: ContextPresence): ArchResult {
+  const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map/i.test(s));
   const canonical = [
-    ...(hasCharter ? [] : [CHARTER_SKIP]),
-    ...(hasSystem ? [] : [SYSTEM_SKIP]),
+    ...(present.charter ? [] : [CHARTER_SKIP]),
+    ...(present.system ? [] : [SYSTEM_SKIP]),
+    ...(present.map === true ? [] : [present.map === 'truncated' ? MAP_TRUNCATED : MAP_SKIP]),
   ];
   result.skipped_checks = [...canonical, ...rest];
   return result;
