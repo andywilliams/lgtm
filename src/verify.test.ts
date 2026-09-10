@@ -254,6 +254,19 @@ describe('buildVerifyPrompt', () => {
     assert.match(buildVerifyPrompt({ diff: 'd', prTitle: 'T', findings: [f], docs: 'DOC', docsPresent: ['standard'] }), /judge it against that document, which is above/);
   });
 
+  test('an unsent document protects only findings WITHIN the cap', () => {
+    // Otherwise "the document was not resolvable" is a route to unlimited undroppable
+    // opinions — in most repos, since most resolve no ticket board and many no STANDARDS.md
+    // — and it is exactly where the tag is least trustworthy, because the reviewer was never
+    // given the block that asks for those findings.
+    const many = Array.from({ length: 5 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(standard FUN-${i}) too long`, file: 'src/a.ts' }));
+    const unproven = Object.fromEntries(many.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    const noStandards = { shown: new Set(['src/a.ts']), inDiff: new Set<string>(), docs: new Set<DocumentCited>(['charter']), text: '' };
+    const out = applyVerdicts(many, unproven, noStandards, { 'src/a.ts': 'x' });
+    assert.equal(out.filter((c) => !c.verifier_dropped).length, DOC_TAG_EXEMPT.standard);
+    assert.equal(dropped(out).length, 2, 'the two past the cap are ordinary opinions');
+  });
+
   test('a verdict about a document that was not sent is rewritten to "unshown" in code', () => {
     // The file equivalent has always been the caller's decision; prose alone made this one
     // weakest on the small or other-family models the pass recommends for decorrelation.

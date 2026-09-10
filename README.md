@@ -699,6 +699,7 @@ On success:
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
       "suggestion": "if (!input) return null;",
+      "cites": null,
       "verdict": "confirmed",
       "verifier_note": "parse() is called with the raw header on line 40",
       "dropped": false

@@ -40,11 +40,11 @@ export interface ReviewComment {
   /** Stable identity across rounds: the symbol or construct at fault, not the line. */
   fingerprint?: string;
   /**
-   * The DOCUMENT this finding is a conformance claim against, rather than the code. It is
-   * what the verifier's drop exemption keys on, so it is a declared field rather than a
-   * convention read back out of the title — a control-flow decision should not depend on
-   * how a model chose to phrase a heading. Derived from the title prefix when absent, so
-   * codex (which gets no schema) and rows written before this field still work.
+   * The DOCUMENT this finding is a conformance claim against, rather than the code — what
+   * the verifier's drop exemption keys on. A declared field rather than a convention read
+   * back out of a heading, but see `citedDocument`: a title prefix, when there is one, wins
+   * over this, because the prefix is what every human surface shows and the filter must not
+   * act on a different document from the one the reader is told about.
    */
   cites?: DocumentCited;
   // --- set by the verifier pass, never by the reviewer (src/verify.ts) ---

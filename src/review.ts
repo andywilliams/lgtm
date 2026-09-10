@@ -657,20 +657,22 @@ const CITED = new Map<string, DocumentCited>([
 ]);
 
 /**
- * What document a finding cites: its declared `cites` if it gave one, else the title prefix
- * it was told to write. Both are the model's word, but the field is a closed enum the schema
- * can enforce, and the prefix is free text that must survive rendering — so the field is
- * preferred and the prefix is the fallback that keeps codex and older rows working.
+ * What document a finding is a conformance claim against: the TITLE PREFIX when it has one,
+ * else the declared `cites` field.
+ *
+ * That precedence looks backwards for a field that exists to replace a convention, and it is
+ * deliberate. The prefix is what every human surface renders, and the same answer decides
+ * whether the verifier may delete the finding — so if the two ever disagree, the filter must
+ * act on the document the reader was told about, not a different one. The field earns its
+ * place by covering the case the prefix cannot: a finding that declares its document without
+ * spelling it in its heading. Either alone is honoured as given, which is what keeps codex
+ * (no schema) and rows written before the field working.
  */
 export function citedDocument(comment: { cites?: unknown; title?: string }): DocumentCited | undefined {
   const declared = typeof comment.cites === 'string' ? CITED.get(comment.cites.toLowerCase()) : undefined;
   const m = String(comment.title ?? '').match(/^\((charter|standards?|ticket)\b/i);
   const tagged = m ? CITED.get(m[1].toLowerCase()) : undefined;
-  // When the two disagree, the TITLE wins: it is what every human surface shows, and the
-  // filter must not act on a different document from the one the reader is told about.
-  // A prefix with no field, or a field with no prefix, is honoured as given.
-  if (tagged && declared && tagged !== declared) return tagged;
-  return declared ?? tagged;
+  return tagged ?? declared;
 }
 
 function normalizeComment(comment: any): ReviewComment {

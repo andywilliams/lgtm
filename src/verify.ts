@@ -270,10 +270,9 @@ export function citesDoc(f: ReviewComment): boolean {
 
 
 /**
- * The document this finding cites, from its DECLARED field — a closed enum the reply schema
- * enforces — falling back to the title prefix for codex (which gets no schema) and for rows
- * written before the field existed. The exemption below is control flow, and control flow
- * should not turn on how a model chose to phrase a heading.
+ * The document this finding cites — the title prefix when it has one, else the declared
+ * `cites` field. See `citedDocument`: the field is what a schema can constrain, the prefix
+ * is what every human surface shows, and when they disagree the shown one wins.
  */
 export function docTagOf(f: ReviewComment): DocumentCited | null {
   return citedDocument(f) ?? null;
@@ -412,12 +411,6 @@ export interface ShownContext {
  * on it, which errs towards keeping a finding rather than dropping one.
  */
 export function wasShown(f: ReviewComment, ctx: ShownContext, contents: Record<string, string> = {}): boolean {
-  // A conformance claim turns on its DOCUMENT, not on the file it is anchored in. The caller
-  // resolved those documents and knows exactly which it sent, so the same rule applies: a
-  // verdict about one that was not sent is a verdict about nothing. Prose said this per
-  // finding; the file equivalent has always been the caller's decision, and so is this.
-  const cites = citedDocument(f);
-  if (cites && ctx.docs && !ctx.docs.has(cites)) return false;
   const have = (path: string) => ctx.shown.has(path) || ctx.inDiff.has(path);
   if (!have(f.file)) return false;
   const keys = Object.keys(contents).filter((k) => !k.startsWith('@'));
@@ -429,6 +422,19 @@ export function wasShown(f: ReviewComment, ctx: ShownContext, contents: Record<s
     if (resolved && !have(resolved)) return false;
   }
   return true;
+}
+
+/**
+ * Was the DOCUMENT a conformance claim cites put in front of the verifier? Kept separate
+ * from `wasShown` because it is gated on the exemption cap: a finding past its document's
+ * cap is an ordinary opinion, and handing it `unshown` would make "the document was not
+ * resolvable" a route to unlimited undroppable findings — which is precisely the switch the
+ * cap exists to prevent, and worst in the repos where the tag is least trustworthy, since
+ * the reviewer was never given the block that asks for those findings.
+ */
+export function citedDocShown(f: ReviewComment, ctx: ShownContext): boolean {
+  const cites = citedDocument(f);
+  return !cites || !ctx.docs || ctx.docs.has(cites);
 }
 
 export interface Verdicts {
@@ -485,13 +491,16 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
-    // The exemption is spent per tag, in the order the reviewer listed the findings.
+    // The exemption is spent per tag, in the order the reviewer listed the findings — and
+    // spent BEFORE the document rewrite below, so that neither protection can be reached
+    // without consuming a slot.
     const tag = docTagOf(f);
     let exempt = false;
     if (tag) {
       const used = usedExemption[tag] ?? 0;
       if (used < DOC_TAG_EXEMPT[tag]) { usedExemption[tag] = used + 1; exempt = true; }
     }
+    if (exempt && ctx && verdict !== 'unverified' && verdict !== 'unshown' && !citedDocShown(f, ctx)) verdict = 'unshown';
     const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !exempt);
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)

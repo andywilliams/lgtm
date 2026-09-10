@@ -81,13 +81,15 @@ it('prompt v2: kind, confidence, evidence and fingerprint survive parsing, with 
 
 
 describe("citedDocument", () => {
-  it("prefers the declared field, falls back to the title prefix, and normalises both spellings", () => {
-    assert.equal(citedDocument({ cites: "ticket", title: "anything at all" }), "ticket");
+  it("takes the title prefix when there is one, else the declared field, and normalises both spellings", () => {
+    assert.equal(citedDocument({ cites: "ticket", title: "anything at all" }), "ticket", "the field covers a finding with no prefix");
     assert.equal(citedDocument({ cites: "standards", title: "x" }), "standard", "either spelling of the middle one");
     assert.equal(citedDocument({ cites: "STANDARD", title: "x" }), "standard");
     assert.equal(citedDocument({ title: "(standard FUN-1) too long" }), "standard", "the prefix still works for codex");
     assert.equal(citedDocument({ title: "(charter) drifted" }), "charter");
     assert.equal(citedDocument({ cites: "nonsense", title: "(ticket) x" }), "ticket", "a junk field falls through to the prefix");
+    // The reader sees "(charter)"; the filter must not be acting on the ticket's slot.
+    assert.equal(citedDocument({ cites: "ticket", title: "(charter) drifted" }), "charter", "on disagreement, what is SHOWN wins");
     assert.equal(citedDocument({ title: "(out of scope) x" }), undefined);
     assert.equal(citedDocument({}), undefined);
   });

@@ -546,7 +546,9 @@ function formatAgentResult(options: {
       severity: c.severity,
       title: c.title,
       body: c.body,
-      suggestion: c.suggestion,
+      // `?? null` like every other optional here: an undefined value drops the key entirely,
+      // and a consumer reading the documented shape would find the field simply missing.
+      suggestion: c.suggestion ?? null,
       fingerprint: c.fingerprint ?? null,
       cites: c.cites ?? null,
       duplicate: c.duplicate,
