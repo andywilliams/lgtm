@@ -25,6 +25,9 @@ export async function reviewWithRecovery(opts: {
   const { review, ai, initialChoice, resuming, logFailedRound, say } = opts;
   let { choice } = opts;
   const isParseFailure = (e: any) => /parse review response/i.test(e?.message ?? '');
+  // A timeout is never retried, whichever rung hit it: each one would spend the same
+  // budget again, turning one 15-minute wait into three quarters of an hour.
+  const refuseTimeout = (e: any) => { if (e instanceof TimeoutError || e?.name === 'TimeoutError') throw e; };
   const policyPickedCheaper = () => choice.source === 'policy' && choice.model !== undefined;
   let lastError: any;
   let freshened = false;
@@ -36,9 +39,7 @@ export async function reviewWithRecovery(opts: {
   } catch (e: any) {
     logFailedRound(e?.message ?? String(e), choice);
     lastError = e;
-    // A timeout is never retried: every rung would spend the same budget again, turning
-    // one 15-minute wait into three. Its message already names the levers.
-    if (e instanceof TimeoutError || e?.name === 'TimeoutError') throw e;
+    refuseTimeout(e);
     if (ai !== 'claude' || /^LGTM_NO_CALL/.test(e?.message ?? '')) throw e; // the debugging sentinel is never recovered
     // A resumed session can be gone (transcript deleted, another machine, CLI upgrade):
     // one fresh full round on the same model before any other rung.
@@ -50,6 +51,7 @@ export async function reviewWithRecovery(opts: {
         return { result: await review({ model: choice.model, fresh: 'session-lost' }), choice, freshened, freshReason };
       } catch (e2: any) {
         logFailedRound(`fresh session failed: ${e2?.message ?? String(e2)}`, choice);
+        refuseTimeout(e2);
         lastError = e2;
       }
     }
@@ -62,6 +64,7 @@ export async function reviewWithRecovery(opts: {
       return { result: await review({ enforceSchema: true, model: choice.model, ...(freshened ? { fresh: 'session-lost' } : {}) }), choice, freshened, freshReason };
     } catch (e2: any) {
       logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
+      refuseTimeout(e2);
       lastError = e2;
       if (!policyPickedCheaper()) throw e2;
     }

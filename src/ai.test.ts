@@ -278,3 +278,19 @@ test('timeoutMs: a positive override wins, anything else falls back to the defau
     if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
   }
 });
+
+test('isTimeout: a killed child is ours only if the wait actually elapsed', async () => {
+  const { isTimeout } = await import('./ai.js');
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  try {
+    process.env.LGTM_TIMEOUT_MS = '1000';
+    const started = 10_000;
+    const killed = { killed: true, signal: 'SIGTERM' };
+    assert.equal(isTimeout(killed, started, started + 1000), true, 'killed at the limit');
+    assert.equal(isTimeout({ code: 'ETIMEDOUT' }, started, started + 950), true, 'ETIMEDOUT just inside the tolerance');
+    assert.equal(isTimeout(killed, started, started + 200), false, 'a Ctrl-C two hundred ms in is not our timeout');
+    assert.equal(isTimeout({ status: 1 }, started, started + 5000), false, 'a plain failure is not a timeout, however long it took');
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
+});

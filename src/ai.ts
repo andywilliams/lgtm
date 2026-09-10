@@ -124,11 +124,14 @@ export class TimeoutError extends Error {
 }
 
 /**
- * Did this failure come from our own timeout? Node reports a killed child by signal, and
- * a signal alone would also match an operator's Ctrl-C — so the elapsed time decides.
+ * Did this failure come from our own timeout? `execFileSync` reports the child it killed
+ * as `killed: true` with `signal: 'SIGTERM'` (and `code: 'ETIMEDOUT'` on some paths), but
+ * an operator's Ctrl-C looks the same — so the elapsed time is what separates them.
+ * Exported for tests: this predicate decides whether a wait is retried, and it is not
+ * something a live run can be made to exercise on demand.
  */
-function isTimeout(error: any, startedAt: number): boolean {
-  const elapsed = Date.now() - startedAt;
+export function isTimeout(error: any, startedAt: number, now = Date.now()): boolean {
+  const elapsed = now - startedAt;
   const killed = error?.code === 'ETIMEDOUT' || error?.killed === true || error?.signal === 'SIGTERM';
   return killed && elapsed >= timeoutMs() * 0.9;
 }
@@ -143,6 +146,7 @@ function timeoutError(prompt: string, what: string): TimeoutError {
   );
 }
 
+// Anthropic ids, the [1m] suffix, Vertex `@date` ids and Bedrock ARNs (`/`, `:`).
 const MODEL_ID = /^[\w.:@\/\-\[\]]+$/;
 
 // A per-process model override — set from `--model` or the round policy — outranks
@@ -371,9 +375,12 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
   return { text, usage };
 }
 
+/** A version probe is a diagnosis, not work: it never gets more than a few seconds. */
+const PROBE_TIMEOUT_MS = 10_000;
+
 export function checkClaudeCli(): boolean {
   try {
-    execSync('claude --version', { stdio: 'pipe' });
+    execSync('claude --version', { stdio: 'pipe', timeout: PROBE_TIMEOUT_MS });
     return true;
   } catch {
     return false;
@@ -382,7 +389,7 @@ export function checkClaudeCli(): boolean {
 
 export function checkCodexCli(): boolean {
   try {
-    execSync('codex --version', { stdio: 'pipe' });
+    execSync('codex --version', { stdio: 'pipe', timeout: PROBE_TIMEOUT_MS });
     return true;
   } catch {
     return false;
@@ -517,6 +524,8 @@ export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', op
   try {
     return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {
+    // A timeout already knows what it is; do not probe the CLI to diagnose it.
+    if (error instanceof TimeoutError) throw error;
     // Only claim "CLI not found" when the binary genuinely isn't runnable NOW —
     // message-sniffing ('not found' / ENOENT) misdiagnoses unrelated failures
     // (e.g. codex exiting 0 without writing its output file) as a missing install.
