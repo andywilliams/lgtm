@@ -823,16 +823,23 @@ async function runReview(options: RunOptions): Promise<void> {
   // A holder rather than a `let`: the attempts assign it from inside `review`, and the
   // logging calls below read whichever session the last attempt actually used.
   const sessionUsed: { current: { id: string; resume: boolean } | null } = { current: null };
-  const freshSession = sessionPlan ? { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] } : null;
+  // One session per RESTART REASON: a session abandoned because the loop's was gone must
+  // not be the one the model fallback then resumes (its transcript is the cheaper model's).
+  const freshSessions = new Map<string, { id: string; resume: boolean; changedSinceLast: Record<string, string>; unchangedFiles: string[] }>();
+  const freshFor = (why: string) => {
+    if (!sessionPlan) return null;
+    if (!freshSessions.has(why)) freshSessions.set(why, { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] });
+    return freshSessions.get(why)!;
+  };
   // Which session ids this process has already handed to the CLI. An attempt that opened
   // a session (even one whose reply was unusable) leaves it on disk, so every later rung
   // must --resume it rather than pass --session-id again, which the CLI refuses. The
   // session then already holds the full prompt, so resuming is also the cheap form.
   const started = new Set<string>();
-  const review = (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean } = {}) => {
+  const review = (attempt: { enforceSchema?: boolean; model?: string; fresh?: string } = {}) => {
     if (ai === 'claude') setModelOverride(attempt.model);
-    const base = attempt.fresh ? freshSession : sessionPlan;
-    const session = base ? { ...base, resume: base.resume || started.has(base.id) } : null;
+    const planned = attempt.fresh ? freshFor(attempt.fresh) : sessionPlan;
+    const session = planned ? { ...planned, resume: planned.resume || started.has(planned.id) } : null;
     sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
     if (session) started.add(session.id);
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {

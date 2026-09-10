@@ -12,7 +12,8 @@ import type { ReviewResult } from './types.js';
  * to have chosen wrongly.
  */
 export async function reviewWithRecovery(opts: {
-  review: (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean }) => Promise<ReviewResult>;
+  /** `fresh` names WHY a new session is wanted; one session is minted per reason. */
+  review: (attempt: { enforceSchema?: boolean; model?: string; fresh?: string }) => Promise<ReviewResult>;
   ai: AIProvider;
   choice: RoundModelChoice;
   initialChoice: RoundModelChoice;
@@ -43,7 +44,7 @@ export async function reviewWithRecovery(opts: {
       try {
         freshened = true;
         freshReason = "fresh session after the loop's could not be continued";
-        return { result: await review({ model: choice.model, fresh: true }), choice, freshened, freshReason };
+        return { result: await review({ model: choice.model, fresh: 'session-lost' }), choice, freshened, freshReason };
       } catch (e2: any) {
         logFailedRound(`fresh session failed: ${e2?.message ?? String(e2)}`, choice);
         lastError = e2;
@@ -55,7 +56,7 @@ export async function reviewWithRecovery(opts: {
   if (isParseFailure(lastError)) {
     try {
       say(`↺  reply was not valid JSON — retrying ${choice.model ?? 'the full model'} with the schema enforced`);
-      return { result: await review({ enforceSchema: true, model: choice.model, ...(freshened ? { fresh: true } : {}) }), choice, freshened, freshReason };
+      return { result: await review({ enforceSchema: true, model: choice.model, ...(freshened ? { fresh: 'session-lost' } : {}) }), choice, freshened, freshReason };
     } catch (e2: any) {
       logFailedRound(`schema retry failed: ${e2?.message ?? String(e2)}`, choice);
       lastError = e2;
@@ -68,7 +69,7 @@ export async function reviewWithRecovery(opts: {
     // A new session for the full model: the existing one's transcript was created under
     // the cheaper model, and the prompt cache is model-scoped.
     freshened = true;
-    return { result: await review({ enforceSchema: true, model: undefined, fresh: true }), choice, freshened, freshReason };
+    return { result: await review({ enforceSchema: true, model: undefined, fresh: 'model-fallback' }), choice, freshened, freshReason };
   } catch (e3: any) {
     logFailedRound(`full-model fallback failed: ${e3?.message ?? String(e3)}`, choice);
     throw e3;
