@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, referencedPaths, extraFilesFor, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -297,5 +297,52 @@ describe('verifyFindings — the contract that must hold when it goes wrong', ()
     } finally {
       delete process.env.LGTM_NO_CALL;
     }
+  });
+});
+
+
+describe('the shown-context rule — the caller decides, not the prose', () => {
+  const ctx = (shown: string[], inDiff: string[] = []) => ({ shown: new Set(shown), inDiff: new Set(inDiff) });
+
+  test('a verdict about code the verifier never held becomes "unshown", whatever it called it', () => {
+    // Exactly this feature's round 3: a finding anchored in a file that IS in the diff,
+    // whose proof is a function in another file that was never sent. The model answered
+    // "unproven" and the finding — which was true — was dropped.
+    const f = finding({ severity: 'SUGGESTION', file: 'src/cli.ts', line: 661, body: "the reader is getMonthlyStats in src/db.ts, which counts only 'measured'" });
+    const contents = { 'src/cli.ts': 'x', 'src/db.ts': 'y' };
+    const verdicts = { 1: { verdict: 'unproven' as const, verifier_note: 'src/db.ts was not shown' } };
+
+    const unguarded = applyVerdicts([f], verdicts);
+    assert.equal(unguarded[0].verifier_dropped, true, 'the prose alone would have dropped it');
+
+    const guarded = applyVerdicts([f], verdicts, ctx([], ['src/cli.ts']), contents);
+    assert.equal(guarded[0].verdict, 'unshown');
+    assert.equal(guarded[0].verifier_dropped, undefined);
+  });
+
+  test('a refutation of code that was never sent is corrected too', () => {
+    const f = finding({ severity: 'BUG', file: 'src/gone.ts' });
+    const out = applyVerdicts([f], { 1: { verdict: 'refuted', verifier_evidence: ['line'], verifier_note: 'n' } }, ctx(['src/a.ts']), {});
+    assert.equal(out[0].verdict, 'unshown');
+    assert.equal(out[0].verifier_dropped, undefined);
+  });
+
+  test('a finding whose files WERE all shown keeps the verdict it was given', () => {
+    const f = finding({ severity: 'SUGGESTION', file: 'src/cli.ts', body: 'see src/db.ts' });
+    const out = applyVerdicts([f], { 1: { verdict: 'unproven', verifier_note: 'read it; not a defect' } }, ctx(['src/cli.ts', 'src/db.ts']), { 'src/cli.ts': 'x', 'src/db.ts': 'y' });
+    assert.equal(out[0].verdict, 'unproven');
+    assert.equal(out[0].verifier_dropped, true, 'this is the drop the pass exists to make');
+  });
+
+  test('wasShown counts the diff as shown, and ignores a path that names nothing', () => {
+    assert.equal(wasShown(finding({ file: 'src/a.ts' }), ctx([], ['src/a.ts'])), true);
+    // "config.yaml" resolves to no file in this change, so it is prose, not a dependency.
+    assert.equal(wasShown(finding({ file: 'src/a.ts', body: 'unlike config.yaml' }), ctx(['src/a.ts']), { 'src/a.ts': 'x' }), true);
+  });
+
+  test('diffFiles reads both sides of a unified diff', () => {
+    const d = 'diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n';
+    assert.deepEqual([...diffFiles(d)].sort(), ['src/a.ts']);
+    assert.deepEqual([...diffFiles('diff --git a/x b/y\n--- a/old.ts\n+++ b/new.ts\n')].sort(), ['new.ts', 'old.ts']);
   });
 });

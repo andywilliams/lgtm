@@ -325,7 +325,10 @@ describe('mergeRoundUsage', () => {
     assert.equal(merged.costUsd, 1.54);
     assert.equal(merged.calls, 2);
     assert.equal(merged.outputTokens, 55);
-    assert.deepEqual(merged.models, ['claude-opus-5', 'claude-sonnet-5']);
+    // The models are the SESSION's: `model_id` must keep naming the model that reviewed,
+    // or it becomes "claude-opus-5+claude-sonnet-5" on every verified round and the
+    // per-model cost attribution DWLF-206 added it for stops working.
+    assert.deepEqual(merged.models, ['claude-opus-5']);
   });
 
   test('the session-shaped fields are the SESSION window\'s, never the sum', () => {

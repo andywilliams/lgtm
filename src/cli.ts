@@ -479,7 +479,7 @@ interface VerifySummary {
   failed: string | null;
   /** Every finding the reviewer raised, dropped ones included: the drop rate's denominator. */
   checked: number;
-  dropped: { file: string; line: number; severity: Severity; title: string; verdict: string; reason: string | null }[];
+  dropped: { id: number | null; file: string; line: number; severity: Severity; title: string; verdict: string; reason: string | null }[];
 }
 
 /**
@@ -999,17 +999,6 @@ async function runReview(options: RunOptions): Promise<void> {
     const line = `   dropped: ${d.original_severity ?? d.severity} "${d.title}" (${d.file}:${d.line}) — ${d.verifier_note ?? d.verdict}`;
     if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
   }
-  const verifySummary: VerifySummary | null = verifyOutcome
-    ? {
-        model: verifyOutcome.model ?? null,
-        failed: verifyOutcome.failed ?? null,
-        checked: result.comments.length,
-        dropped: droppedComments.map((d) => ({
-          file: d.file, line: d.line, severity: d.original_severity ?? d.severity, title: d.title,
-          verdict: d.verdict ?? 'unproven', reason: d.verifier_note ?? null,
-        })),
-      }
-    : null;
   if (verifyOutcome && !verifyOutcome.failed) {
     const line = `⚖  ${droppedComments.length} of ${result.comments.length} finding(s) dropped, ${result.comments.filter((c) => c.verdict === 'confirmed').length} confirmed`;
     if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
@@ -1032,6 +1021,22 @@ async function runReview(options: RunOptions): Promise<void> {
     usage: mergeRoundUsage(reviewUsage, verifyUsage),
     verify: verifyOutcome ? { model: verifyOutcome.model, usage: verifyUsage, failed: verifyOutcome.failed } : undefined,
   });
+  // Built after the round is logged so each drop carries its finding id: a wrong drop has
+  // to be quotable and joinable to its row, not just readable.
+  const verifySummary: VerifySummary | null = verifyOutcome
+    ? {
+        model: verifyOutcome.model ?? null,
+        failed: verifyOutcome.failed ?? null,
+        checked: result.comments.length,
+        dropped: result.comments
+          .map((c, i) => ({ c, id: metrics.loop?.findingIds[i] ?? null }))
+          .filter(({ c }) => c.verifier_dropped)
+          .map(({ c, id }) => ({
+            id, file: c.file, line: c.line, severity: c.original_severity ?? c.severity, title: c.title,
+            verdict: c.verdict ?? 'unproven', reason: c.verifier_note ?? null,
+          })),
+      }
+    : null;
   // The stopping rule, said out loud every round — on stderr in agent mode so the
   // stdout JSON contract is untouched, but a driving agent still sees it.
   if (metrics.loop) {

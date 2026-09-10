@@ -129,7 +129,11 @@ export function mergeRoundUsage(session: AIUsage, outside: AIUsage): AIUsage {
     outputTokens: session.outputTokens + outside.outputTokens,
     costUsd: session.costUsd + outside.costUsd,
     durationMs: session.durationMs + outside.durationMs,
-    models: [...session.models, ...outside.models.filter((m) => !session.models.includes(m))],
+    // The SESSION's models, so `model_id` still names the model that REVIEWED. Summing
+    // them would make it a compound string on every verified round, and the DWLF-206
+    // per-model saving is measured off that column; the verifier's own model is recorded
+    // in `verify_model`, where it can be read without ambiguity.
+    models: session.models,
     calls: session.calls + outside.calls,
     // Session-shaped fields: the first window's, never the sum. See above.
     lastPromptTokens: session.lastPromptTokens,

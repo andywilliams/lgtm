@@ -191,7 +191,7 @@ export function extraFilesFor(findings: ReviewComment[], contents: Record<string
  * repository, which is what keeps review + verify inside its cost budget on a late round
  * where the review itself is nearly all prompt-cache reads.
  */
-export function buildWindows(findings: ReviewComment[], contents: Record<string, string>, maxBytes: number): string {
+export function buildWindows(findings: ReviewComment[], contents: Record<string, string>, maxBytes: number, shownOut?: Set<string>): string {
   const byFile = new Map<string, [number, number][]>();
   for (const f of findings) {
     // Own properties only: `file` comes from the model, and "toString" or "constructor"
@@ -231,6 +231,7 @@ export function buildWindows(findings: ReviewComment[], contents: Record<string,
   // cap reads to the verifier as "this file has no such code", which is the difference
   // between "I was shown nothing" and "I looked and it is not there" — and that
   // difference is the whole basis of the refuted/unproven split.
+  if (shownOut) for (const f of shown) shownOut.add(f);
   // The list of what was provided is not decoration: the verdict rules turn on whether the
   // thing that would settle a finding was in front of the verifier, and the only way it can
   // answer that honestly is to be told exactly what it has.
@@ -238,15 +239,23 @@ export function buildWindows(findings: ReviewComment[], contents: Record<string,
   return header + out;
 }
 
+/** The files a unified diff touches — they are in front of the verifier whatever else is. */
+export function diffFiles(diff: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of diff.matchAll(/^\+\+\+ b\/(.+)$/gm)) out.add(m[1].trim());
+  for (const m of diff.matchAll(/^--- a\/(.+)$/gm)) out.add(m[1].trim());
+  return out;
+}
+
 /** Does any finding cite a document (charter / STANDARDS.md) rather than the code? */
 export function citesDocs(findings: ReviewComment[]): boolean {
   return findings.some((f) => /^\((charter|standard\b[^)]*)\)/i.test(f.title));
 }
 
-export function buildVerifyPrompt(input: VerifyInput): string {
+export function buildVerifyPrompt(input: VerifyInput, shownOut?: Set<string>): string {
   const { diff, prTitle, findings, contents = {}, readersContext, docs } = input;
   const maxBytes = input.maxContextBytes ?? verifyMaxContextBytes();
-  const windows = buildWindows(findings, contents, maxBytes);
+  const windows = buildWindows(findings, contents, maxBytes, shownOut);
   // The charter and standards are the ONLY evidence a "(charter)" / "(standard …)"
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
@@ -296,6 +305,40 @@ export function isOpinion(severity: Severity): boolean {
   return severity === 'SUGGESTION' || severity === 'NITPICK';
 }
 
+/**
+ * What the verifier was actually given, so a verdict about its own context can be checked
+ * rather than trusted. `buildWindows` computes this exactly; leaving it in the prompt as a
+ * sentence and nowhere else would make the safety property model-dependent — weakest in
+ * precisely the configurations this feature recommends for decorrelation (a small model,
+ * or another family), where a subtle prose distinction is least likely to be honoured.
+ */
+export interface ShownContext {
+  /** Files whose contents were put in the prompt. */
+  shown: Set<string>;
+  /** Files the diff touches — in front of the verifier whether or not a window fitted. */
+  inDiff: Set<string>;
+}
+
+/**
+ * Could the verifier possibly have checked this finding? Only if every file it turns on —
+ * the one it is anchored in, and every file its own text names — was in front of it.
+ * Deliberately strict: a finding that mentions a file in passing is treated as depending
+ * on it, which errs towards keeping a finding rather than dropping one.
+ */
+export function wasShown(f: ReviewComment, ctx: ShownContext, contents: Record<string, string> = {}): boolean {
+  const have = (path: string) => ctx.shown.has(path) || ctx.inDiff.has(path);
+  if (!have(f.file)) return false;
+  const keys = Object.keys(contents).filter((k) => !k.startsWith('@'));
+  for (const raw of referencedPaths(f)) {
+    // Only paths that name a real file in this change are treated as dependencies; a
+    // ".ts" fragment in prose that matches nothing is not evidence of anything.
+    const matches = keys.includes(raw) ? [raw] : keys.filter((k) => k.endsWith(`/${raw}`));
+    const resolved = matches.length === 1 ? matches[0] : ctx.inDiff.has(raw) ? raw : null;
+    if (resolved && !have(resolved)) return false;
+  }
+  return true;
+}
+
 export interface Verdicts {
   [id: number]: { verdict: Verdict; severity?: Severity; verifier_evidence?: string[]; verifier_note?: string };
 }
@@ -327,7 +370,7 @@ export function parseVerdicts(output: string, count: number): Verdicts {
  * annotated; nothing is removed here, because the caller must log the drops (that is how
  * the false-positive rate becomes a number) and only then hide them from its output.
  */
-export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts): ReviewComment[] {
+export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx?: ShownContext, contents?: Record<string, string>): ReviewComment[] {
   return findings.map((f, i) => {
     const v = verdicts[i + 1];
     // No verdict at all is NOT "unproven": a verifier that skipped a finding has said
@@ -338,7 +381,10 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts): Re
     const evidence = v.verifier_evidence ?? [];
     // A refutation is a claim about the code and must be quotable; without quoted lines
     // it is exactly the "I could not find it" case, which is unproven.
-    const verdict: Verdict = v.verdict === 'refuted' && evidence.length === 0 ? 'unproven' : v.verdict;
+    let verdict: Verdict = v.verdict === 'refuted' && evidence.length === 0 ? 'unproven' : v.verdict;
+    // The caller knows what it sent, so it decides — not the prose. A judgement about code
+    // the verifier never held is recorded as what it is, whatever the model called it.
+    if (ctx && verdict !== 'unverified' && verdict !== 'unshown' && !wasShown(f, ctx, contents)) verdict = 'unshown';
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
@@ -382,11 +428,13 @@ export function verifyFindings(input: VerifyInput & {
   // The override is process-wide, so the verifier's cheaper model is put back exactly as
   // it was found: the review's own choice is still set when this runs.
   const previous = getModelOverride();
+  const shown = new Set<string>();
+  const ctx: ShownContext = { shown, inDiff: diffFiles(input.diff) };
   try {
     // Inside the guard, not above it: this is the statement that consumes untrusted model
     // output (a finding's `file` and `line`), and the function's contract is that a review
     // already paid for is never lost to something that happens after it.
-    const prompt = buildVerifyPrompt(input);
+    const prompt = buildVerifyPrompt(input, shown);
     if (ai === 'claude') setModelOverride(model);
     let output: string;
     try {
@@ -402,7 +450,7 @@ export function verifyFindings(input: VerifyInput & {
       verdicts = parseVerdicts(output, findings.length);
     }
     if (Object.keys(verdicts).length === 0) return { comments: findings, failed: 'the verifier returned no verdicts', model };
-    return { comments: applyVerdicts(findings, verdicts), model };
+    return { comments: applyVerdicts(findings, verdicts, ctx, input.contents), model };
   } catch (e: any) {
     return { comments: findings, failed: e?.message ?? String(e), model };
   } finally {

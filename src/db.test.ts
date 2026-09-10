@@ -415,6 +415,15 @@ test('a verifier-dropped finding is logged, but is not part of what the round fo
     { severity: 'SUGGESTION', title: 'Real nit', file: 'a.ts', line: 2, body: '', confidence: 'medium', verdict: 'confirmed' },
   ]);
 
+  const dbA = (await import('./db.js')).initDb();
+  const droppedRow = dbA.prepare("SELECT dropped, disposition FROM findings WHERE repo = ? AND title = 'Refuted crash'").get(repo) as any;
+  dbA.close();
+  // The drop is its OWN axis. Putting it on `disposition` would make "open finding" mean
+  // two things at once, and would settle the row at birth so a drop that a later round
+  // contradicts could never be surfaced.
+  assert.equal(droppedRow.dropped, 1);
+  assert.equal(droppedRow.disposition, null, 'disposition still means only what a later ROUND decided');
+
   const s = getLoopSummary(repo, key);
   // Without `verified` the drop rate has no denominator: a round that never ran the pass
   // and a round that ran it and dropped nothing would look identical, and the metric this
@@ -467,12 +476,14 @@ test('the verifier severity stored is the final one; the reviewer claim survives
     { severity: 'SUGGESTION', title: 'Downgraded', file: 'a.ts', line: 1, body: '', verdict: 'confirmed', original_severity: 'BUG', verifier_evidence: ['x'] },
   ]);
   const db = initDb();
-  const row = db.prepare('SELECT severity, original_severity, verdict, verifier_evidence, disposition FROM findings WHERE repo = ?').get(repo) as any;
-  const review = db.prepare('SELECT verify_failed, verify_cost_usd FROM reviews WHERE id = ?').get(r.id) as any;
+  const row = db.prepare('SELECT severity, original_severity, verdict, verifier_evidence, disposition, dropped FROM findings WHERE repo = ?').get(repo) as any;
+  const review = db.prepare('SELECT verify_failed, verify_cost_usd, verify_rules FROM reviews WHERE id = ?').get(r.id) as any;
   db.close();
   assert.equal(row.severity, 'SUGGESTION', 'the stopping rule reads the final severity');
   assert.equal(row.original_severity, 'BUG', 'and the reviewer claim is still auditable');
   assert.equal(row.disposition, null, 'a confirmed finding is open, like any other');
+  assert.equal(row.dropped, 0);
+  assert.ok(review.verify_rules >= 2, 'the row says which verdict rules produced it');
   assert.deepEqual(JSON.parse(row.verifier_evidence), ['x']);
   assert.equal(review.verify_failed, 'the verifier returned no verdicts', 'a pass that ran and could not answer is not the same round as one that did not run');
   assert.equal(review.verify_cost_usd, null);
@@ -525,4 +536,26 @@ test('a codex verifier does not cost the round its measured review numbers', asy
   assert.equal(row.model_id, 'claude-opus-5');
   assert.equal(row.usage_source, 'partial', 'and the row says which half was not measured');
   assert.equal(row.sent_tokens, 400, 'the session still holds only what the review sent');
+});
+
+test('a drop recorded on `disposition` by an earlier build moves onto its own column', async () => {
+  const { initDb, logReview, logFindings, getLoopSummary } = await import('./db.js');
+  const repo = 'legacydrop/repo';
+  const key = 'pr:14';
+  const r = logReview({ repo, prNumber: 14, reviewedAt: '2026-09-10T16:00:00.000Z', filesReviewed: 1, contextFilesAdded: 0,
+    contextReasons: '[]', tokenCount: 1, model: 'claude', usedContextExpansion: false, falseNegative: false,
+    mode: 'pr', roundKey: key, harshness: 'medium', diffSha: 'a', verify: { model: 'claude-sonnet-5', measured: true, costUsd: 0.01, tokens: 100 } });
+  logFindings(r.id, repo, key, 1, [{ severity: 'BUG', title: 'Old drop', file: 'a.ts', line: 1, body: '' }]);
+
+  // Rewrite it the way the first build of this feature stored a drop.
+  let db = initDb();
+  db.prepare("UPDATE findings SET disposition = 'verifier-dropped', disposed_at_round = 1, dropped = NULL WHERE repo = ?").run(repo);
+  db.close();
+
+  db = initDb(); // the migration runs here
+  const row = db.prepare('SELECT dropped, disposition FROM findings WHERE repo = ?').get(repo) as any;
+  db.close();
+  assert.equal(row.dropped, 1);
+  assert.equal(row.disposition, null, 'and disposition is handed back to the loop');
+  assert.equal(getLoopSummary(repo, key).rounds[0].dropped, 1, 'the round still reads as one drop');
 });
