@@ -176,3 +176,11 @@ test('the full-model fallback always opens its own session — a cheaper session
   assert.equal(choice.model, undefined);
   assert.equal(h.attempts[2].fresh, 'model-fallback', 'the fallback rung opens its own session');
 });
+
+test('a timeout is never retried — one wait, not three', async () => {
+  const { TimeoutError } = await import('./ai.js');
+  const h = harness([new TimeoutError('claude --print produced nothing in 15 minutes')], true);
+  await assert.rejects(() => h.run(cheaper), /produced nothing in 15 minutes/);
+  assert.equal(h.attempts.length, 1, 'no rung follows a timeout');
+  assert.equal(h.failed.length, 1, 'and the round is still logged as failed');
+});

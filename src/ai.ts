@@ -118,6 +118,31 @@ export function timeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
 }
 
+/** A call that ran out of time. Named so the recovery ladder can refuse to retry it. */
+export class TimeoutError extends Error {
+  readonly name = 'TimeoutError';
+}
+
+/**
+ * Did this failure come from our own timeout? Node reports a killed child by signal, and
+ * a signal alone would also match an operator's Ctrl-C — so the elapsed time decides.
+ */
+function isTimeout(error: any, startedAt: number): boolean {
+  const elapsed = Date.now() - startedAt;
+  const killed = error?.code === 'ETIMEDOUT' || error?.killed === true || error?.signal === 'SIGTERM';
+  return killed && elapsed >= timeoutMs() * 0.9;
+}
+
+/** The message a timed-out call raises: what it was doing, and the levers that fix it. */
+function timeoutError(prompt: string, what: string): TimeoutError {
+  const mins = Math.round(timeoutMs() / 60000);
+  return new TimeoutError(
+    `${what} produced nothing in ${mins} minutes (prompt ~${Math.ceil(prompt.length / 4).toLocaleString()} tokens). ` +
+      'A first round on a very large change is the usual cause. Options: review the unreviewed delta only ' +
+      '(--local --base <last-reviewed-commit>), split the change, or raise LGTM_TIMEOUT_MS.'
+  );
+}
+
 const MODEL_ID = /^[\w.:@\/\-\[\]]+$/;
 
 // A per-process model override — set from `--model` or the round policy — outranks
@@ -414,6 +439,7 @@ function runClaude(prompt: string, opts: RunOptions): string {
     process.stderr.write('lgtm: no model configured — the claude CLI picks its default, and lgtm cannot tell when you change it (a loop session opened on the old one would then review with a cold cache). Set LGTM_MODEL, or "model" in ~/.claude/settings.json, to pin it.\n');
   }
   const args = claudePrintArgs(model, effort, settingSources(), opts.schema, opts.session);
+  const startedAt = Date.now();
   try {
     const raw = execFileSync('claude', args, {
       input: prompt,
@@ -428,13 +454,11 @@ function runClaude(prompt: string, opts: RunOptions): string {
   } catch (error: any) {
     // A run that cannot finish must say so, with the lever that fixes it — silence for
     // fifteen minutes is what made this look like a broken tool rather than a slow one.
-    if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') {
-      const mins = Math.round(timeoutMs() / 60000);
-      throw new Error(
-        `claude --print produced nothing in ${mins} minutes (prompt ~${Math.ceil(prompt.length / 4).toLocaleString()} tokens). ` +
-          'A first round on a very large change is the usual cause. Options: review the unreviewed delta only ' +
-          '(--local --base <last-reviewed-commit>), split the change, or raise LGTM_TIMEOUT_MS.'
-      );
+    // The call is recorded either way: the time and tokens were spent, and a round that
+    // spent them is a round, however little came back.
+    if (isTimeout(error, startedAt)) {
+      addUsage(null, prompt.length);
+      throw timeoutError(prompt, 'claude --print');
     }
     // A non-zero exit usually still carries the JSON envelope on stdout; surface its
     // reason instead of the bare "Command failed: claude …". Anything that is NOT an
@@ -457,6 +481,7 @@ function runCodex(prompt: string, label: string): string {
   const tempFile = join(tmpdir(), `lgtm-${label}-${Date.now()}-${process.pid}.txt`);
   const outputFile = tempFile + '.out';
   writeFileSync(tempFile, prompt);
+  const startedAt = Date.now();
   try {
     execSync(`codex exec -o "${outputFile}" - < "${tempFile}"`, {
       encoding: 'utf-8',
@@ -466,6 +491,12 @@ function runCodex(prompt: string, label: string): string {
     });
     addUsage(null, prompt.length);
     return readFileSync(outputFile, 'utf-8');
+  } catch (error: any) {
+    if (isTimeout(error, startedAt)) {
+      addUsage(null, prompt.length);
+      throw timeoutError(prompt, 'codex exec');
+    }
+    throw error;
   } finally {
     try { unlinkSync(outputFile); } catch { /* ignore */ }
     try { unlinkSync(tempFile); } catch { /* ignore */ }
