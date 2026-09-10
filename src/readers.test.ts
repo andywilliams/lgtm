@@ -157,3 +157,46 @@ describe('readers: bracket scanning', () => {
     }
   });
 });
+
+describe('readers: structure that lives on context lines', () => {
+  it('sees a spread added into an object literal opened on an unchanged line', async () => {
+    const { fieldsFromHelpers } = await import('./readers.js');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-readers-'));
+    try {
+      writeFileSync(join(dir, 'h.ts'), 'export function createPayload(s) {\n  return { pivotTime: s.t };\n}\n');
+      // The `{` is CONTEXT; only the spread is added — the shape a real fix usually has.
+      const diff = ['+++ b/src/e.ts', ' emit({', '+    ...createPayload(next),', '   other: 1,', ' });'].join('\n');
+      const fields = fieldsFromHelpers(diff, dir).map((f) => f.id);
+      assert.ok(fields.includes('pivotTime'), `got ${fields.join(',') || '(none)'}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not read type annotations or ternary branches as payload fields', async () => {
+    const { fieldsFromHelpers } = await import('./readers.js');
+    const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-readers-'));
+    try {
+      writeFileSync(join(dir, 'h.ts'), [
+        'export function createPayload(s: State): Payload {',
+        '  const annotated: SomeType = s.x;',
+        '  return {',
+        '    pivotTime: s.t,',
+        '    price: s.up ? s.high : s.low,',
+        '  };',
+        '}',
+      ].join('\n'));
+      const diff = ['+++ b/src/e.ts', '+  emit({ ...createPayload(next) });'].join('\n');
+      const fields = fieldsFromHelpers(diff, dir).map((f) => f.id);
+      assert.deepEqual(fields.sort(), ['pivotTime', 'price'], `got ${fields.join(',')}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -761,16 +761,13 @@ async function runReview(options: RunOptions): Promise<void> {
         log(chalk.blue(`\n📡 Readers of what this diff writes:`));
         // The same foreign test the prompt uses — the carried root, not a path prefix.
         for (const h of hits) log(chalk.gray(`   • ${h.identifier} ← ${h.root === repoRootForReaders ? relative(repoRootForReaders, h.file) : `${h.file} (another repo)`}`));
-      }
-      for (const f of failedSearchRoots()) console.error(chalk.yellow(`⚠  the reader search failed under ${f} — this review is blind to consumers there.`));
-      if (hits.length > 0) {
-        // reported above
       } else if (readersSearchRan()) {
         log(chalk.gray(`\n📡 Nothing outside the changed files reads what this diff writes (${identifiers.length} identifier(s) searched)`));
       } else {
         // Never report an absence the search could not have found: no rg, no grep, no answer.
         log(chalk.yellow(`\n📡 Could not search for readers — neither rg nor grep ran. This review is blind to who reads what it writes.`));
       }
+      for (const f of failedSearchRoots()) console.error(chalk.yellow(`⚠  the reader search failed under ${f} — this review is blind to consumers there.`));
     }
   }
 

@@ -26,6 +26,26 @@ const MAX_IDENTIFIERS = 8;
 const TEST_FILE = /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.[jt]sx?$|\.vitest\./;
 
 /**
+ * A hunk's lines as source, with a flag for the ones the diff ADDS. Structure lives on
+ * context lines — a spread added into an object literal whose `{` was already there has
+ * no visible opener in the added lines alone — so detection reads the whole hunk while
+ * attribution stays with the added lines.
+ */
+export function hunkLines(diff: string): { text: string; added: boolean }[] {
+  const out: { text: string; added: boolean }[] = [];
+  let inTest = false;
+  for (const line of diff.split('\n')) {
+    const header = line.match(/^\+\+\+ b\/(.+)$/);
+    if (header) { inTest = TEST_FILE.test(header[1]); continue; }
+    if (inTest || line.startsWith('+++ ') || line.startsWith('--- ') || line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index ')) continue;
+    if (line.startsWith('-')) continue; // removed: no longer part of the file
+    if (line.startsWith('+')) out.push({ text: line.slice(1), added: true });
+    else if (line.startsWith(' ')) out.push({ text: line.slice(1), added: false });
+  }
+  return out;
+}
+
+/**
  * The diff's added lines, with test files left out: a fixture writes nothing production
  * reads, and its helpers would otherwise crowd out the real payload builder.
  */
@@ -96,12 +116,22 @@ export function fieldsFromHelpers(diff: string, repoRoot: string, maxHelpers = 3
   // enclosing `{` sits on an earlier line, which a line-by-line rule cannot see.
   const spread = new Set<string>();
   const named = new Set<string>();
-  const blob = added.join('\n');
+  // Whole hunks, so an enclosing `{` on a context line is visible; only spreads on ADDED
+  // lines count as something this change writes.
+  const lines = hunkLines(diff);
+  const blob = lines.map((l) => l.text).join('\n');
+  const addedRanges: [number, number][] = [];
+  let offset = 0;
+  for (const l of lines) {
+    if (l.added) addedRanges.push([offset, offset + l.text.length]);
+    offset += l.text.length + 1;
+  }
+  const isAdded = (i: number) => addedRanges.some(([a, b]) => i >= a && i <= b);
   for (const m of blob.matchAll(/\.\.\.(\w{4,})\s*\(/g)) {
     // Exactly: is the nearest unclosed bracket an object's? `{ ...f(x) }` is the emitted
     // payload; `[...f(x)]` is an array and `g(a, ...f(x))` an argument list, and no gap
     // pattern separates those once the values contain parens of their own.
-    if (enclosingOpener(blob, m.index!) === '{') spread.add(m[1]);
+    if (isAdded(m.index!) && enclosingOpener(blob, m.index!) === '{') spread.add(m[1]);
   }
   for (const line of added) {
     for (const m of line.matchAll(/\b((?:create|build|make|to)[A-Z]\w+)\s*\(/g)) named.add(m[1]);
@@ -189,10 +219,14 @@ function fieldsAssignedIn(file: string, helper: string, maxFields = 8): string[]
   const afterParams = window.indexOf(')');
   const [body = window] = objectLiterals(window.slice(afterParams === -1 ? 0 : afterParams), 1);
   const fields = new Set<string>();
-  // Keys of the object literals the helper builds — brace-matched, so a payload written
-  // on one line (`return { pivotTime: t, price: p };`) is read as well as a multi-line one.
-  for (const literal of objectLiterals(body)) {
-    for (const m of literal.matchAll(/(?:^|[{,\s])(\w{3,})\s*:/g)) fields.add(m[1]);
+  // The literals the helper RETURNS, not its whole body: the body is itself a `{...}`,
+  // and scanning it whole reads type annotations and ternary branches as keys. A key
+  // follows `{` or `,`; `cond ? a : b` puts a name before a colon but not after either.
+  const inner = body.slice(1);
+  const returned = inner.match(/(?:return\s*\(?\s*|=>\s*\(?\s*)\{/);
+  const source = returned ? inner.slice(returned.index! + returned[0].length - 1) : inner;
+  for (const literal of objectLiterals(source)) {
+    for (const m of literal.matchAll(/[{,]\s*(\w{3,})\s*:/g)) fields.add(m[1]);
   }
   for (const m of body.matchAll(/\b(?:payload|result|out|obj)\.(\w{3,})\s*=/g)) fields.add(m[1]);
   const noise = new Set(['type', 'name', 'value', 'data', 'return', 'const', 'this', 'true', 'false', 'null', 'string', 'number', 'boolean', 'default', 'case']);
