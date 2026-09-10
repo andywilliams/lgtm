@@ -4,10 +4,11 @@ import { program, Option } from 'commander';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { readFileSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, relative } from 'node:path';
 import { getPRDetails, getPRDiff, getChangedFiles, getFileContent, submitReview, postBatchReview, postReviewComment, postIssueComment, getPRComments, getExistingReviewComments, resolveComment, getCurrentRepoSlug } from './github.js';
 import { getLocalDetails, getLocalDiff, getLocalChangedFiles, getLocalFileContent, detectDefaultBase, getCurrentBranch } from './git.js';
-import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, type AIProvider } from './review.js';
+import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli, getAvailableProviders, SYSTEM_PROMPT as REVIEW_SYSTEM_PROMPT, type AIProvider } from './review.js';
+import { SYSTEM_PROMPT_KEY } from './session.js';
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
 import { runStandardsInit } from './standardsInterview.js';
@@ -18,10 +19,11 @@ import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
 import { expandContext } from './contextExpander.js';
-import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice } from './db.js';
-import { createHash } from 'node:crypto';
+import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice, type LoopSession } from './db.js';
+import { createHash, randomUUID } from 'node:crypto';
 import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
+import { planSession, modelRoleOf } from './session.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
@@ -103,6 +105,7 @@ program.addHelpText(
     '  LGTM_MODEL                    model id to review with (default: your ~/.claude/settings.json model)\n' +
     '  LGTM_EFFORT                   low|medium|high|xhigh|max (default: your settings effort for that model)\n' +
     '  LGTM_LATE_MODEL               model for late (round 4+) chill review rounds (default claude-sonnet-5; "off" = always the full model)\n' +
+    '  LGTM_SESSIONS                 "off" = every round is a one-off call (default: one Claude session per loop, resumed each round for the prompt cache)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -117,6 +120,7 @@ program
   .option('--decided <file>', 'JSON file of previously-dismissed findings ({file?,line?,title,reason}[]) the reviewer must not re-raise (findings dismissed with `lgtm dismiss` are injected automatically)')
   .option('--override <reason>', `Run a round past the ${ROUND_BUDGET}-round budget; the reason is recorded with the round`)
   .option('--model <id>', 'Model to review with (default: your settings model; late chill rounds use LGTM_LATE_MODEL, claude-sonnet-5, unless set to off)')
+  .option('--fresh', 'Start a new loop session instead of continuing the existing one (LGTM_SESSIONS=off disables sessions entirely)', false)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -251,6 +255,7 @@ program
         pr: memory.pr,
         explicitModel: options.model,
         harshnessExplicit,
+        fresh: options.fresh,
         policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
@@ -302,11 +307,13 @@ interface RunOptions {
   explicitModel?: string;
   /** False when -H was not given, so the round policy may lower it on a late, settled round. */
   harshnessExplicit?: boolean;
+  /** `--fresh`: do not continue the loop's session. */
+  fresh?: boolean;
   /**
    * What the round policy needs from the log; absent when the log was unavailable.
    * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
    */
-  policy?: { loopRound: number; openBugs: number; lastDiffLines: number | null };
+  policy?: { loopRound: number; openBugs: number; lastDiffLines: number | null; session: LoopSession | null };
   charterEnabled: boolean;
   standardsEnabled: boolean;
 }
@@ -375,7 +382,7 @@ function applyLoopMemory(opts: {
         `File what is left as follow-ups, or rerun with --override "<why this loop must continue>". See: lgtm rounds ${local ? '--local' : prNumber}`
     );
   }
-  return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines } };
+  return { scope, decided, pr, policy: { loopRound: summary.budgetUsed + 1, openBugs: summary.openBugs, lastDiffLines: summary.lastDiffLines, session: ctx.session } };
 }
 
 /** Added + removed lines in a unified diff — the size the round policy compares between rounds. */
@@ -549,13 +556,21 @@ function recordReviewMetrics(opts: {
   modelChoice?: RoundModelChoice;
   /** Set when the round produced no review — the error text. The row is logged; nothing is judged. */
   failed?: string;
+  sessionId?: string;
+  fileShas?: Record<string, string>;
+  modelRole?: string;
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
   const usage = takeUsage();
+  // A failure before any model call (a session the CLI could not find) spent nothing:
+  // there is no round to record and no budget slot to charge.
+  if (failed && (usage.calls === 0 || (usage.measured && promptTokens(usage) === 0 && usage.costUsd === 0))) {
+    return { tokenEstimate, usage, loop: null };
+  }
   let loop: LoopState | null = null;
   try {
     // Rows logged before the slug became the key used the path; `rounds` reads both.
@@ -585,6 +600,9 @@ function recordReviewMetrics(opts: {
       diffLines,
       modelReason: modelChoice && ai === 'claude' ? modelChoice.reason : undefined,
       failed: Boolean(failed),
+      sessionId,
+      fileShas,
+      modelRole,
     });
     const round = allocated ?? 1;
     if (failed) return { tokenEstimate, usage, loop: null };
@@ -613,7 +631,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, policy, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, policy, charterEnabled, standardsEnabled } = options;
   let harshness = options.harshness;
   // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
   // asking "is it safe now?", which is chill's question — unless -H said otherwise.
@@ -695,7 +713,11 @@ async function runReview(options: RunOptions): Promise<void> {
     }
   }
 
-  // Auto-expand context if requested
+  // Auto-expand context if requested. Related files come back with absolute paths;
+  // everything downstream (the prompt heading and the session's file keys) uses the
+  // repo-relative form, so the same file is one identity in both.
+  const repoRootForKeys = getRepoRoot();
+  const relKey = (p: string) => (p.startsWith('/') && p.startsWith(repoRootForKeys) ? relative(repoRootForKeys, p) : p);
   let expandedContextStr = '';
   let expanded: { path: string; reason: string; content: string }[] = [];
   if (relatedFiles) {
@@ -706,6 +728,9 @@ async function runReview(options: RunOptions): Promise<void> {
       maxFiles: 20,
       importDepth: 3,
     });
+    // Path order, not discovery order: the same set of files must render identically
+    // from one round to the next or the prompt cache never matches past this point.
+    expanded.sort((a, b) => a.path.localeCompare(b.path));
 
     if (expanded.length > 0) {
       log(chalk.gray(`   Found ${expanded.length} context file(s):`));
@@ -713,8 +738,8 @@ async function runReview(options: RunOptions): Promise<void> {
       expandedContextStr = `\n## Expanded Context (Auto-discovered)\n`;
       expandedContextStr += `The following files were automatically discovered as relevant context:\n\n`;
       for (const file of expanded) {
-        log(chalk.gray(`   • ${file.path} (${file.reason})`));
-        expandedContextStr += `### ${file.path}\n`;
+        log(chalk.gray(`   • ${relKey(file.path)} (${file.reason})`));
+        expandedContextStr += `### ${relKey(file.path)}\n`;
         expandedContextStr += `_Reason: ${file.reason}_\n\n`;
         expandedContextStr += `\`\`\`\n${file.content}\n\`\`\`\n\n`;
         tokenEstimate += Math.ceil(file.content.length / 4);
@@ -774,36 +799,72 @@ async function runReview(options: RunOptions): Promise<void> {
     diffLines,
     lastDiffLines: policy?.lastDiffLines ?? null,
   });
-  let choice: RoundModelChoice = initialChoice;
-  // Said even for codex, so `--model` with codex is visibly not applied rather than silently ignored.
-  const modelLine = `🎛  model: ${choice.model ?? (ai === 'claude' ? 'default (full)' : ai)} — ${choice.reason}`;
-  if (auto) console.error(chalk.gray(modelLine)); else log(chalk.gray(modelLine));
-
-  // Review with AI
-  const aiLabel = ai === 'codex' ? 'Codex' : 'Claude';
-  const contextModes = [harshness + ' mode'];
-  if (fullContext) contextModes.push('full context');
-  if (usageContext && usageContextStr) contextModes.push('usage context');
-  if (relatedFiles && expandedContextStr) contextModes.push('related files');
-  if (handbookContextStr) contextModes.push('handbook');
-  if (charterContextStr) contextModes.push('charter');
-  if (standardsContextStr) contextModes.push('standards');
-  const modeLabel = contextModes.join(' + ');
-  log(chalk.blue(`\n🤖 Reviewing with ${aiLabel} (${modeLabel})...`));
-  // The model is an argument of each attempt, not hidden state the ladder has to reset.
-  const review = (attempt: { enforceSchema?: boolean; model?: string } = {}) => {
-    if (ai === 'claude') setModelOverride(attempt.model);
-    return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, { scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema });
+  // The loop's session, if it can be continued (see planSession); the file set covers the
+  // related files too, so a newly discovered import is sent to a resumed session.
+  // Related files come back with absolute paths; key them like the changed files (repo-relative)
+  // or the same file is hashed twice and "changed" forever.
+  const contentsSeen: Record<string, string> = { ...(fileContents ?? {}) };
+  for (const f of expanded) { const k = relKey(f.path); if (!(k in contentsSeen)) contentsSeen[k] = f.content; }
+  // The stable prefix is fingerprinted like a file, under pseudo-paths: a charter edited
+  // mid-loop reaches the resumed session as "updated context"; a changed system prompt
+  // (lgtm upgraded) restarts the session, since the reviewer's rules themselves moved.
+  contentsSeen[SYSTEM_PROMPT_KEY] = REVIEW_SYSTEM_PROMPT;
+  if (charterContextStr) contentsSeen['@charter'] = charterContextStr;
+  if (standardsContextStr) contentsSeen['@standards'] = standardsContextStr;
+  if (handbookContextStr) contentsSeen['@handbook'] = handbookContextStr;
+  const plan = planSession({ prior: policy?.session ?? null, contents: contentsSeen, ai, fresh, choice: initialChoice });
+  const { fileShas } = plan;
+  const sessionPlan = plan.session;
+  let choice: RoundModelChoice = plan.choice;
+  if (plan.note) { if (auto) console.error(chalk.gray(plan.note)); else log(chalk.gray(plan.note)); }
+  // The model is an argument of each attempt, not hidden state the ladder has to reset;
+  // `fresh` abandons the resumed session for ONE new one (minted once, so the schema retry
+  // and the full-model fallback continue it rather than opening a third and fourth).
+  // A holder rather than a `let`: the attempts assign it from inside `review`, and the
+  // logging calls below read whichever session the last attempt actually used.
+  const sessionUsed: { current: { id: string; resume: boolean } | null } = { current: null };
+  // One session per RESTART REASON: a session abandoned because the loop's was gone must
+  // not be the one the model fallback then resumes (its transcript is the cheaper model's).
+  const freshSessions = new Map<string, { id: string; resume: boolean; changedSinceLast: Record<string, string>; unchangedFiles: string[] }>();
+  const freshFor = (why: string) => {
+    if (!sessionPlan) return null;
+    if (!freshSessions.has(why)) freshSessions.set(why, { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] });
+    return freshSessions.get(why)!;
   };
+  // Which session ids this process has already handed to the CLI. An attempt that opened
+  // a session (even one whose reply was unusable) leaves it on disk, so every later rung
+  // must --resume it rather than pass --session-id again, which the CLI refuses. The
+  // session then already holds the full prompt, so resuming is also the cheap form.
+  const started = new Set<string>();
+  const review = (attempt: { enforceSchema?: boolean; model?: string; fresh?: string } = {}) => {
+    if (ai === 'claude') setModelOverride(attempt.model);
+    const planned = attempt.fresh ? freshFor(attempt.fresh) : sessionPlan;
+    const session = planned ? { ...planned, resume: planned.resume || started.has(planned.id) } : null;
+    sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
+    if (session) started.add(session.id);
+    return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
+      scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
+      session: session ? { ...session, round: policy?.loopRound ?? 1 } : undefined,
+    });
+  };
+  if (sessionPlan) {
+    const line = sessionPlan.resume
+      ? `⟳  session: continuing ${sessionPlan.id.slice(0, 8)} — ${Object.keys(sessionPlan.changedSinceLast).length} file(s) changed since last round, ${sessionPlan.unchangedFiles.length} unchanged`
+      : `⟳  session: new ${sessionPlan.id.slice(0, 8)} for this loop`;
+    if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
+  }
   // The failed attempt's model choice is passed in, not closed over: the recovery ladder
   // changes the choice between attempts and the row must name the model that actually failed.
   const logFailedRound = (why: string, attempted: RoundModelChoice) => recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: [], decided,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: attempted, failed: why,
+    sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(attempted),
   });
   let result: Awaited<ReturnType<typeof review>>;
-  ({ result, choice } = await reviewWithRecovery({ review, ai, choice, initialChoice, logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
+  let freshReason: string | undefined;
+  ({ result, choice, freshReason } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
+  if (freshReason) choice = { ...choice, reason: `${freshReason} (${choice.reason})` };
 
   log(chalk.gray(`\n${result.summary}\n`));
 
@@ -814,6 +875,7 @@ async function runReview(options: RunOptions): Promise<void> {
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
     filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice,
+    sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(choice),
   });
   // The stopping rule, said out loud every round — on stderr in agent mode so the
   // stdout JSON contract is untouched, but a driving agent still sees it.

@@ -38,6 +38,8 @@ export interface AIUsage {
   /** Distinct model ids the CLI reported (a print run may also use a small helper model). */
   models: string[];
   calls: number;
+  /** Prompt tokens of the LAST call in the window — the context a session actually holds, where the totals above sum every attempt. */
+  lastPromptTokens: number;
   /** False when any call in the window had no envelope to read (codex, or a non-JSON reply). */
   measured: boolean;
 }
@@ -52,6 +54,7 @@ export function emptyUsage(): AIUsage {
     durationMs: 0,
     models: [],
     calls: 0,
+    lastPromptTokens: 0,
     measured: true,
   };
 }
@@ -83,6 +86,7 @@ export function addUsage(u: AIUsage | null): void {
   ledger.outputTokens += u.outputTokens;
   ledger.costUsd += u.costUsd;
   ledger.durationMs += u.durationMs;
+  ledger.lastPromptTokens = promptTokens(u);
   for (const m of u.models) if (!ledger.models.includes(m)) ledger.models.push(m);
 }
 
@@ -315,6 +319,7 @@ export function parsePrintEnvelope(raw: string): { text: string; usage: AIUsage 
     durationMs: num(d.duration_ms),
     models: d.modelUsage && typeof d.modelUsage === 'object' ? Object.keys(d.modelUsage) : [],
     calls: 1,
+    lastPromptTokens: num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens),
     measured: Boolean(hasUsage),
   };
   return { text, usage };
@@ -346,14 +351,16 @@ export function getAvailableProviders(): AIProvider[] {
 }
 
 /** The argv for a stripped, measured `claude --print` call (execFile form — no shell). */
-export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources(), schema?: object): string[] {
+export function claudePrintArgs(model: string | undefined, effort: string | undefined, sources = settingSources(), schema?: object, session?: RunOptions['session']): string[] {
   const args = [
     '--print',
     '--output-format', 'json',
     '--strict-mcp-config',
     '--setting-sources', sources,
-    '--no-session-persistence',
   ];
+  // A loop session must persist to be resumable; a one-off call leaves no transcript.
+  if (session) args.push(session.resume ? '--resume' : '--session-id', session.id);
+  else args.push('--no-session-persistence');
   if (model) args.push('--model', model);
   if (effort) args.push('--effort', effort);
   // A schema makes the CLI enforce the output shape — no more prose where JSON was asked
@@ -365,6 +372,13 @@ export function claudePrintArgs(model: string | undefined, effort: string | unde
 export interface RunOptions {
   /** JSON Schema the reply must satisfy (claude only; codex has no equivalent). */
   schema?: object;
+  /**
+   * Run inside a persisted Claude session: `resume: false` starts one with this id,
+   * `resume: true` continues it. A continued session is a prompt-cache hit on everything
+   * said so far, which is how a fix-verify round costs cents instead of dollars. The
+   * transcript is written under the CLI's project dir for the cwd — one file per loop.
+   */
+  session?: { id: string; resume: boolean };
 }
 
 let announcedModel = false;
@@ -376,9 +390,9 @@ function runClaude(prompt: string, opts: RunOptions): string {
   warnIfSettingsRoute(settings);
   if (!model && !announcedModel) {
     announcedModel = true;
-    process.stderr.write('lgtm: no model configured (LGTM_MODEL or ~/.claude/settings.json) — the claude CLI will pick its default.\n');
+    process.stderr.write('lgtm: no model configured — the claude CLI picks its default, and lgtm cannot tell when you change it (a loop session opened on the old one would then review with a cold cache). Set LGTM_MODEL, or "model" in ~/.claude/settings.json, to pin it.\n');
   }
-  const args = claudePrintArgs(model, effort, settingSources(), opts.schema);
+  const args = claudePrintArgs(model, effort, settingSources(), opts.schema, opts.session);
   try {
     const raw = execFileSync('claude', args, {
       input: prompt,
@@ -431,6 +445,11 @@ function runCodex(prompt: string, label: string): string {
  * Usage for the call (when the provider reports it) lands in the ledger — see takeUsage.
  */
 export function runAIPrompt(prompt: string, ai: AIProvider, label = 'prompt', opts: RunOptions = {}): string {
+  // Debugging aids: LGTM_DUMP_PROMPT=<file> writes the exact prompt; LGTM_NO_CALL=1 then
+  // stops before any model call (the round is not logged — nothing was spent).
+  const dump = process.env.LGTM_DUMP_PROMPT;
+  if (dump) writeFileSync(dump, prompt);
+  if (process.env.LGTM_NO_CALL === '1') throw new Error(`LGTM_NO_CALL: prompt ${dump ? `written to ${dump}` : 'not sent'} (${prompt.length} chars)`);
   try {
     return ai === 'codex' ? runCodex(prompt, label) : runClaude(prompt, opts);
   } catch (error: any) {

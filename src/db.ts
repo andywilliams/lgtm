@@ -44,6 +44,10 @@ export interface ReviewLog {
   diffLines?: number;
   modelReason?: string;
   failed?: boolean;
+  sessionId?: string;
+  /** path → sha1 of the full contents sent this round. */
+  fileShas?: Record<string, string>;
+  modelRole?: string;
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -82,6 +86,16 @@ const REVIEW_COLUMNS: [string, string][] = [
   // 1 when the round produced no review (the model call or its parse failed) — the
   // spend is real, the round judges nothing.
   ['failed', 'INTEGER'],
+  // The Claude session this round ran in (one per loop; later rounds resume it) and the
+  // sha1 of each changed file's contents as sent — so the next round sends only what moved.
+  ['session_id', 'TEXT'],
+  ['file_shas', 'TEXT'],
+  // What lgtm ASKED for, independent of how the CLI names it back: 'full' (the operator's
+  // default), 'late:<id>' (the policy's cheaper model) or 'explicit:<id>' (--model).
+  ['model_role', 'TEXT'],
+  // Prompt tokens of the round's LAST call: the context the session holds after it.
+  // prompt_tokens sums every attempt (a schema retry bills twice), so it over-states.
+  ['context_tokens', 'INTEGER'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -163,7 +177,19 @@ export function initDb(): Database.Database {
  * caller can inherit the scope and hand the reviewer its own dismissals without a file.
  * The ordinal is a preview; the insert allocates the real one.
  */
-export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; scopeFrom: string | null; dismissed: DecidedFinding[] } {
+export interface LoopSession {
+  id: string;
+  /** The model the session has been running on, as the CLI reported it. */
+  model: string | null;
+  /** What lgtm asked for on the session's latest round: 'full' | 'late:<id>' | 'explicit:<id>' — the comparable thing. */
+  role: string | null;
+  /** path → sha1 of the file contents the session has already seen (latest version of each). */
+  fileShas: Record<string, string>;
+  /** Billed prompt tokens of the session's latest turn — the context a resumed turn starts from. */
+  lastPromptTokens: number | null;
+}
+
+export function loopContext(repo: string, roundKey: string, branch?: string): { nextRound: number; lastScope: string | null; scopeFrom: string | null; dismissed: DecidedFinding[]; session: LoopSession | null } {
   const db = initDb();
   const nextRound = nextRoundIn(db, repo, roundKey);
   // A PR loop continues the branch's local loop: its scope and dismissals carry over.
@@ -172,6 +198,33 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
   // Scope comes from the current run only — a loop restarted after a gap states its own.
   const run = currentRun(db, repo, keys);
   const scoped = [...run].reverse().find((r) => r.scope);
+  // The loop's session: the latest round that ran in one (failed rounds included — the
+  // session exists even if that turn produced nothing). File shas accumulate across the
+  // session's rounds so "what changed since" is judged against what it last saw.
+  const sessionRow = [...run].reverse().find((r) => r.session_id);
+  let session: LoopSession | null = null;
+  if (sessionRow?.session_id) {
+    const fileShas: Record<string, string> = {};
+    for (const r of run) {
+      if (r.session_id !== sessionRow.session_id || !r.file_shas) continue;
+      try { Object.assign(fileShas, JSON.parse(r.file_shas)); } catch { /* ignore a bad row */ }
+    }
+    const modelRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_id);
+    const roleRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && r.model_role);
+    // No role recorded (a row from before the column existed) ⇒ null; planSession then
+    // opens a new session rather than guess from the reported id's family name.
+    // context_tokens is the last call's prompt (older rows only carry the summed
+    // prompt_tokens); an unmeasured or failed round records neither, so the budget reads
+    // the latest round of this session that measured anything.
+    const ctxRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && (r.context_tokens ?? r.prompt_tokens) !== null);
+    session = {
+      id: sessionRow.session_id,
+      model: modelRow?.model_id ?? null,
+      role: roleRow?.model_role ?? null,
+      fileShas,
+      lastPromptTokens: ctxRow ? ctxRow.context_tokens ?? ctxRow.prompt_tokens : null,
+    };
+  }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
     `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' ORDER BY id`
@@ -192,6 +245,7 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     // inherit message can say so instead of "round 0" on a PR's first round.
     scopeFrom: scoped ? `${scoped.round_key} round ${scoped.round}` : null,
     dismissed,
+    session,
   };
 }
 
@@ -234,13 +288,17 @@ interface RunRow {
   diff_lines: number | null;
   model_id: string | null;
   failed: number | null;
+  session_id: string | null;
+  file_shas: string | null;
+  model_role: string | null;
+  context_tokens: number | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -280,9 +338,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -317,7 +375,11 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.recovered ? 1 : 0,
     data.diffLines ?? null,
     data.modelReason ?? null,
-    data.failed ? 1 : 0
+    data.failed ? 1 : 0,
+    data.sessionId ?? null,
+    data.fileShas ? JSON.stringify(data.fileShas) : null,
+    data.modelRole ?? null,
+    m ? m.lastPromptTokens : null
     );
     return { id: Number(result.lastInsertRowid), round };
   });

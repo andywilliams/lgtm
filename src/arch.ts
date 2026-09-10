@@ -103,14 +103,18 @@ export async function archReview(
     fileContextSection =
       `\n## Full contents of changed files\n` +
       `Use these to ground "codebase-pattern" claims (count the pattern before claiming it) and to judge placement.\n\n` +
+      // Path order, like the related files: the same set must render identically round to round.
       Object.entries(files)
+        .sort(([a], [b]) => a.localeCompare(b))
         .map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``)
         .join('\n\n') +
       '\n';
   }
 
+  // Stable-first for the prompt cache: system prompt, charter, system doc, handbook and
+  // the changed files' contents before the diff and title, which change every round.
   const prompt = `${ARCH_SYSTEM_PROMPT}
-${context.charterBlock || ''}${context.systemBlock || ''}${context.handbookBlock || ''}
+${context.charterBlock || ''}${context.systemBlock || ''}${context.handbookBlock || ''}${fileContextSection}
 ## Change title
 ${title}
 
@@ -121,7 +125,7 @@ ${body || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${fileContextSection}
+
 ${ARCH_OUTPUT_FORMAT}`;
 
   const output = runAIPrompt(prompt, ai, 'arch');

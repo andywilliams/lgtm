@@ -66,7 +66,7 @@ export const REVIEW_SCHEMA = {
   required: ['summary', 'comments'],
 } as const;
 
-const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
+export const SYSTEM_PROMPT = `You are a senior code reviewer. Review the provided PR diff and give specific, actionable feedback.
 
 IMPORTANT RULES:
 - Only comment on lines that are ADDED (start with + in the diff)
@@ -85,65 +85,45 @@ When raising a readability issue, suggest the clearer alternative and use severi
 CLAIMS & CONVENTIONS — do not invent rules:
 You are reviewing from the diff and the provided context ONLY; you cannot browse the repository. So do NOT assert that a "project convention", "standard", "the codebase always does X", or similar exists unless it is directly evidenced in what you were given. If a finding depends on a convention you cannot see, phrase it conditionally ("if the project's convention is X, then…"), cap its severity at "SUGGESTION", and never state the convention as established fact. When unsure, under-claim rather than fabricate a rule — a confidently-wrong finding is worse than a missing one.`;
 
+export interface ReviewPromptInput {
+  diff: string;
+  prTitle: string;
+  prBody: string;
+  harshness: Harshness;
+  fileContents?: Record<string, string>;
+  usageContext?: string;
+  expandedContext?: string;
+  handbookContext?: string;
+  extra?: {
+    scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean;
+    /** Continue the loop's session instead of starting fresh; only what moved is sent. */
+    session?: { id: string; resume: boolean; round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] };
+  };
+}
+
 /**
- * Review a PR diff using specified AI CLI
+ * Assemble the review prompt STABLE-FIRST, in decreasing order of stability. The API
+ * caches by exact prefix, so the parts that never change within a loop come first (the
+ * system prompt, the repo's charter/standards/handbook), then the parts that change only
+ * when the code does (related files, the changed files' contents, symbol usages — a fix
+ * round edits exactly these, so they close the stable group rather than open it), and
+ * last the parts that change every round: the diff, harshness, scope, dismissals and the
+ * output contract. Measured before this ordering: two consecutive rounds re-sent
+ * ~220k tokens at full price because the harshness text came first; an identical prompt
+ * re-run read 223k tokens from cache and cost a tenth. (DWLF-215)
  */
-export async function reviewPR(
-  diff: string,
-  prTitle: string,
-  prBody: string,
-  harshness: Harshness,
-  ai: AIProvider = 'claude',
-  fileContents?: Record<string, string>,
-  usageContext?: string,
-  expandedContext?: string,
-  handbookContext?: string,
-  extra?: { scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean }
-): Promise<ReviewResult> {
-  // Build file context section if provided
-  let fileContextSection = '';
-  if (fileContents && Object.keys(fileContents).length > 0) {
-    fileContextSection = `\n## Full File Contents (for pattern analysis)
-Look at how similar code is structured in these files. If the PR adds new code that doesn't follow existing patterns (e.g., missing integration with existing systems, missing registration in arrays/maps where similar items are registered), flag it.
+export function buildReviewPrompt(input: ReviewPromptInput): string {
+  return buildStablePrefix(input) + buildVolatileTail(input);
+}
 
-${Object.entries(fileContents).map(([path, content]) => 
-  `### ${path}\n\`\`\`\n${content}\n\`\`\``
-).join('\n\n')}
+/** The part of the prompt that is the same within a loop (see buildReviewPrompt). */
+export function buildStablePrefix(input: ReviewPromptInput): string {
+  const { fileContents, usageContext, expandedContext, handbookContext, extra } = input;
 
-IMPORTANT: Compare the PR changes against the existing patterns in the full files above. Flag any inconsistencies where new code doesn't follow established patterns.
-`;
-  }
+  // ---- stable within a loop, most stable first -------------------------------------
+  const handbookContextSection = handbookContext || '';
 
-  // Add usage context if provided
-  let usageContextSection = '';
-  if (usageContext) {
-    usageContextSection = usageContext;
-  }
-
-  // Add expanded context if provided
-  let expandedContextSection = '';
-  if (expandedContext) {
-    expandedContextSection = expandedContext;
-  }
-
-  // Add second-brain handbook (domain) context if provided
-  let handbookContextSection = '';
-  if (handbookContext) {
-    handbookContextSection = handbookContext;
-  }
-
-  // Scope of the change (--scope): out-of-scope *quality* issues become follow-ups — but never
-  // downgrade a genuine bug/security risk just because it's out of scope, and defer to harshness.
-  let scopeSection = '';
-  if (extra?.scope) {
-    scopeSection = `\n## Scope of this change
-${extra.scope}
-
-For issues OUTSIDE this scope (pre-existing problems in the files you're touching, or unrelated concerns), prefix the title "(out of scope)". Treat out-of-scope *quality / style / improvement* issues as follow-ups at severity "SUGGESTION". But do NOT downgrade to hide risk — a genuine bug, crash, or security problem keeps "BUG"/"SECURITY" even when it is out of scope (just note it looks pre-existing). Focus your attention on the change itself, and still obey the harshness rules above: if they say not to emit suggestions, don't (that includes these out-of-scope follow-ups).
-`;
-  }
-
-  // In-repo architecture charter (--auto-detected): one conformance check, not a gate.
+  // In-repo architecture charter (auto-detected): one conformance check, not a gate.
   let charterSection = '';
   if (extra?.charter) {
     charterSection = `${extra.charter}
@@ -156,6 +136,37 @@ The charter above is context for ONE extra check only: if this diff (a) contradi
   // The block arrives fully-formed from buildStandardsBlock — instruction included.
   const standardsSection = extra?.standards ?? '';
 
+  const expandedContextSection = expandedContext || '';
+
+  let fileContextSection = '';
+  if (fileContents && Object.keys(fileContents).length > 0) {
+    fileContextSection = `\n## Full File Contents (for pattern analysis)
+Look at how similar code is structured in these files. If the PR adds new code that doesn't follow existing patterns (e.g., missing integration with existing systems, missing registration in arrays/maps where similar items are registered), flag it.
+
+${Object.entries(fileContents).sort(([a], [b]) => a.localeCompare(b)).map(([path, content]) =>
+  `### ${path}\n\`\`\`\n${content}\n\`\`\``
+).join('\n\n')}
+
+IMPORTANT: Compare the PR changes against the existing patterns in the full files above. Flag any inconsistencies where new code doesn't follow established patterns.
+`;
+  }
+
+  const usageContextSection = usageContext || '';
+
+  return `${SYSTEM_PROMPT}
+${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}`;
+}
+
+/**
+ * The part of the prompt that changes every round: title, diff, harshness, scope,
+ * dismissals and the output contract. Built directly — never sliced out of the full
+ * prompt by a marker, because a reviewed file can contain any marker (this repo's own
+ * review.ts does), and a slice would then carry half the stable prefix along.
+ */
+export function buildVolatileTail(input: ReviewPromptInput): string {
+  const { diff, prTitle, prBody, harshness, extra } = input;
+
+  // ---- changes every round -----------------------------------------------------------
   // Retro mode: the "diff" is an entire EXISTING file presented as additions. Without
   // this the model reads it as newly-authored work and miscalibrates — it reports
   // long-standing intentional behaviour as a defect someone is about to ship, and
@@ -172,6 +183,17 @@ The diff above is a whole file from the current codebase, rendered as additions 
 `;
   }
 
+  // Scope of the change (--scope): out-of-scope *quality* issues become follow-ups — but never
+  // downgrade a genuine bug/security risk just because it's out of scope, and defer to harshness.
+  let scopeSection = '';
+  if (extra?.scope) {
+    scopeSection = `\n## Scope of this change
+${extra.scope}
+
+For issues OUTSIDE this scope (pre-existing problems in the files you're touching, or unrelated concerns), prefix the title "(out of scope)". Treat out-of-scope *quality / style / improvement* issues as follow-ups at severity "SUGGESTION". But do NOT downgrade to hide risk — a genuine bug, crash, or security problem keeps "BUG"/"SECURITY" even when it is out of scope (just note it looks pre-existing). Focus your attention on the change itself, and still obey the harshness rules: if they say not to emit suggestions, don't (that includes these out-of-scope follow-ups).
+`;
+  }
+
   // Previously-dismissed findings (--decided): don't re-litigate settled points across a fix loop.
   let decidedSection = '';
   if (extra?.decided && extra.decided.length > 0) {
@@ -184,8 +206,7 @@ ${items}
 `;
   }
 
-  const userPrompt = `${HARSHNESS_PROMPTS[harshness]}
-
+  return `
 ## PR Title
 ${prTitle}
 
@@ -196,7 +217,10 @@ ${prBody || '(no description)'}
 \`\`\`diff
 ${diff}
 \`\`\`
-${handbookContextSection}${charterSection}${standardsSection}${retroSection}${fileContextSection}${usageContextSection}${expandedContextSection}${scopeSection}${decidedSection}
+${retroSection}
+## What to flag (harshness: ${harshness})
+${HARSHNESS_PROMPTS[harshness]}
+${scopeSection}${decidedSection}
 OUTPUT FORMAT: You must respond with ONLY a valid JSON object, no other text before or after.
 For each issue found, include in the comments array:
 - "file": the file path
@@ -211,13 +235,66 @@ Respond with this exact JSON structure:
 
 If no issues found, respond with:
 {"summary": "LGTM — no issues found", "comments": []}`;
+}
 
-  const fullPrompt = `${SYSTEM_PROMPT}\n\n${userPrompt}`;
+/**
+ * The prompt for a round that CONTINUES the loop's session. The session already holds
+ * the system prompt, the repo context and every file it has seen, so this sends only
+ * what moved: the current contents of files changed since the last round (replacing the
+ * versions in context), the current diff, and the per-round instructions. The reviewer
+ * is told this is a later round of the same change, so it judges the code as it is now.
+ */
+export function buildResumePrompt(input: ReviewPromptInput & { round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] }): string {
+  const { prTitle, harshness, round, changedSinceLast, unchangedFiles, usageContext } = input;
+  const volatile = buildVolatileTail(input); // title, diff, harshness, scope, decided, output format
+  const entries = Object.entries(changedSinceLast).sort(([a], [b]) => a.localeCompare(b));
+  const context = entries.filter(([p]) => p.startsWith('@'));
+  const changed = entries.filter(([p]) => !p.startsWith('@'));
+  const contextSection = context.length > 0
+    ? `## Repo context updated since the last round (replaces what you were given earlier)\n\n` + context.map(([, block]) => block).join('\n') + '\n'
+    : '';
+  const changedSection = changed.length > 0
+    ? `## Files changed since the last round — CURRENT contents (these replace the versions you saw earlier)\n\n` +
+      changed.map(([path, content]) => `### ${path}\n\`\`\`\n${content}\n\`\`\``).join('\n\n') + '\n'
+    : '## Files changed since the last round\n\n(none — the contents you have already seen are current)\n';
+  const unchanged = unchangedFiles.filter((p) => !p.startsWith('@')).length > 0
+    ? `Unchanged since the last round (contents already in context): ${unchangedFiles.filter((p) => !p.startsWith('@')).join(', ')}\n` : '';
+  // Symbol usages are recomputed from the current diff and are small: always current.
+  const usage = usageContext ? `\n${usageContext}\n` : '';
+  return `# Review round ${round} of "${prTitle}" — the code has moved on since your last review
 
+This is a later round of the SAME change. Everything you were given before (repo charter, standards, related files, file contents) still applies unless replaced below. Judge the code AS IT IS NOW: a finding from an earlier round that the current code no longer exhibits must not be repeated; a finding that still applies should be raised again. Harshness for this round: ${harshness}.
+
+${contextSection}${changedSection}${unchanged}${usage}${volatile}`;
+}
+
+/**
+ * Review a PR diff using specified AI CLI
+ */
+export async function reviewPR(
+  diff: string,
+  prTitle: string,
+  prBody: string,
+  harshness: Harshness,
+  ai: AIProvider = 'claude',
+  fileContents?: Record<string, string>,
+  usageContext?: string,
+  expandedContext?: string,
+  handbookContext?: string,
+  extra?: ReviewPromptInput['extra']
+): Promise<ReviewResult> {
+  const input = { diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, extra };
+  const s = extra?.session;
+  const fullPrompt = s?.resume
+    ? buildResumePrompt({ ...input, round: s.round, changedSinceLast: s.changedSinceLast, unchangedFiles: s.unchangedFiles })
+    : buildReviewPrompt(input);
   // The schema is a retry tool, not a default: measured, it adds a second CLI turn that
   // misses the prompt cache (2.3× the cost of a small call), so it is used only when a
   // plain reply failed to parse.
-  const output = runAIPrompt(fullPrompt, ai, 'review', { schema: extra?.enforceSchema ? REVIEW_SCHEMA : undefined });
+  const output = runAIPrompt(fullPrompt, ai, 'review', {
+    schema: extra?.enforceSchema ? REVIEW_SCHEMA : undefined,
+    session: s ? { id: s.id, resume: s.resume } : undefined,
+  });
   return parseAIResponse(output);
 }
 
