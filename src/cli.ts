@@ -15,6 +15,7 @@ import { runStandardsInit } from './standardsInterview.js';
 import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
+import { buildRepoMap } from './repoMap.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -1913,6 +1914,8 @@ interface ArchRunOptions {
   dryRun: boolean;
   fullContext: boolean;
   ai: AIProvider;
+  /** Cap on the repository-map block; undefined uses the module default. */
+  maxMapBytes?: number;
 }
 
 async function runArchReview(options: ArchRunOptions): Promise<void> {
@@ -1953,6 +1956,11 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   }
   if (archCtx.systemPath) log(chalk.blue(`🗺  System doc: ${archCtx.systemPath}`));
 
+  // A directory census, so placement and pattern claims can be COUNTED rather than felt.
+  const repoMap = buildRepoMap(repoRoot ?? process.cwd(), options.maxMapBytes);
+  if (repoMap.block) log(chalk.blue(`🧭 Repository map${repoMap.truncated ? ' (truncated)' : ''}`));
+  else log(chalk.yellow(`🧭 No repository map — placement and pattern counts will be skipped`));
+
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
 
@@ -1961,6 +1969,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   const result = await archReview(truncatedDiff, pr.title, pr.body, ai, {
     charterBlock: archCtx.charterBlock,
     systemBlock: archCtx.systemBlock,
+    repoMapBlock: repoMap.block,
     handbookBlock,
     fileContents,
   });
@@ -2017,6 +2026,7 @@ arch
   .option('--full-context', 'Include full contents of changed files (always on in agent mode)', false)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('--model <id>', 'Model to review with (default: your settings model)')
+  .option('--max-map-bytes <n>', 'Cap the repository map block (default 8000 bytes)')
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
     function exitWithError(message: string): never {
@@ -2060,6 +2070,7 @@ arch
         dryRun: options.dryRun,
         fullContext: options.fullContext,
         ai,
+        maxMapBytes: options.maxMapBytes ? Number(options.maxMapBytes) : undefined,
       });
     } catch (error: any) {
       exitWithError(error?.message ?? String(error));

@@ -156,3 +156,22 @@ describe('formatArchComment', () => {
     assert.ok(md.includes('Skipped checks'));
   });
 });
+
+describe('skipped checks are ground truth', () => {
+  it('reports a missing repository map, and never lets the model claim one it did not get', () => {
+    const result = {
+      verdict: 'no-decisions' as const, summary: '', decisions: [],
+      skipped_checks: ['charter-grounded checks — no charter resolvable', 'something the model noticed'],
+    };
+    const withMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, true, true, true);
+    assert.ok(!withMap.skipped_checks.some((s) => /repository map/.test(s)));
+    assert.ok(withMap.skipped_checks.includes('something the model noticed'), 'the model keeps its own entries');
+
+    const withoutMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, true, true, false);
+    assert.ok(withoutMap.skipped_checks.some((s) => /repository map/.test(s)));
+
+    // A model that claims the map was skipped when it was given one is overruled.
+    const lying = enforceSkippedChecks({ ...result, skipped_checks: ['placement and codebase-pattern counts — no repository map'] }, true, true, true);
+    assert.deepEqual(lying.skipped_checks, []);
+  });
+});
