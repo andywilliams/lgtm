@@ -824,14 +824,17 @@ async function runReview(options: RunOptions): Promise<void> {
   // logging calls below read whichever session the last attempt actually used.
   const sessionUsed: { current: { id: string; resume: boolean } | null } = { current: null };
   const freshSession = sessionPlan ? { id: randomUUID(), resume: false, changedSinceLast: {}, unchangedFiles: [] } : null;
+  // Which session ids this process has already handed to the CLI. An attempt that opened
+  // a session (even one whose reply was unusable) leaves it on disk, so every later rung
+  // must --resume it rather than pass --session-id again, which the CLI refuses. The
+  // session then already holds the full prompt, so resuming is also the cheap form.
+  const started = new Set<string>();
   const review = (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean } = {}) => {
     if (ai === 'claude') setModelOverride(attempt.model);
-    const session = attempt.fresh ? freshSession : sessionPlan;
+    const base = attempt.fresh ? freshSession : sessionPlan;
+    const session = base ? { ...base, resume: base.resume || started.has(base.id) } : null;
     sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
-    // The first fresh attempt CREATES the session; a later rung must continue it, not
-    // pass --session-id again (the CLI refuses an id that already exists). It holds the
-    // full prompt from that first attempt, so the resume form is also the cheap one.
-    if (session && session === freshSession && !session.resume) freshSession!.resume = true;
+    if (session) started.add(session.id);
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
       scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
       session: session ? { ...session, round: policy?.loopRound ?? 1 } : undefined,
@@ -852,9 +855,9 @@ async function runReview(options: RunOptions): Promise<void> {
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(attempted),
   });
   let result: Awaited<ReturnType<typeof review>>;
-  let freshened: boolean | undefined;
-  ({ result, choice, freshened } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
-  if (freshened) choice = { ...choice, reason: `fresh session after the loop's could not be continued (${choice.reason})` };
+  let freshReason: string | undefined;
+  ({ result, choice, freshReason } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
+  if (freshReason) choice = { ...choice, reason: `${freshReason} (${choice.reason})` };
 
   log(chalk.gray(`\n${result.summary}\n`));
 

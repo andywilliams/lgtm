@@ -97,12 +97,15 @@ test('when the fresh session also fails, the error that surfaces is the latest o
 test('every fresh rung after the first continues the session the first one created', async () => {
   // Mirrors runReview's `review` closure: one fresh session, created once then resumed.
   const freshSession = { id: 'fresh-1', resume: false };
+  const loopSession = { id: 'loop-1', resume: true };
+  const started = new Set<string>();
   const seen: Array<{ id: string; resume: boolean }> = [];
   const script: Array<Error | typeof ok> = [new Error('No conversation found with session ID'), parseError(), ok];
   const review = async (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean }) => {
-    const session = attempt.fresh ? freshSession : { id: 'loop-1', resume: true };
-    seen.push({ ...session });
-    if (session === freshSession && !session.resume) freshSession.resume = true;
+    const base = attempt.fresh ? freshSession : loopSession;
+    const session = { ...base, resume: base.resume || started.has(base.id) };
+    seen.push(session);
+    started.add(session.id);
     const next = script.shift();
     if (next instanceof Error) throw next;
     return next ?? ok;
@@ -113,6 +116,35 @@ test('every fresh rung after the first continues the session the first one creat
     { id: 'fresh-1', resume: false },  // created by the freshen rung
     { id: 'fresh-1', resume: true },   // the schema rung continues it, never re-creates it
   ]);
+});
+
+test('a session opened by round 1 itself is resumed by the retry rungs, never re-created', async () => {
+  const roundOneSession = { id: 'loop-1', resume: false }; // planSession opened it this round
+  const started = new Set<string>();
+  const seen: Array<{ id: string; resume: boolean }> = [];
+  const script: Array<Error | typeof ok> = [parseError(), ok];
+  const review = async (attempt: { enforceSchema?: boolean; model?: string; fresh?: boolean }) => {
+    const base = attempt.fresh ? { id: 'fresh-1', resume: false } : roundOneSession;
+    const session = { ...base, resume: base.resume || started.has(base.id) };
+    seen.push(session);
+    started.add(session.id);
+    const next = script.shift();
+    if (next instanceof Error) throw next;
+    return next ?? ok;
+  };
+  await reviewWithRecovery({ review, ai: 'claude', choice: full, initialChoice: full, logFailedRound: () => {}, say: () => {} });
+  assert.deepEqual(seen, [{ id: 'loop-1', resume: false }, { id: 'loop-1', resume: true }]);
+});
+
+test('freshReason is set only when the session was the problem, not the model', async () => {
+  const lost = harness([new Error('No conversation found with session ID'), ok], true);
+  const a = await lost.run(full);
+  assert.match(a.freshReason ?? '', /could not be continued/);
+
+  const modelFallback = harness([parseError(), parseError(), ok]);
+  const b = await modelFallback.run(cheaper);
+  assert.equal(b.freshReason, undefined, 'a model fallback says so in choice.reason instead');
+  assert.match(b.choice.reason, /fell back to the full model/);
 });
 
 test('the full-model fallback always opens its own session — a cheaper session\'s cache is model-scoped', async () => {
