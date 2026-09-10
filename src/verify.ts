@@ -118,6 +118,11 @@ section or document that is not listed above is ALWAYS "unshown", never "unprove
 ABSENCE OF PROOF IS NOT REFUTATION. Do not reason from what is missing from your context: a thing you
 were not given is not a thing that does not exist.
 
+A finding of kind "missing" claims something is ABSENT, so there are no lines showing a defect to quote.
+"confirmed" for one of those means: you looked where the thing would be, in code you were given, and it
+is not there — quote the place it would have been, or the requirement it fails. Do not answer "unproven"
+merely because an absence has nothing to point at.
+
 WHAT YOU MAY NOT DO:
 - You may NOT add findings. If you notice a different problem, ignore it — that is not this job.
 - You may NOT change a finding's file, line, title or body.
@@ -248,13 +253,21 @@ export function diffFiles(diff: string): Set<string> {
 }
 
 /**
- * Does any finding cite a DOCUMENT — the charter, STANDARDS.md, or the ticket — rather
- * than the code? Those documents are the only evidence such a finding can have, so they
- * travel with it; without them the finding is an unprovable opinion and the drop rule
- * deletes the whole class.
+ * Is this finding a conformance claim against a DOCUMENT — the charter, STANDARDS.md, or
+ * the ticket — rather than a claim about the code? Two things follow. The document travels
+ * with it, because it is the only evidence such a finding can have. And it is never dropped
+ * merely as `unproven`: each of those checks is already capped at ONE finding by its own
+ * prompt, and every one is a SUGGESTION, so without this the opinion-drop could silently
+ * delete a whole capped feature — the completeness check (DWLF-210) is one finding, always
+ * a SUGGESTION, and asserts an ABSENCE, which is the hardest shape to quote lines for.
+ * They can still be REFUTED and dropped; what is refused is deletion by inability to prove.
  */
+export function citesDoc(f: ReviewComment): boolean {
+  return /^\((charter|ticket|standard\b[^)]*)\)/i.test(f.title);
+}
+
 export function citesDocs(findings: ReviewComment[]): boolean {
-  return findings.some((f) => /^\((charter|ticket|standard\b[^)]*)\)/i.test(f.title));
+  return findings.some(citesDoc);
 }
 
 export function buildVerifyPrompt(input: VerifyInput, shownOut?: Set<string>): string {
@@ -393,7 +406,7 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
-    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed));
+    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !citesDoc(f));
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)
       : verdict === 'unproven' ? 'low' as const : f.confidence;

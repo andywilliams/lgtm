@@ -2182,7 +2182,10 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     prTitle: pr.title, prBody: pr.body, branch: local ? getCurrentBranch() : pr.headRef,
   });
   if (archTicket.block) log(chalk.blue(`🎫 Ticket DWLF-${archTicket.ref}`));
-  else if (archTicket.reason) log(chalk.yellow(`🎫 DWLF-${archTicket.ref}: ${archTicket.reason}`));
+  // Silent for an unconfigured board, exactly as the review path is: it is the default
+  // state and an opt-out, not a failure. It is still recorded in `skipped_checks`, which is
+  // arch's structured record of what it could not ground rather than a warning to the operator.
+  else if (archTicket.reason && archTicket.skipped !== 'not-configured') log(chalk.yellow(`🎫 DWLF-${archTicket.ref}: ${archTicket.reason}`));
 
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
@@ -2195,7 +2198,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     repoMapBlock: repoMap.block,
     repoMapTruncated: repoMap.truncated,
     ticketBlock: archTicket.block,
-    ticketSkipReason: archTicket.reason ?? undefined,
+    ticketSkip: archTicket.reason ? { configured: archTicket.skipped !== 'not-configured', reason: archTicket.reason } : undefined,
     handbookBlock,
     fileContents,
   });

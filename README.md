@@ -247,12 +247,14 @@ Each finding comes back with a verdict:
 | `confirmed` | the verifier quoted lines showing the problem is real | shown, confidence raised to `high` |
 | `refuted` | it quoted lines that contradict the finding | dropped |
 | `unshown` | the code that would settle it was not in front of it | **shown unchanged** |
-| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped |
+| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped, unless it cites a document (see below) |
 | `unverified` | the pass did not run, failed, or said nothing about this finding | shown unchanged |
 
 Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`, and a finding whose proof was never in front of the verifier is `unshown`, which drops nothing.
 
 That last distinction was bought with data. On this feature's own third review round, before `unshown` existed, the verifier dropped three findings — and all three were true, dropped only because their proof sat in a file it had not been given. So it is now also **shown the whole of any other file a finding names**, and told exactly which files it has. And the rule is enforced where the truth is known: lgtm records which files it actually sent, and rewrites any verdict about a file it never sent to `unshown` — the model is asked, but not trusted, because the configurations this feature recommends for decorrelation are the ones least likely to honour a fine prose distinction.
+
+A finding tagged `(ticket)`, `(charter)` or `(standard …)` is never dropped merely as `unproven` — it can still be refuted. Each of those checks is capped at one SUGGESTION by its own prompt, and the completeness check asserts an *absence*, which has no lines to quote, so without the exemption the filter could silently delete a whole capped feature.
 
 `comments` in agent mode now carries the findings that **survived**. Everything dropped is in `verify.dropped` with its own `id`, so a wrong drop can be quoted back, dismissed, or joined to its row in the log.
 

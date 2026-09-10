@@ -88,8 +88,12 @@ export interface ArchReviewContext {
   handbookBlock?: string;
   /** The ticket this change was asked to deliver (may be ''); see ticket.ts. */
   ticketBlock?: string;
-  /** A ticket ref was found but the board could not be read — named in skipped_checks. */
-  ticketSkipReason?: string;
+  /**
+   * A ticket ref was found but no block could be built. The KIND is passed through rather
+   * than recovered from the message: reconstructing it by regex on human-readable prose
+   * means an ordinary reword of that message silently changes what the honesty record says.
+   */
+  ticketSkip?: { configured: boolean; reason: string };
   /** Full contents of changed files, for pattern-counting and placement checks. */
   fileContents?: Record<string, string>;
 }
@@ -142,7 +146,7 @@ ${ARCH_OUTPUT_FORMAT}`;
     charter: Boolean(context.charterBlock),
     system: Boolean(context.systemBlock),
     map: context.repoMapBlock ? (context.repoMapTruncated ? 'truncated' : true) : false,
-    ticket: context.ticketBlock ? true : context.ticketSkipReason ?? false,
+    ticket: context.ticketBlock ? true : context.ticketSkip ?? false,
   });
 }
 
@@ -158,10 +162,8 @@ const MAP_TRUNCATED = 'placement and codebase-pattern counts — the repository 
 // Two shapes on purpose: a board nobody configured is an opt-out, and reads differently
 // from a configured board that failed. Both are recorded — `skipped_checks` is arch's
 // structured honesty record, not a warning, so absence of a check belongs in it either way.
-const ticketSkip = (why: string) =>
-  /no board access/i.test(why)
-    ? 'ticket check — no board access'
-    : `ticket check — the ticket could not be read (${why})`;
+const ticketSkip = (s: { configured: boolean; reason: string }) =>
+  s.configured ? `ticket check — the ticket could not be read (${s.reason})` : 'ticket check — no board access';
 
 /**
  * The skipped_checks honesty contract is enforced from ground truth, not model
@@ -174,8 +176,8 @@ export interface ContextPresence {
   system: boolean;
   /** false when no map could be built; 'truncated' when only part of one was shown. */
   map: boolean | 'truncated';
-  /** true when the ticket was provided; a string when one was named but unreadable; false when none was named. */
-  ticket?: boolean | string;
+  /** true when the ticket was provided; the skip when one was named but unreadable; false when none was named. */
+  ticket?: boolean | { configured: boolean; reason: string };
 }
 
 export function enforceSkippedChecks(result: ArchResult, present: ContextPresence): ArchResult {
@@ -191,7 +193,7 @@ export function enforceSkippedChecks(result: ArchResult, present: ContextPresenc
     ...(present.charter ? [] : [CHARTER_SKIP]),
     ...(present.system ? [] : [SYSTEM_SKIP]),
     ...(present.map === true ? [] : [present.map === 'truncated' ? MAP_TRUNCATED : MAP_SKIP]),
-    ...(typeof present.ticket === 'string' ? [ticketSkip(present.ticket)] : []),
+    ...(present.ticket && typeof present.ticket === 'object' ? [ticketSkip(present.ticket)] : []),
   ];
   result.skipped_checks = [...canonical, ...rest];
   return result;

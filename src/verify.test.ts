@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -43,6 +43,26 @@ describe('applyVerdicts — what may drop a finding', () => {
     const v = parseVerdicts(JSON.stringify({ verdicts: [{ id: 1, verdict: 'probably fine', verifier_note: 'a' }] }), 1);
     assert.equal(v[1].verdict, 'unshown');
     assert.deepEqual(dropped(applyVerdicts([finding({ severity: 'NITPICK' })], v)), []);
+  });
+
+  test('a finding whose evidence is a DOCUMENT is not dropped merely as unproven', () => {
+    // Each document check is capped at ONE finding and is always a SUGGESTION, so the
+    // opinion-drop could otherwise delete a whole capped feature silently. The completeness
+    // check is the sharp case: one SUGGESTION asserting an ABSENCE, which has no lines to
+    // quote. They can still be REFUTED; what is refused is deletion by inability to prove.
+    const docs = [
+      finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' }),
+      finding({ severity: 'SUGGESTION', title: '(charter) this contradicts an invariant' }),
+      finding({ severity: 'NITPICK', title: '(standard FUN-1) the function is too long' }),
+    ];
+    const unproven = Object.fromEntries(docs.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    assert.deepEqual(dropped(applyVerdicts(docs, unproven)), []);
+
+    const refuted = Object.fromEntries(docs.map((_, i) => [i + 1, { verdict: 'refuted' as const, verifier_evidence: ['x'], verifier_note: 'n' }]));
+    assert.equal(dropped(applyVerdicts(docs, refuted)).length, 3, 'a refuted document claim is still dropped');
+
+    assert.equal(citesDoc(finding({ title: '(out of scope) x' })), false);
+    assert.equal(citesDoc(finding({ title: 'plain finding' })), false);
   });
 
   test('an unproven BUG is kept at low confidence; an unproven SUGGESTION is dropped', () => {

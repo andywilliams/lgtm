@@ -189,8 +189,14 @@ describe('skipped checks are ground truth', () => {
     assert.deepEqual(enforceSkippedChecks({ ...base }, { ...ctx, ticket: true }).skipped_checks, []);
 
     // A ticket that WAS named and could not be read is recorded, with the reason.
-    const unreadable = enforceSkippedChecks({ ...base }, { ...ctx, ticket: 'the board answered 500' });
+    const unreadable = enforceSkippedChecks({ ...base }, { ...ctx, ticket: { configured: true, reason: 'the board answered 500' } });
     assert.ok(unreadable.skipped_checks.some((s) => /ticket could not be read \(the board answered 500\)/.test(s)));
+
+    // An unconfigured board is its own shape, and the string DWLF-210 quotes verbatim. The
+    // kind is passed through rather than sniffed out of the reason, so rewording the
+    // human-readable message cannot silently change what the honesty record claims.
+    const unconfigured = enforceSkippedChecks({ ...base }, { ...ctx, ticket: { configured: false, reason: 'anything at all' } });
+    assert.deepEqual(unconfigured.skipped_checks, ['ticket check — no board access']);
 
     // And the model's OWN phrasing is overruled when the ticket was in fact provided —
     // matched on a fragment, like the other three, or a paraphrase survives and claims a
