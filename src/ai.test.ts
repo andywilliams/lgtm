@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -261,4 +261,20 @@ test('claudePrintArgs: a loop session persists and is started or resumed by id; 
   assert.ok(!cont.includes('--session-id'));
   assert.ok(!cont.includes('--no-session-persistence'));
   assert.ok(claudePrintArgs('claude-fable-5-1[1m]', 'high', '').includes('--no-session-persistence'));
+});
+
+test('timeoutMs: a positive override wins, anything else falls back to the default', () => {
+  const saved = process.env.LGTM_TIMEOUT_MS;
+  try {
+    delete process.env.LGTM_TIMEOUT_MS;
+    assert.equal(timeoutMs(), DEFAULT_TIMEOUT_MS);
+    process.env.LGTM_TIMEOUT_MS = '60000';
+    assert.equal(timeoutMs(), 60_000);
+    for (const junk of ['0', '-1', 'soon', '']) {
+      process.env.LGTM_TIMEOUT_MS = junk;
+      assert.equal(timeoutMs(), DEFAULT_TIMEOUT_MS, `junk ${JSON.stringify(junk)} falls back`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
+  }
 });

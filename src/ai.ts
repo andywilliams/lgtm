@@ -106,6 +106,18 @@ export function takeUsage(): AIUsage {
 }
 
 // Anthropic ids, the [1m] suffix, Vertex `@date` ids and Bedrock ARNs (`/`, `:`).
+/**
+ * How long one model call may take before lgtm gives up and SAYS so. A review that
+ * cannot finish used to hang with no output at all — four attempts on DWLF-136 produced
+ * nothing, not even a "too large" message, which is what made a slow tool look broken.
+ */
+export const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+export function timeoutMs(): number {
+  const raw = process.env.LGTM_TIMEOUT_MS?.trim();
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TIMEOUT_MS;
+}
+
 const MODEL_ID = /^[\w.:@\/\-\[\]]+$/;
 
 // A per-process model override — set from `--model` or the round policy — outranks
@@ -408,11 +420,22 @@ function runClaude(prompt: string, opts: RunOptions): string {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs(),
     });
     const { text, usage } = parsePrintEnvelope(raw);
     addUsage(usage, prompt.length);
     return text;
   } catch (error: any) {
+    // A run that cannot finish must say so, with the lever that fixes it — silence for
+    // fifteen minutes is what made this look like a broken tool rather than a slow one.
+    if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') {
+      const mins = Math.round(timeoutMs() / 60000);
+      throw new Error(
+        `claude --print produced nothing in ${mins} minutes (prompt ~${Math.ceil(prompt.length / 4).toLocaleString()} tokens). ` +
+          'A first round on a very large change is the usual cause. Options: review the unreviewed delta only ' +
+          '(--local --base <last-reviewed-commit>), split the change, or raise LGTM_TIMEOUT_MS.'
+      );
+    }
     // A non-zero exit usually still carries the JSON envelope on stdout; surface its
     // reason instead of the bare "Command failed: claude …". Anything that is NOT an
     // envelope (usage text from an older CLI, a stray message) stays an error.
@@ -439,6 +462,7 @@ function runCodex(prompt: string, label: string): string {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
       maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs(),
     });
     addUsage(null, prompt.length);
     return readFileSync(outputFile, 'utf-8');
