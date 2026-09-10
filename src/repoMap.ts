@@ -16,6 +16,21 @@ export interface RepoMap {
   truncated: boolean;
 }
 
+/** What the map was built from: the local checkout's HEAD, and whether it is dirty. */
+function revision(repoRoot: string): string {
+  try {
+    const head = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--short', 'HEAD'], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const dirty = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain'], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 4 * 1024 * 1024,
+    }).trim() !== '';
+    return dirty ? `${head} + uncommitted changes` : head;
+  } catch {
+    return 'unknown revision';
+  }
+}
+
 const DEFAULT_MAX_BYTES = 8_000;
 
 /** Tracked files, or null when this is not a git checkout. */
@@ -75,7 +90,9 @@ function entryPoints(repoRoot: string): string[] {
       const shown = typeof e === 'string' ? e : Array.isArray(e) ? e.join(', ') : Object.keys(e).join(', ');
       out.push(`exports: ${shown}`);
     }
-    if (pkg.files) out.push(`files: ${(pkg.files as string[]).join(', ')}`);
+    // `files` comes from someone else's package.json: a non-array would throw on join.
+    if (Array.isArray(pkg.files)) out.push(`files: ${pkg.files.join(', ')}`);
+    else if (typeof pkg.files === 'string') out.push(`files: ${pkg.files}`);
     return out;
   } catch {
     return [];
@@ -105,7 +122,10 @@ export function buildRepoMap(repoRoot: string, maxBytes = DEFAULT_MAX_BYTES): Re
   const flows = workflows(files);
 
   let block = `\n## Repository map (${files.length} tracked files, ${total} directories`;
-  block += omitted > 0 ? `, ${census.length} largest shown)\n` : ')\n';
+  block += omitted > 0 ? `, ${census.length} largest shown` : '';
+  // Provenance, because the map is the LOCAL checkout — not necessarily the revision the
+  // diff under review is against. A claim counted here is a claim about this working copy.
+  block += `; local checkout at ${revision(repoRoot)})\n`;
   block += `Use it for PLACEMENT and for COUNTED pattern claims: "11 files live under src/handlers/, this one is under src/services/" is a \`codebase-pattern\` claim you can make from this map. A count you cannot make from the map or the file contents provided stays \`judgement\`. The map lists directories and counts, NOT every file, and ${omitted > 0 ? `${omitted} smaller directories are not listed` : 'every directory is listed'} — the absence of a file, or of a directory, is not evidence it does not exist.\n\n`;
   block += census.map(({ dir, count }) => `- ${dir}/ — ${count}`).join('\n') + '\n';
   if (entries.length > 0) block += `\nPackage entry points: ${entries.join(' · ')}\n`;

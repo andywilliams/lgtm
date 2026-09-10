@@ -1856,6 +1856,8 @@ function formatArchAgentResult(opts: {
   charterPath?: string;
   charterSource?: string;
   systemPath?: string;
+  /** Whether the review was grounded by a repository map — structured, not only prose in skipped_checks. */
+  repoMap?: { present: boolean; truncated: boolean };
   error?: string;
 }): string {
   const r = opts.result;
@@ -1872,6 +1874,7 @@ function formatArchAgentResult(opts: {
       charter: opts.charterPath ?? null,
       charterSource: opts.charterSource ?? null,
       system: opts.systemPath ?? null,
+      repoMap: opts.repoMap ?? { present: false, truncated: false },
     },
     ...(opts.error ? { error: opts.error } : {}),
   });
@@ -1984,6 +1987,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
       charterPath: archCtx.charterPath,
       charterSource: archCtx.charterSource,
       systemPath: archCtx.systemPath,
+      repoMap: { present: Boolean(repoMap.block), truncated: repoMap.truncated },
     }));
     return;
   }
