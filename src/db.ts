@@ -48,6 +48,8 @@ export interface ReviewLog {
   /** path → sha1 of the full contents sent this round. */
   fileShas?: Record<string, string>;
   modelRole?: string;
+  /** The verifier pass, when it ran: its model, its own spend, and why it could not answer. */
+  verify?: { model?: string; measured: boolean; costUsd: number | null; tokens: number | null; failed?: string };
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -60,8 +62,10 @@ const REVIEW_COLUMNS: [string, string][] = [
   ['cost_usd', 'REAL'],
   ['duration_ms', 'INTEGER'],
   ['model_id', 'TEXT'],
-  // 'measured' when every model call reported usage; 'estimate' otherwise (codex, or a
-  // provider reply with no envelope) — so a query never mixes the two silently.
+  // 'measured' when every model call reported usage; 'estimate' when the REVIEW's own
+  // calls did not (codex, or a provider reply with no envelope); 'partial' when the review
+  // was measured and the verifier pass was not — so a query never mixes the three silently,
+  // and a round is not thrown away as unmeasured because its second half ran on codex.
   ['usage_source', 'TEXT'],
   ['mode', 'TEXT'],
   ['round_key', 'TEXT'],
@@ -98,7 +102,35 @@ const REVIEW_COLUMNS: [string, string][] = [
   ['context_tokens', 'INTEGER'],
   // What lgtm sent this round (prompt chars/4) — the honest input to a session's growth.
   ['sent_tokens', 'INTEGER'],
+  // The verifier pass (DWLF-209): which model proved-or-dropped this round's findings,
+  // and what that second call cost on its own — so "review + verify vs review alone" is
+  // a subtraction, not an estimate. NULL when the pass did not run; `verify_failed` holds
+  // why when it ran and could not answer, since "nothing dropped" and "nothing checked"
+  // are different rounds.
+  // 1 when the pass RAN. A pass can run with no model id (the operator's own model is
+  // not a first-party one), so verify_model being NULL cannot stand for "did not run" —
+  // and "nothing was dropped" and "nothing was checked" must not read the same.
+  ['verify_ran', 'INTEGER'],
+  // Which verdict vocabulary and drop rule produced this round's verdicts. The rules
+  // changed once mid-development ('unproven' narrowed, 'unshown' carved out of it) and
+  // will change again; without this, verdicts written under different rules are summed
+  // together forever and no drop rate can be attributed to the rules that produced it.
+  ['verify_rules', 'INTEGER'],
+  ['verify_model', 'TEXT'],
+  ['verify_cost_usd', 'REAL'],
+  ['verify_tokens', 'INTEGER'],
+  ['verify_failed', 'TEXT'],
 ];
+
+/**
+ * The version of the verifier's verdict vocabulary and drop rule, stored per round.
+ * Bump it whenever what a verdict MEANS changes, so a stored verdict can be attributed to
+ * the rules that produced it — the repo's own precedent (DWLF-151) is to store alongside
+ * and never silently rewrite. 1: confirmed/refuted/unproven, an unproven opinion dropped.
+ * 2: 'unshown' carved out of 'unproven' and enforced by the caller, not only asked for in
+ * the prompt — after v1 dropped three findings that were true and merely not shown.
+ */
+export const VERIFY_RULES_VERSION = 2;
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
 export const ROUND_BUDGET = 8;
@@ -156,9 +188,23 @@ function migrate(db: Database.Database): void {
   const findingCols = new Set(
     (db.prepare('PRAGMA table_info(findings)').all() as { name: string }[]).map((c) => c.name)
   );
-  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT'], ['evidence', 'TEXT'], ['how_to_verify', 'TEXT']] as [string, string][]) {
+  for (const [name, type] of [
+    ['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT'], ['evidence', 'TEXT'], ['how_to_verify', 'TEXT'],
+
+    // The verifier's verdict on this finding, what it quoted, and the severity the
+    // REVIEWER gave when the verifier lowered it (DWLF-209).
+    // The verifier's judgement is its OWN axis, kept off `disposition`: that column means
+    // "what a later round decided about this finding" and nothing else, so a query for
+    // open findings does not silently inherit the verifier's opinion, and a finding
+    // dropped in one round and confirmed in the next is a join anyone can write.
+    ['verdict', 'TEXT'], ['verifier_note', 'TEXT'], ['verifier_evidence', 'TEXT'], ['original_severity', 'TEXT'], ['dropped', 'INTEGER'],
+  ] as [string, string][]) {
     if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
   }
+  // Rows written while the drop lived on `disposition` (this feature's own first loop):
+  // move them onto the column that means it. Idempotent, and it leaves them open to the
+  // loop's own disposition pass exactly as an undropped finding would be.
+  db.exec("UPDATE findings SET dropped = 1, disposition = NULL WHERE disposition = 'verifier-dropped'");
 }
 
 export function initDb(): Database.Database {
@@ -248,7 +294,7 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
   }
   const marks = keys.map(() => '?').join(', ');
   const dismissedRows = db.prepare(
-    `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' ORDER BY id`
+    `SELECT file, line, title, dismissed_reason FROM findings WHERE repo = ? AND round_key IN (${marks}) AND disposition = 'dismissed' AND COALESCE(dropped, 0) = 0 ORDER BY id`
   ).all(repo, ...keys) as { file: string; line: number; title: string; dismissed_reason: string | null }[];
   db.close();
   const seen = new Set<string>();
@@ -315,13 +361,17 @@ interface RunRow {
   file_shas: string | null;
   model_role: string | null;
   context_tokens: number | null;
+  verify_ran: number | null;
+  verify_model: string | null;
+  verify_cost_usd: number | null;
+  verify_failed: string | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens, verify_ran, verify_model, verify_cost_usd, verify_failed FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -361,9 +411,10 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens,
+      verify_ran, verify_rules, verify_model, verify_cost_usd, verify_tokens, verify_failed
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -386,7 +437,7 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     m?.durationMs ?? null,
     // The primary model, not the helper: the CLI lists a small model alongside it.
     m && m.models.length > 0 ? primaryModel(m.models) : null,
-    m ? 'measured' : 'estimate',
+    m ? (data.verify && !data.verify.measured ? 'partial' : 'measured') : 'estimate',
     data.mode ?? null,
     data.roundKey ?? null,
     round,
@@ -403,7 +454,13 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.fileShas ? JSON.stringify(data.fileShas) : null,
     data.modelRole ?? null,
     m ? m.lastPromptTokens : null,
-    u ? u.sentTokens : null
+    u ? u.sentTokens : null,
+    data.verify ? 1 : 0,
+    data.verify ? VERIFY_RULES_VERSION : null,
+    data.verify?.model ?? null,
+    data.verify?.costUsd ?? null,
+    data.verify?.tokens ?? null,
+    data.verify?.failed ?? null
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -448,16 +505,26 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
-    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify,
+      verdict, verifier_note, verifier_evidence, original_severity, dropped)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   // The evidence is stored with the finding, not just shown: `confidence` is a verdict
   // derived from it, and a later round marking the finding fixed or suppressed is only
   // checkable if what the reviewer actually quoted survives.
+  // A dropped finding carries `dropped = 1` and no disposition: it never reached the
+  // agent, so no later round settles it, but `disposition` keeps its one meaning and the
+  // drop stays a fact anyone can query — including against the round that re-raised it.
+  // `severity` stores the FINAL severity (the verifier may have lowered it) because that
+  // is what the stopping rule reads; the reviewer's claim survives in `original_severity`.
   const tx = db.transaction((rows: ReviewComment[]) =>
     rows.map((c) => Number(ins.run(
       reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.fingerprint ?? null,
       c.kind ?? null, c.confidence ?? null, c.evidence && c.evidence.length > 0 ? JSON.stringify(c.evidence) : null, c.how_to_verify ?? null,
+      c.verdict ?? null, c.verifier_note ?? null,
+      c.verifier_evidence && c.verifier_evidence.length > 0 ? JSON.stringify(c.verifier_evidence) : null,
+      c.original_severity ?? null,
+      c.verifier_dropped ? 1 : 0,
     ).lastInsertRowid))
   );
   const ids = tx(comments);
@@ -500,12 +567,7 @@ export function stopAdvice(round: number, lastBugRound: number | null, clean: nu
   };
 }
 
-export interface DispositionSummary {
-  fixed: number;
-  dismissed: number;
-  carried: number;
-  suppressed: number;
-}
+export type DispositionSummary = Record<Disposition, number>;
 
 export interface DisposeOptions {
   decided?: DecidedFinding[];
@@ -555,7 +617,7 @@ export function disposePreviousRound(
   const prev = db.prepare(
     'SELECT f.id, f.fingerprint, f.fingerprint_raw, f.title, f.file, f.severity, f.kind, f.confidence, r.harshness FROM findings f ' +
     'JOIN reviews r ON r.id = f.review_id ' +
-    `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL`
+    `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL AND COALESCE(f.dropped, 0) = 0`
   ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; fingerprint_raw: string | null; title: string; file: string; severity: Severity; kind: string | null; confidence: string | null; harshness: string | null }[];
   if (prev.length === 0) {
     db.close();
@@ -633,16 +695,28 @@ export interface RoundRow {
   promptTokens: number | null;
   model: string | null;
   failed: boolean;
+  /** Counts EXCLUDING findings the verifier dropped — the round as the agent saw it. */
   bySeverity: Record<Severity, number>;
   findings: number;
   /** Findings about what the diff removes or omits — the class a diff review skips. */
   absences: number;
   /** Findings the reviewer could quote evidence for. */
   highConfidence: number;
+  /** Findings the verifier refuted or could not prove: this round's false-positive count. */
+  dropped: number;
+  /** Findings the verifier was asked about and confirmed. */
+  confirmed: number;
   fixed: number;
   dismissed: number;
   carried: number;
   suppressed: number;
+  /** True when the verifier pass ran on this round at all — the denominator of a drop rate. */
+  verified: boolean;
+  /** Why the pass could not answer, when it ran and could not: the round is UNCHECKED, not clean. */
+  verifyFailed: string | null;
+  /** The verifier pass's own spend, when it ran. */
+  verifyCostUsd: number | null;
+  verifyModel: string | null;
 }
 
 export interface LoopSummary {
@@ -688,8 +762,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   const marks = keys.map(() => '?').join(', ');
   const reviews = roundsFor(db, repo, keys);
   const findings = db.prepare(
-    `SELECT round_key, round, severity, disposition, kind, confidence FROM findings WHERE repo = ? AND round_key IN (${marks})`
-  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null; kind: string | null; confidence: string | null }[];
+    `SELECT round_key, round, severity, disposition, kind, confidence, verdict, dropped FROM findings WHERE repo = ? AND round_key IN (${marks})`
+  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null; kind: string | null; confidence: string | null; verdict: string | null; dropped: number | null }[];
   const inRun = new Set<string>();
   db.close();
 
@@ -706,18 +780,30 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     findings: 0,
     absences: 0,
     highConfidence: 0,
+    dropped: 0,
+    confirmed: 0,
     fixed: 0,
     dismissed: 0,
     carried: 0,
     suppressed: 0,
+    verified: Boolean(r.verify_ran),
+    verifyFailed: r.verify_failed,
+    verifyCostUsd: r.verify_cost_usd,
+    verifyModel: r.verify_model,
   }));
   const byRound = new Map(rounds.map((r) => [`${r.key}#${r.round}`, r]));
   // lastBugRound is an ordinal within the requested key — the stopping rule's own loop.
   let lastBugRound: number | null = null;
+  // A finding the verifier dropped never reached the agent, so it is not part of what
+  // the round FOUND: it is counted only as a drop, and it must not set lastBugRound or
+  // break the clean-round count — otherwise refuting a false BUG would buy the loop
+  // nothing and the stopping rule would still be driven by the noise.
   for (const f of findings) {
     const row = byRound.get(`${f.round_key}#${f.round}`);
     if (!row) continue;
+    if (f.dropped) { row.dropped += 1; continue; }
     row.findings += 1;
+    if (f.verdict === 'confirmed') row.confirmed += 1;
     if (f.kind === 'removed' || f.kind === 'missing') row.absences += 1;
     if (f.confidence === 'high') row.highConfidence += 1;
     if (SEVERITIES.includes(f.severity)) row.bySeverity[f.severity] += 1;
@@ -730,7 +816,7 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   const run = runOf(reviews);
   for (const r of run) inRun.add(`${r.round_key}#${r.round}`);
   const openBugs = findings.filter(
-    (f) => inRun.has(`${f.round_key}#${f.round}`) && f.disposition === null && (f.severity === 'BUG' || f.severity === 'SECURITY')
+    (f) => inRun.has(`${f.round_key}#${f.round}`) && f.disposition === null && !f.dropped && (f.severity === 'BUG' || f.severity === 'SECURITY')
   ).length;
   const judging = (i: number) => {
     const r = run[i];
@@ -775,7 +861,10 @@ export function getMonthlyStats(year: number, month: number): {
   total: number;
   falseNegatives: number;
   withContextExpansion: number;
+  /** Reviews whose own model calls reported usage — 'measured' and 'partial' rows alike. */
   measured: number;
+  /** Of those, the ones whose VERIFIER half reported nothing (a codex verifier). */
+  partial: number;
   promptTokens: number;
   outputTokens: number;
   costUsd: number;
@@ -789,7 +878,11 @@ export function getMonthlyStats(year: number, month: number): {
       COUNT(*) as total,
       SUM(false_negative) as false_negatives,
       SUM(used_context_expansion) as with_context,
-      SUM(CASE WHEN usage_source = 'measured' THEN 1 ELSE 0 END) as measured,
+      -- A 'partial' row's REVIEW figures are measured; only its verifier half was not
+      -- (codex reports no usage). Counting it as unmeasured would understate the coverage
+      -- of every figure below it, all of which come from the review's own envelope.
+      SUM(CASE WHEN usage_source IN ('measured', 'partial') THEN 1 ELSE 0 END) as measured,
+      SUM(CASE WHEN usage_source = 'partial' THEN 1 ELSE 0 END) as partial,
       SUM(prompt_tokens) as prompt_tokens,
       SUM(output_tokens) as output_tokens,
       SUM(cost_usd) as cost_usd
@@ -797,7 +890,7 @@ export function getMonthlyStats(year: number, month: number): {
     WHERE reviewed_at >= ? AND reviewed_at < ?
   `).get(startDate, endDate) as {
     total: number; false_negatives: number; with_context: number;
-    measured: number; prompt_tokens: number; output_tokens: number; cost_usd: number;
+    measured: number; partial: number; prompt_tokens: number; output_tokens: number; cost_usd: number;
   };
   db.close();
   return {
@@ -805,6 +898,7 @@ export function getMonthlyStats(year: number, month: number): {
     falseNegatives: stats.false_negatives || 0,
     withContextExpansion: stats.with_context || 0,
     measured: stats.measured || 0,
+    partial: stats.partial || 0,
     promptTokens: stats.prompt_tokens || 0,
     outputTokens: stats.output_tokens || 0,
     costUsd: stats.cost_usd || 0,

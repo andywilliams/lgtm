@@ -198,6 +198,8 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_MODEL` | your `~/.claude/settings.json` `model` | model id to review with |
 | `LGTM_EFFORT` | your settings' effort for that model | `low`/`medium`/`high`/`xhigh`/`max` |
 | `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
+| `LGTM_VERIFY_MODEL` | `claude-sonnet-5` | model for the verifier pass that proves or drops each finding (see below); `off` = no verifier pass |
+| `LGTM_VERIFY_MAX_BYTES` | `60000` | cap on the file windows the verifier is shown around each finding |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 | `LGTM_TIMEOUT_MS` | 15 minutes | how long one model call may take before lgtm gives up and says why |
@@ -210,7 +212,7 @@ Codex has no usage envelope, so its rows are stored as `usage_source = 'estimate
 Every review (PR or `--local`) is logged as a **round** with one row per finding. When the next round runs, the previous round's findings are marked `fixed` (no longer raised), `carried` (raised again), `dismissed` (absent and listed in your `--decided` file, reason kept) or `suppressed` (absent only because this round ran at a lower harshness that does not raise SUGGESTION/NITPICK — not evidence of a fix). Nothing to fill in — the tool infers it.
 
 ```bash
-lgtm rounds 86          # the loop for PR 86: findings per round by severity, fixed/dismissed/carried, cost
+lgtm rounds 86          # the loop for PR 86: findings per round by severity, confirmed/dropped, fixed/dismissed/carried, cost
 lgtm rounds --local     # the same for the current branch's working-tree reviews
 lgtm rounds 86 --json
 ```
@@ -218,6 +220,43 @@ lgtm rounds 86 --json
 Each finding carries its own triage fields: `kind` (`added`, or `removed` / `missing` for a deleted guard or an absent reader), `confidence` (`high` only when the reviewer could quote evidence — enforced on parse), `evidence` (the quoted lines), `how_to_verify` (the one check that settles it) and `fingerprint` (the symbol at fault, used to match the finding across rounds). Posted comments carry them too. `lgtm rounds` counts absences and high-confidence findings per round.
 
 Agent-mode output carries the same under `loop`: `round`, `previous` (what became of last round's findings), `lastBugRound`, `roundsSinceBug`, and `advice` — the stopping rule applied by the tool: **two consecutive rounds without a BUG/SECURITY, or one round that raises nothing at all ⇒ stop**, printed on stderr every round (`🛑 STOP  round 6, last BUG/SECURITY round 4 — 2 clean rounds, stop; file what is left`).
+
+### The verifier pass — a finding is proved before you read it
+
+On long loops most round-1 findings turn out not to be defects (DWLF-127 went from 109 to 12), and each one costs the reader a look before the next real fix. In `--agent` mode a **second model call** now proves or drops each finding before it is shown:
+
+```bash
+lgtm review 86 --agent                    # verifier on by default in agent mode
+lgtm review 86 --verify                    # turn it on for an interactive run
+lgtm review 86 --no-verify                 # off
+lgtm review 86 --verify-model claude-haiku-4-5-20251001
+lgtm review 86 --verify-ai codex           # a different model FAMILY, for decorrelation
+lgtm review 86 --agent --show-dropped      # audit the pass: show what it dropped
+export LGTM_VERIFY_MODEL=off               # turn the pass off everywhere
+```
+
+`--show-dropped` changes what is *displayed*, never what is posted: a refuted finding is never pushed to a PR.
+
+
+Each finding comes back with a verdict:
+
+| verdict | what it means | what happens |
+|---|---|---|
+| `confirmed` | the verifier quoted lines showing the problem is real | shown, confidence raised to `high` |
+| `refuted` | it quoted lines that contradict the finding | dropped |
+| `unshown` | the code that would settle it was not in front of it | **shown unchanged** |
+| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped |
+| `unverified` | the pass did not run, failed, or said nothing about this finding | shown unchanged |
+
+Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`, and a finding whose proof was never in front of the verifier is `unshown`, which drops nothing.
+
+That last distinction was bought with data. On this feature's own third review round, before `unshown` existed, the verifier dropped three findings — and all three were true, dropped only because their proof sat in a file it had not been given. So it is now also **shown the whole of any other file a finding names**, and told exactly which files it has. And the rule is enforced where the truth is known: lgtm records which files it actually sent, and rewrites any verdict about a file it never sent to `unshown` — the model is asked, but not trusted, because the configurations this feature recommends for decorrelation are the ones least likely to honour a fine prose distinction.
+
+`comments` in agent mode now carries the findings that **survived**. Everything dropped is in `verify.dropped` with its own `id`, so a wrong drop can be quoted back, dismissed, or joined to its row in the log.
+
+Drops are never silent. They are stored in `reviews.db` (so the false-positive share per round is a number, not a memory), listed under `verify.dropped` in agent output, and any dropped BUG/SECURITY prints a line on stderr. `lgtm rounds` divides the drops only by the findings a pass actually adjudicated, and names any round whose verifier ran and could not answer — those findings are *unchecked*, which is not the same as clean. A dropped finding is **not** fed back as a dismissal — the next round is free to raise it again, so one bad drop cannot silence a real bug for the rest of a loop.
+
+The verifier is deliberately given the diff and a window around each finding rather than the whole context: its question is per-finding, so its cost scales with the number of findings. Measured, it runs on `LGTM_VERIFY_MODEL` (default `claude-sonnet-5`) and `lgtm rounds` prints what it cost as a percentage on top of the reviews.
 
 ### Who reads what this diff writes
 
@@ -630,11 +669,17 @@ On success:
       "severity": "BUG",
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
-      "suggestion": "if (!input) return null;"
+      "suggestion": "if (!input) return null;",
+      "verdict": "confirmed",
+      "verifier_note": "parse() is called with the raw header on line 40",
+      "dropped": false
     }
-  ]
+  ],
+  "verify": { "model": "claude-sonnet-5", "failed": null, "checked": 3, "dropped": [] }
 }
 ```
+
+`verify` is `null` when the verifier pass did not run, and findings it dropped are never posted — see [the verifier pass](#the-verifier-pass--a-finding-is-proved-before-you-read-it).
 
 On error:
 ```json
@@ -709,6 +754,21 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   "posted": false,
   "commentsFound": 2,
   "duplicates": 1,
+  "verify": {
+    "model": "claude-sonnet-5",
+    "failed": null,
+    "checked": 3,
+    "dropped": [
+      {
+        "file": "src/parser.ts",
+        "line": 12,
+        "severity": "SUGGESTION",
+        "title": "Prefer a named constant",
+        "verdict": "unproven",
+        "reason": "nothing in the shown code makes this a defect"
+      }
+    ]
+  },
   "comments": [
     {
       "file": "src/parser.ts",
@@ -717,7 +777,12 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
       "title": "Missing null check",
       "body": "The input parameter could be undefined...",
       "suggestion": "if (!input) return null;",
-      "duplicate": false
+      "duplicate": false,
+      "verdict": "confirmed",
+      "verifier_note": "parse() is called with the raw header on line 40",
+      "verifier_evidence": ["const header = raw[0];"],
+      "original_severity": null,
+      "dropped": false
     },
     {
       "file": "src/parser.ts",
@@ -725,7 +790,12 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
       "severity": "SUGGESTION",
       "title": "Extract magic number",
       "body": "The value 1024 appears without explanation...",
-      "duplicate": true
+      "duplicate": true,
+      "verdict": "unverified",
+      "verifier_note": null,
+      "verifier_evidence": [],
+      "original_severity": null,
+      "dropped": false
     }
   ],
   "context": {
@@ -737,6 +807,8 @@ If you want an agent to post, use `--auto`. If you want an agent to *read everyt
   }
 }
 ```
+
+`verify` is `null` when the verifier pass did not run. `verify.checked` counts every finding the reviewer raised, including the dropped ones — `verify.dropped.length / verify.checked` is the round's false-positive share. Findings listed under `verify.dropped` are **not** in `comments`; `--show-dropped` puts them back, flagged `dropped: true`.
 
 On error (e.g. AI/CLI failure, invalid input), the same shape is returned with `success: false`, an `error` string, and an empty `comments` array. Exit code is `0` on success, `1` on error.
 

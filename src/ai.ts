@@ -106,6 +106,47 @@ export function takeUsage(): AIUsage {
 }
 
 /**
+ * A round's total spend, where the second window happened OUTSIDE the loop's session —
+ * today the verifier pass, which runs as its own one-off call on its own model.
+ *
+ * Deliberately asymmetric, and the asymmetry is the whole point. What the round COST is a
+ * sum: tokens, dollars, duration, calls. What the SESSION now holds is not — `sentTokens`
+ * and `lastPromptTokens` are read back by `planSession` to decide whether the session has
+ * room for another round, and the verifier's prompt is not in the session at all (its call
+ * passes no session, so the CLI is given `--no-session-persistence`). Summing them would
+ * charge the session phantom context and abandon it rounds early, re-sending the whole
+ * prompt uncached — the exact cost DWLF-215 exists to avoid. The verifier's own half is
+ * recorded separately in the row's `verify_*` columns, so nothing is lost by leaving it
+ * out of the session's accounting.
+ */
+export function mergeRoundUsage(session: AIUsage, outside: AIUsage): AIUsage {
+  if (outside.calls === 0) return session;
+  if (session.calls === 0) return { ...outside, sentTokens: 0, lastPromptTokens: 0 };
+  return {
+    inputTokens: session.inputTokens + outside.inputTokens,
+    cacheCreationTokens: session.cacheCreationTokens + outside.cacheCreationTokens,
+    cacheReadTokens: session.cacheReadTokens + outside.cacheReadTokens,
+    outputTokens: session.outputTokens + outside.outputTokens,
+    costUsd: session.costUsd + outside.costUsd,
+    durationMs: session.durationMs + outside.durationMs,
+    // The SESSION's models, so `model_id` still names the model that REVIEWED. Summing
+    // them would make it a compound string on every verified round, and the DWLF-206
+    // per-model saving is measured off that column; the verifier's own model is recorded
+    // in `verify_model`, where it can be read without ambiguity.
+    models: session.models,
+    calls: session.calls + outside.calls,
+    // Session-shaped fields: the first window's, never the sum. See above.
+    lastPromptTokens: session.lastPromptTokens,
+    sentTokens: session.sentTokens,
+    // Only the SESSION window decides whether this reads as a bill. The outside call has
+    // its own columns, and a provider that reports nothing (codex) would otherwise erase
+    // a fully-measured claude review from the log — making `--verify-ai codex`, the
+    // decorrelation move this feature recommends, the one that costs the round its numbers.
+    measured: session.measured,
+  };
+}
+
+/**
  * How long one model call may take before lgtm gives up and SAYS so. A review that
  * cannot finish used to hang with no output at all — four attempts on DWLF-136 produced
  * nothing, not even a "too large" message, which is what made a slow tool look broken.
@@ -168,6 +209,11 @@ export function isModelId(s: string): boolean {
 export function setModelOverride(model: string | undefined): void {
   if (model !== undefined && !MODEL_ID.test(model)) throw new Error(`not a model id: ${JSON.stringify(model)}`);
   modelOverride = model;
+}
+
+/** The override currently in force, so a nested call (the verifier) can put it back. */
+export function getModelOverride(): string | undefined {
+  return modelOverride;
 }
 
 /** The model late chill rounds run on; `off` disables the policy. Default is the current Sonnet. */

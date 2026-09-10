@@ -1,6 +1,6 @@
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeRoundUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -312,4 +312,66 @@ test('isTimeout: a killed child is ours only if the wait actually elapsed', asyn
   } finally {
     if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
   }
+});
+
+describe('mergeRoundUsage', () => {
+  const u = (over: Partial<AIUsage> = {}): AIUsage => ({ ...emptyUsage(), calls: 1, ...over });
+
+  test('sums the spend of the review and the verifier pass', () => {
+    const merged = mergeRoundUsage(
+      u({ inputTokens: 100, cacheReadTokens: 900, outputTokens: 50, costUsd: 1.5, durationMs: 1000, models: ['claude-opus-5'], sentTokens: 250, lastPromptTokens: 1000 }),
+      u({ inputTokens: 20, outputTokens: 5, costUsd: 0.04, durationMs: 300, models: ['claude-sonnet-5'], sentTokens: 30, lastPromptTokens: 20 }),
+    );
+    assert.equal(merged.costUsd, 1.54);
+    assert.equal(merged.calls, 2);
+    assert.equal(merged.outputTokens, 55);
+    // The models are the SESSION's: `model_id` must keep naming the model that reviewed,
+    // or it becomes "claude-opus-5+claude-sonnet-5" on every verified round and the
+    // per-model cost attribution DWLF-206 added it for stops working.
+    assert.deepEqual(merged.models, ['claude-opus-5']);
+  });
+
+  test('the session-shaped fields are the SESSION window\'s, never the sum', () => {
+    // Both are read back by planSession to decide whether the session has room for
+    // another round. The verifier's prompt is not in the session, so summing them charges
+    // it phantom context and abandons it early — re-sending the whole prompt uncached.
+    const merged = mergeRoundUsage(
+      u({ sentTokens: 250, lastPromptTokens: 1000, costUsd: 1.5 }),
+      u({ sentTokens: 30, lastPromptTokens: 20, costUsd: 0.04 }),
+    );
+    assert.equal(merged.sentTokens, 250);
+    assert.equal(merged.lastPromptTokens, 1000);
+    assert.equal(merged.costUsd, 1.54, 'the money is still the total');
+  });
+
+  test('only the SESSION half decides whether the round reads as a bill', () => {
+    // An unmeasured OUTSIDE call (codex reports no usage) must not throw away a fully
+    // measured review: the outside half has its own columns, and `usage_source` records
+    // that it was not measured. An unmeasured review is a different matter — nothing on
+    // the row is then a bill, and it must not read as one.
+    assert.equal(mergeRoundUsage(u({ costUsd: 1 }), u({ measured: false })).measured, true);
+    assert.equal(mergeRoundUsage(u({ measured: false }), u({ costUsd: 1 })).measured, false);
+  });
+
+  test('a window with no calls is ignored, and a verifier with no review before it grows no session', () => {
+    const review = u({ costUsd: 2, lastPromptTokens: 500, sentTokens: 400 });
+    assert.deepEqual(mergeRoundUsage(review, emptyUsage()), review);
+    const verifyOnly = mergeRoundUsage(emptyUsage(), review);
+    assert.equal(verifyOnly.costUsd, 2);
+    assert.equal(verifyOnly.sentTokens, 0, 'an outside call never counts as session context');
+    assert.equal(verifyOnly.lastPromptTokens, 0);
+  });
+});
+
+test('the model override is readable, so a nested call can put back what it found', () => {
+  // The verifier pass runs on a cheaper model mid-command; without this the review's own
+  // choice would be lost and everything after it would run on the verifier's model.
+  setModelOverride('claude-opus-5');
+  const before = getModelOverride();
+  setModelOverride('claude-sonnet-5');
+  assert.equal(getModelOverride(), 'claude-sonnet-5');
+  setModelOverride(before);
+  assert.equal(getModelOverride(), 'claude-opus-5');
+  setModelOverride(undefined);
+  assert.equal(getModelOverride(), undefined);
 });
