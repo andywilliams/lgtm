@@ -86,9 +86,8 @@ const LINT_PROBE_TIMEOUT_MS = 60_000;
 export type FragmentLintResult =
   | { status: 'ok' }
   | { status: 'skipped'; reason: string }
-  | { status: 'problems'; detail: string }
-  /** `namesFragment` false ⇒ their lint fails for a reason that may predate this file. */
-  | { status: 'broken'; detail: string; namesFragment: boolean };
+  /** `namesFragment` false ⇒ the output points at something else in the directory, or nowhere. */
+  | { status: 'problems' | 'broken'; detail: string; namesFragment: boolean };
 
 /**
  * Lint the generated fragment with the TARGET repo's own ESLint, because that is the only
@@ -114,7 +113,7 @@ export function checkFragmentLints(repoRoot: string, fragmentPath: string): Frag
     // root. Saying "nothing to break" there would be the exact wrong reassurance.
     return hasEslintConfig(repoRoot)
       ? { status: 'skipped', reason: 'ESLint is configured here but there is no local binary to run it with (Yarn PnP, or a workspace package) — check it yourself' }
-      : { status: 'skipped', reason: 'no ESLint configured in this repo' };
+      : { status: 'skipped', reason: 'no ESLint configured in this repo, so the mechanical rules have nothing to run in yet' };
   }
   // Lint the fragment's DIRECTORY, not the file. Naming a file explicitly makes ESLint lint
   // it even when the config ignores it — which would report `broken` forever in a repo that
@@ -136,11 +135,14 @@ export function checkFragmentLints(repoRoot: string, fragmentPath: string): Frag
     // FAIL" followed by the words "no output" — an accusation with no evidence behind it.
     if (typeof e?.status !== 'number') return { status: 'skipped', reason: `ESLint could not be run (${e?.code ?? e?.message ?? 'spawn failed'})` };
     const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
-    if (e.status === 1) return { status: 'problems', detail: firstUsefulLine(out) };
-    // Exit >= 2 also happens when their lint was ALREADY broken — a missing plugin, an
-    // unparseable config — before the fragment was ever read. Whether the output names the
-    // file decides whether lgtm may claim responsibility for it.
-    return { status: 'broken', detail: firstUsefulLine(out), namesFragment: out.includes(basename(fragmentPath)) || out.includes(dir) };
+    // Whether the output names our file decides whether lgtm may claim responsibility, and
+    // it applies to BOTH exits. `.lgtm/` is not a one-file directory — the answers JSON is
+    // written beside the fragment, `quality baseline` puts its own there — so a rule firing
+    // on a neighbour would otherwise be reported as a problem in the fragment, with a remedy
+    // aimed at the wrong file. Exit >= 2 has the same shape for a different reason: a
+    // missing plugin breaks their lint before the fragment is ever read.
+    const namesFragment = out.includes(basename(fragmentPath));
+    return { status: e.status === 1 ? 'problems' : 'broken', detail: firstUsefulLine(out), namesFragment };
   }
 }
 
@@ -575,7 +577,7 @@ function writeMechanicalHalf(opts: {
   // unrequested side effect on the working tree.
   const fragmentDir = join(dirname(outPath), '.lgtm');
   const fragmentPath = join(fragmentDir, 'standards.eslint.js');
-    const fragment = generateEslintFragment({
+  const fragment = generateEslintFragment({
     repoName,
     profile,
     selections,
@@ -613,10 +615,15 @@ function writeMechanicalHalf(opts: {
     console.log(chalk.yellow(`   ${lint.namesFragment ? 'Fix' : 'If it is this file'}: ${ignoreRemedy(repoRoot, fragmentPath)}.`));
     console.log(chalk.gray('   (Not done for you: editing a config lgtm did not generate is your call, not the tool\'s.)'));
   } else if (lint.status === 'problems') {
-    console.log(chalk.yellow(`\n⚠  Your ESLint reports problems in this generated file: ${lint.detail}`));
-    console.log(chalk.yellow(`   Either fix the rule that fires on it, or ${ignoreRemedy(repoRoot, fragmentPath)}.`));
+    console.log(chalk.yellow(lint.namesFragment
+      ? `\n⚠  Your ESLint reports problems in this generated file: ${lint.detail}`
+      : `\n⚠  Your ESLint reports problems under ${relative(repoRoot, dirname(fragmentPath)) || '.'} — not necessarily this file: ${lint.detail}`));
+    console.log(chalk.yellow(`   Either fix the rule that fires, or ${ignoreRemedy(repoRoot, fragmentPath)}.`));
   } else if (lint.status === 'skipped') {
-    console.log(chalk.gray(`   Not lint-checked (${lint.reason}) — the mechanical rules have nothing to run in yet.`));
+    // The reason carries its own consequence. A fixed tail here once said "the mechanical
+    // rules have nothing to run in yet", false for three of the four reasons — including
+    // the one added precisely to stop giving that reassurance.
+    console.log(chalk.gray(`   Not lint-checked: ${lint.reason}.`));
   }
 }
 

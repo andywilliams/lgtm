@@ -355,6 +355,21 @@ describe('checkFragmentLints — does the file we just wrote break their build?'
     assert.equal((checkFragmentLints(ours, join(ours, '.lgtm/standards.eslint.js')) as { namesFragment: boolean }).namesFragment, true);
   });
 
+  it('does not blame the fragment for a neighbour in the same directory', () => {
+    // `.lgtm/` is not a one-file directory: the answers JSON is written beside the fragment
+    // and `quality baseline` puts its own file there. A rule firing on a neighbour exits 1,
+    // and asserting "problems in this generated file" aims the remedy at the wrong file.
+    const dir = scratch({
+      '.lgtm/standards.eslint.js': 'export const standardsRules = {};\n',
+      '.lgtm/standards.answers.json': '{}\n',
+      'node_modules/.bin/eslint': '#!/bin/sh\necho ".lgtm/standards.answers.json 1:1 error Bad jsonc/no-comments"\nexit 1\n',
+    });
+    chmodSync(join(dir, 'node_modules/.bin/eslint'), 0o755);
+    const out = checkFragmentLints(dir, join(dir, '.lgtm/standards.eslint.js'));
+    assert.equal(out.status, 'problems');
+    assert.equal((out as { namesFragment: boolean }).namesFragment, false);
+  });
+
   it('does not probe a fragment written outside the repo by a preview run', () => {
     // `--out /tmp/draft/STANDARDS.md` puts the fragment in /tmp. Linting it with the repo's
     // cwd answers a question about a file that is not in the repo — most likely "ok",
