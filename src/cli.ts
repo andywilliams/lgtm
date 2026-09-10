@@ -1957,9 +1957,11 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   if (archCtx.systemPath) log(chalk.blue(`🗺  System doc: ${archCtx.systemPath}`));
 
   // A directory census, so placement and pattern claims can be COUNTED rather than felt.
-  const repoMap = buildRepoMap(repoRoot ?? process.cwd(), options.maxMapBytes);
+  // Only for the repo under review: charterRepoRoot returns null when --repo names another
+  // repository, and mapping the cwd checkout there would describe the wrong codebase.
+  const repoMap = repoRoot ? buildRepoMap(repoRoot, options.maxMapBytes) : { block: '', truncated: false };
   if (repoMap.block) log(chalk.blue(`🧭 Repository map${repoMap.truncated ? ' (truncated)' : ''}`));
-  else log(chalk.yellow(`🧭 No repository map — placement and pattern counts will be skipped`));
+  else log(chalk.yellow(`🧭 No repository map${repoRoot ? '' : ' (--repo names a repository this checkout is not)'} — placement and pattern counts will be skipped`));
 
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
@@ -1970,6 +1972,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     charterBlock: archCtx.charterBlock,
     systemBlock: archCtx.systemBlock,
     repoMapBlock: repoMap.block,
+    repoMapTruncated: repoMap.truncated,
     handbookBlock,
     fileContents,
   });
@@ -2039,6 +2042,10 @@ arch
     }
     if (options.model) {
       try { setModelOverride(options.model); } catch (e: any) { exitWithError(e.message); }
+    }
+    // Number('abc') is NaN and would silently disable the cap; reject rather than guess.
+    if (options.maxMapBytes !== undefined && (!/^\d+$/.test(String(options.maxMapBytes).trim()) || Number(options.maxMapBytes) < 1)) {
+      exitWithError('--max-map-bytes must be a positive integer');
     }
 
     const local = options.local;

@@ -109,7 +109,7 @@ describe('parseArchResponse', () => {
 describe('enforceSkippedChecks', () => {
   it('adds canonical entries from ground truth when the model omits them', () => {
     const r = parseArchResponse(JSON.stringify({ verdict: 'no-decisions', summary: 's', decisions: [], skipped_checks: [] }));
-    enforceSkippedChecks(r, false, false);
+    enforceSkippedChecks(r, { charter: false, system: false, map: true });
     assert.strictEqual(r.skipped_checks.length, 2);
     assert.ok(r.skipped_checks[0].includes('charter-grounded'));
     assert.ok(r.skipped_checks[1].includes('system-fit'));
@@ -122,7 +122,7 @@ describe('enforceSkippedChecks', () => {
       decisions: [],
       skipped_checks: ['Charter-grounded checks were not possible here', 'org-fit — no org context configured'],
     }));
-    enforceSkippedChecks(r, false, true);
+    enforceSkippedChecks(r, { charter: false, system: true, map: true });
     assert.deepStrictEqual(r.skipped_checks.filter((s) => s.includes('org-fit')).length, 1);
     assert.strictEqual(r.skipped_checks.filter((s) => /charter/i.test(s)).length, 1);
     assert.ok(!r.skipped_checks.some((s) => /system-fit/.test(s)));
@@ -135,7 +135,7 @@ describe('enforceSkippedChecks', () => {
       decisions: [],
       skipped_checks: ['system-fit checks — no system doc resolvable'],
     }));
-    enforceSkippedChecks(r, true, true);
+    enforceSkippedChecks(r, { charter: true, system: true, map: true });
     assert.deepStrictEqual(r.skipped_checks, []);
   });
 });
@@ -163,15 +163,19 @@ describe('skipped checks are ground truth', () => {
       verdict: 'no-decisions' as const, summary: '', decisions: [],
       skipped_checks: ['charter-grounded checks — no charter resolvable', 'something the model noticed'],
     };
-    const withMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, true, true, true);
+    const withMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, { charter: true, system: true, map: true });
     assert.ok(!withMap.skipped_checks.some((s) => /repository map/.test(s)));
     assert.ok(withMap.skipped_checks.includes('something the model noticed'), 'the model keeps its own entries');
 
-    const withoutMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, true, true, false);
+    const withoutMap = enforceSkippedChecks({ ...result, skipped_checks: [...result.skipped_checks] }, { charter: true, system: true, map: false });
     assert.ok(withoutMap.skipped_checks.some((s) => /repository map/.test(s)));
 
     // A model that claims the map was skipped when it was given one is overruled.
-    const lying = enforceSkippedChecks({ ...result, skipped_checks: ['placement and codebase-pattern counts — no repository map'] }, true, true, true);
+    const lying = enforceSkippedChecks({ ...result, skipped_checks: ['placement and codebase-pattern counts — no repository map'] }, { charter: true, system: true, map: true });
     assert.deepEqual(lying.skipped_checks, []);
+
+    // A truncated map is its own state: the reviewer is told absence proves nothing.
+    const cut = enforceSkippedChecks({ ...result, skipped_checks: [] }, { charter: true, system: true, map: 'truncated' });
+    assert.ok(cut.skipped_checks.some((s) => /TRUNCATED/.test(s)));
   });
 });

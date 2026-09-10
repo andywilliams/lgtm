@@ -80,6 +80,8 @@ export interface ArchReviewContext {
   charterBlock?: string;
   /** Directory census + entry points, so placement and pattern claims can be counted (may be ''). */
   repoMapBlock?: string;
+  /** True when the map above was cut short — the reviewer must not read absence as evidence. */
+  repoMapTruncated?: boolean;
   /** Prompt-ready system block from charter.ts (may be ''). */
   systemBlock?: string;
   /** Optional descriptive handbook context from the second brain (may be ''). */
@@ -132,7 +134,11 @@ ${ARCH_OUTPUT_FORMAT}`;
 
   const output = runAIPrompt(prompt, ai, 'arch');
   const result = parseArchResponse(output);
-  return enforceSkippedChecks(result, Boolean(context.charterBlock), Boolean(context.systemBlock), Boolean(context.repoMapBlock));
+  return enforceSkippedChecks(result, {
+    charter: Boolean(context.charterBlock),
+    system: Boolean(context.systemBlock),
+    map: context.repoMapBlock ? (context.repoMapTruncated ? 'truncated' : true) : false,
+  });
 }
 
 // "no charter RESOLVABLE", not "repo has none" — with --repo pointing away from the
@@ -140,6 +146,7 @@ ${ARCH_OUTPUT_FORMAT}`;
 const CHARTER_SKIP = 'charter-grounded checks — no charter resolvable';
 const SYSTEM_SKIP = 'system-fit checks — no system doc resolvable';
 const MAP_SKIP = 'placement and codebase-pattern counts — no repository map (not a git checkout, or it could not be listed)';
+const MAP_TRUNCATED = 'placement and codebase-pattern counts — the repository map was TRUNCATED, so a directory missing from it may still exist';
 
 /**
  * The skipped_checks honesty contract is enforced from ground truth, not model
@@ -147,12 +154,19 @@ const MAP_SKIP = 'placement and codebase-pattern counts — no repository map (n
  * canonical entries are set here (and the model's own phrasings of them dropped).
  * Exported for tests.
  */
-export function enforceSkippedChecks(result: ArchResult, hasCharter: boolean, hasSystem: boolean, hasMap = true): ArchResult {
+export interface ContextPresence {
+  charter: boolean;
+  system: boolean;
+  /** false when no map could be built; 'truncated' when only part of one was shown. */
+  map: boolean | 'truncated';
+}
+
+export function enforceSkippedChecks(result: ArchResult, present: ContextPresence): ArchResult {
   const rest = result.skipped_checks.filter((s) => !/charter-grounded|system-fit|repository map/i.test(s));
   const canonical = [
-    ...(hasCharter ? [] : [CHARTER_SKIP]),
-    ...(hasSystem ? [] : [SYSTEM_SKIP]),
-    ...(hasMap ? [] : [MAP_SKIP]),
+    ...(present.charter ? [] : [CHARTER_SKIP]),
+    ...(present.system ? [] : [SYSTEM_SKIP]),
+    ...(present.map === true ? [] : [present.map === 'truncated' ? MAP_TRUNCATED : MAP_SKIP]),
   ];
   result.skipped_checks = [...canonical, ...rest];
   return result;

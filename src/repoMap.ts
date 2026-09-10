@@ -46,6 +46,14 @@ export function directoryCensus(files: string[], maxDirs = 40): { dir: string; c
     .slice(0, maxDirs);
 }
 
+/** How many distinct two-level directories the repo has, so the caveat can be exact. */
+export function directoryCount(files: string[]): number {
+  return new Set(files.map((f) => {
+    const parts = f.split('/');
+    return parts.length === 1 ? '(root)' : parts.slice(0, Math.min(2, parts.length - 1)).join('/');
+  })).size;
+}
+
 /** What this package exposes — the interface a placement decision is judged against. */
 function entryPoints(repoRoot: string): string[] {
   const p = join(repoRoot, 'package.json');
@@ -55,7 +63,13 @@ function entryPoints(repoRoot: string): string[] {
     const out: string[] = [];
     if (pkg.main) out.push(`main: ${pkg.main}`);
     if (pkg.bin) out.push(`bin: ${typeof pkg.bin === 'string' ? pkg.bin : Object.keys(pkg.bin).join(', ')}`);
-    if (pkg.exports) out.push(`exports: ${Object.keys(pkg.exports).join(', ')}`);
+    if (pkg.exports) {
+      // `exports` is legally a string or an array as well as a map of subpaths;
+      // Object.keys on a string yields character indices.
+      const e = pkg.exports;
+      const shown = typeof e === 'string' ? e : Array.isArray(e) ? e.join(', ') : Object.keys(e).join(', ');
+      out.push(`exports: ${shown}`);
+    }
     if (pkg.files) out.push(`files: ${(pkg.files as string[]).join(', ')}`);
     return out;
   } catch {
@@ -80,11 +94,14 @@ export function buildRepoMap(repoRoot: string, maxBytes = DEFAULT_MAX_BYTES): Re
   if (!files) return { block: '', truncated: false };
 
   const census = directoryCensus(files);
+  const total = directoryCount(files);
+  const omitted = total - census.length;
   const entries = entryPoints(repoRoot);
   const flows = workflows(files);
 
-  let block = `\n## Repository map (${files.length} tracked files)\n`;
-  block += `Use it for PLACEMENT and for COUNTED pattern claims: "11 files live under src/handlers/, this one is under src/services/" is a \`codebase-pattern\` claim you can make from this map. A count you cannot make from the map or the file contents provided stays \`judgement\`. The map lists directories and counts, NOT every file — the absence of a file here is not evidence it does not exist.\n\n`;
+  let block = `\n## Repository map (${files.length} tracked files, ${total} directories`;
+  block += omitted > 0 ? `, ${census.length} largest shown)\n` : ')\n';
+  block += `Use it for PLACEMENT and for COUNTED pattern claims: "11 files live under src/handlers/, this one is under src/services/" is a \`codebase-pattern\` claim you can make from this map. A count you cannot make from the map or the file contents provided stays \`judgement\`. The map lists directories and counts, NOT every file, and ${omitted > 0 ? `${omitted} smaller directories are not listed` : 'every directory is listed'} — the absence of a file, or of a directory, is not evidence it does not exist.\n\n`;
   block += census.map(({ dir, count }) => `- ${dir}/ — ${count}`).join('\n') + '\n';
   if (entries.length > 0) block += `\nPackage entry points: ${entries.join(' · ')}\n`;
   if (flows.length > 0) block += `Workflows: ${flows.join(', ')}\n`;

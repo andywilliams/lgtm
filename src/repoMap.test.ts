@@ -44,3 +44,36 @@ describe('repository map', () => {
     assert.ok(block.endsWith('… (map truncated)\n'));
   });
 });
+
+describe('repository map: what it refuses to guess', () => {
+  it('names how many directories it left out, so absence is never evidence', () => {
+    const files = Array.from({ length: 60 }, (_, i) => `dir${i}/file.ts`);
+    const { block } = buildRepoMap(process.cwd());
+    assert.ok(/\d+ tracked files, \d+ directories/.test(block), block.slice(0, 120));
+    // The caveat covers directories, not just files — a 40-dir cap drops the rest.
+    assert.ok(/absence of a file, or of a directory, is not evidence/.test(block));
+    const census = directoryCensus(files);
+    assert.equal(census.length, 40, 'capped');
+    assert.equal(new Set(files.map((f) => f.split('/')[0])).size, 60, 'but the true count is reported in the header');
+  });
+
+  it('renders a string or array exports field without character indices', async () => {
+    const { mkdtempSync, writeFileSync, rmSync, mkdirSync } = await import('node:fs');
+    const { execFileSync } = await import('node:child_process');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'lgtm-map-'));
+    try {
+      execFileSync('git', ['-C', dir, 'init', '-q'], { stdio: 'ignore' });
+      mkdirSync(join(dir, 'src'));
+      writeFileSync(join(dir, 'src', 'index.ts'), 'export const a = 1;\n');
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x', exports: './index.js' }));
+      execFileSync('git', ['-C', dir, 'add', '-A'], { stdio: 'ignore' });
+      const { block } = buildRepoMap(dir);
+      assert.ok(block.includes('exports: ./index.js'), block);
+      assert.ok(!block.includes("exports: 0, 1, 2"), 'a string is not a set of character indices');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
