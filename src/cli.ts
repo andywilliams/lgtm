@@ -429,7 +429,9 @@ function normalizeFingerprintText(text: string): string {
 
 function isDuplicateComment(candidate: ReviewComment, existing: ExistingReviewComment[]): boolean {
   const candidateKey = `${candidate.file}:${candidate.line}`;
-  const fingerprint = normalizeFingerprintText(formatReviewCommentBody(candidate)).slice(0, 50);
+  // The finding's own words, not the rendered comment: the renderer's header (kind,
+  // confidence, evidence) changes with the tool and would break every match.
+  const fingerprint = normalizeFingerprintText(`**${candidate.title}**\n\n${candidate.body}`).slice(0, 50);
   if (!fingerprint) return false;
 
   return existing.some((comment) => {

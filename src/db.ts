@@ -96,6 +96,8 @@ const REVIEW_COLUMNS: [string, string][] = [
   // Prompt tokens of the round's LAST call: the context the session holds after it.
   // prompt_tokens sums every attempt (a schema retry bills twice), so it over-states.
   ['context_tokens', 'INTEGER'],
+  // What lgtm sent this round (prompt chars/4) — the honest input to a session's growth.
+  ['sent_tokens', 'INTEGER'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -139,6 +141,7 @@ function migrate(db: Database.Database): void {
       file TEXT NOT NULL,
       line INTEGER NOT NULL,
       fingerprint TEXT NOT NULL,
+      fingerprint_raw TEXT,
       kind TEXT,
       confidence TEXT,
       disposition TEXT,
@@ -151,7 +154,7 @@ function migrate(db: Database.Database): void {
   const findingCols = new Set(
     (db.prepare('PRAGMA table_info(findings)').all() as { name: string }[]).map((c) => c.name)
   );
-  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT']] as [string, string][]) {
+  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT']] as [string, string][]) {
     if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
   }
 }
@@ -194,7 +197,7 @@ export interface LoopSession {
   role: string | null;
   /** path → sha1 of the file contents the session has already seen (latest version of each). */
   fileShas: Record<string, string>;
-  /** Billed prompt tokens of the session's latest turn — the context a resumed turn starts from. */
+  /** Rough tokens the session holds: what lgtm sent across its rounds, plus the replies. */
   lastPromptTokens: number | null;
 }
 
@@ -225,13 +228,20 @@ export function loopContext(repo: string, roundKey: string, branch?: string): { 
     // context_tokens is the last call's prompt (older rows only carry the summed
     // prompt_tokens); an unmeasured or failed round records neither, so the budget reads
     // the latest round of this session that measured anything.
-    const ctxRow = [...run].reverse().find((r) => r.session_id === sessionRow.session_id && (r.context_tokens ?? r.prompt_tokens) !== null);
+    // The session's held context is what we SENT across its rounds plus the replies —
+    // never the envelope's prompt_tokens, which sums the CLI's internal turns.
+    let held: number | null = null;
+    for (const r of run) {
+      if (r.session_id !== sessionRow.session_id) continue;
+      if (r.sent_tokens === null && r.output_tokens === null) continue;
+      held = (held ?? 0) + (r.sent_tokens ?? 0) + (r.output_tokens ?? 0);
+    }
     session = {
       id: sessionRow.session_id,
       model: modelRow?.model_id ?? null,
       role: roleRow?.model_role ?? null,
       fileShas,
-      lastPromptTokens: ctxRow ? ctxRow.context_tokens ?? ctxRow.prompt_tokens : null,
+      lastPromptTokens: held,
     };
   }
   const marks = keys.map(() => '?').join(', ');
@@ -295,6 +305,8 @@ interface RunRow {
   recovered: number | null;
   scope: string | null;
   diff_lines: number | null;
+  sent_tokens: number | null;
+  output_tokens: number | null;
   model_id: string | null;
   failed: number | null;
   session_id: string | null;
@@ -307,7 +319,7 @@ interface RunRow {
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -347,9 +359,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -388,7 +400,8 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.sessionId ?? null,
     data.fileShas ? JSON.stringify(data.fileShas) : null,
     data.modelRole ?? null,
-    m ? m.lastPromptTokens : null
+    m ? m.lastPromptTokens : null,
+    u ? u.sentTokens : null
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -433,11 +446,11 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
-    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, kind, confidence)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const tx = db.transaction((rows: ReviewComment[]) =>
-    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.kind ?? null, c.confidence ?? null).lastInsertRowid))
+    rows.map((c) => Number(ins.run(reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.fingerprint ?? null, c.kind ?? null, c.confidence ?? null).lastInsertRowid))
   );
   const ids = tx(comments);
   db.close();
@@ -532,18 +545,20 @@ export function disposePreviousRound(
   const unchanged = Boolean(diffSha && last?.diff_sha && last.diff_sha === diffSha);
   const summary: DispositionSummary = { fixed: 0, dismissed: 0, carried: 0, suppressed: 0 };
   const prev = db.prepare(
-    'SELECT f.id, f.fingerprint, f.title, f.file, f.severity, f.kind, f.confidence, r.harshness FROM findings f ' +
+    'SELECT f.id, f.fingerprint, f.fingerprint_raw, f.title, f.file, f.severity, f.kind, f.confidence, r.harshness FROM findings f ' +
     'JOIN reviews r ON r.id = f.review_id ' +
     `WHERE f.repo = ? AND f.round_key IN (${marks}) AND NOT (f.round_key = ? AND f.round >= ?) AND f.disposition IS NULL`
-  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; title: string; file: string; severity: Severity; kind: string | null; confidence: string | null; harshness: string | null }[];
+  ).all(repo, ...keys, roundKey, round) as { id: number; fingerprint: string; fingerprint_raw: string | null; title: string; file: string; severity: Severity; kind: string | null; confidence: string | null; harshness: string | null }[];
   if (prev.length === 0) {
     db.close();
     return summary;
   }
   const rank = (h: string | null | undefined) => HARSHNESS_RANK[h ?? ''] ?? 1;
-  // Two reasons a round can be silent about a finding without it having been fixed: it
+  // Two reasons a round can be silent about a finding without its having been fixed: it
   // ran at a lower harshness that does not raise that severity, or it ran at chill, which
-  // raises only high-confidence findings (prompt v2). Both are silence, not a fix.
+  // ASKS for high-confidence findings only (a prompt instruction, not an enforced filter).
+  // Both make absence uninformative, so the finding stays open rather than reading as fixed
+  // — the conservative direction: a finding kept open costs a look, a false 'fixed' hides a bug.
   const suppressedBy = (severity: Severity, prevHarshness: string | null, prevConfidence: string | null) => {
     if (currentHarshness === undefined) return false;
     const lowerHarshness = rank(currentHarshness) < rank(prevHarshness) && (severity === 'SUGGESTION' || severity === 'NITPICK');
@@ -564,7 +579,11 @@ export function disposePreviousRound(
       let disposition: Disposition;
       let reason: string | null = null;
       const dismissed = reasonFor(f);
-      if (now.has(f.fingerprint)) disposition = 'carried';
+      // Both sides are widened: the stored row's own spellings against this round's.
+      // Otherwise a row keyed on a fingerprint could never be matched by a round that
+      // sends only a title (codex, or a reviewer that omitted it), and vice versa.
+      const storedKeys = keysFor({ file: f.file, title: f.title, fingerprint: f.fingerprint_raw ?? undefined });
+      if (storedKeys.some((k) => now.has(k)) || now.has(f.fingerprint)) disposition = 'carried';
       else if (dismissed !== undefined) {
         disposition = 'dismissed';
         reason = dismissed;
