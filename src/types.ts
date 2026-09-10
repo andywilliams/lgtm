@@ -5,6 +5,14 @@ export type Severity = 'BUG' | 'SECURITY' | 'SUGGESTION' | 'NITPICK';
 export type FindingKind = 'added' | 'removed' | 'missing';
 export type Confidence = 'high' | 'medium' | 'low';
 
+/**
+ * What the verifier pass made of a finding (see src/verify.ts). 'unverified' is not a
+ * verdict the verifier gives — it is what a finding carries when the pass did not run,
+ * failed, or said nothing about it, and it is deliberately distinct from 'unproven' so
+ * that silence can never be the thing that deletes a finding.
+ */
+export type Verdict = 'confirmed' | 'refuted' | 'unproven' | 'unverified';
+
 export interface ReviewComment {
   file: string;
   line: number;
@@ -20,6 +28,16 @@ export interface ReviewComment {
   how_to_verify?: string;
   /** Stable identity across rounds: the symbol or construct at fault, not the line. */
   fingerprint?: string;
+  // --- set by the verifier pass, never by the reviewer (src/verify.ts) ---
+  verdict?: Verdict;
+  /** Lines the verifier quoted to confirm or refute the finding. */
+  verifier_evidence?: string[];
+  /** One sentence saying what settled it. */
+  verifier_note?: string;
+  /** The severity the REVIEWER gave, when the verifier lowered it. */
+  original_severity?: Severity;
+  /** True when the verifier refuted it, or could not prove an opinion — logged, not shown. */
+  verifier_dropped?: boolean;
 }
 
 export interface ReviewResult {

@@ -399,3 +399,76 @@ test('prompt v2: a medium-confidence finding absent from a chill round is suppre
   const { getLoopSummary } = await import('./db.js');
   assert.equal(getLoopSummary(repo, key).openBugs, 1, 'the unverified BUG stays open rather than reading as fixed');
 });
+
+test('a verifier-dropped finding is logged, but is not part of what the round found', async () => {
+  const { logReview, logFindings, getLoopSummary, stopAdvice } = await import('./db.js');
+  const repo = 'verify/repo';
+  const key = 'pr:9';
+  const base = { repo, prNumber: 9, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+
+  // One round: a BUG the verifier refuted, and a SUGGESTION it confirmed.
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T11:00:00.000Z', harshness: 'medium', diffSha: 'a',
+    verify: { model: 'claude-sonnet-5', costUsd: 0.04, tokens: 9000 } });
+  logFindings(r1.id, repo, key, 1, [
+    { severity: 'BUG', title: 'Refuted crash', file: 'a.ts', line: 1, body: '', confidence: 'high', verdict: 'refuted', verifier_note: 'the guard is on line 8', verifier_dropped: true },
+    { severity: 'SUGGESTION', title: 'Real nit', file: 'a.ts', line: 2, body: '', confidence: 'medium', verdict: 'confirmed' },
+  ]);
+
+  const s = getLoopSummary(repo, key);
+  assert.equal(s.rounds[0].dropped, 1, 'the drop is on the row — that is what makes the false-positive rate measurable');
+  assert.equal(s.rounds[0].confirmed, 1);
+  assert.equal(s.rounds[0].findings, 1, 'a dropped finding is not something the round found');
+  assert.equal(s.rounds[0].bySeverity.BUG, 0, 'a refuted BUG must not drive the stopping rule');
+  assert.equal(s.rounds[0].verifyCostUsd, 0.04);
+  assert.equal(s.rounds[0].verifyModel, 'claude-sonnet-5');
+  assert.equal(s.lastBugRound, null);
+  assert.equal(s.openBugs, 0, 'a refuted BUG is settled at insert, not left open for a later round');
+  assert.equal(stopAdvice(1, s.lastBugRound, s.cleanRounds, s.lastRoundEmpty).stop, false, 'one clean round is not two');
+});
+
+test('a finding re-raised and then dropped reads as carried, never as fixed', async () => {
+  const { logReview, logFindings, disposePreviousRound, getLoopSummary } = await import('./db.js');
+  const repo = 'verify2/repo';
+  const key = 'pr:10';
+  const base = { repo, prNumber: 10, filesReviewed: 1, contextFilesAdded: 0, contextReasons: '[]', tokenCount: 1, model: 'claude',
+    usedContextExpansion: false, falseNegative: false, mode: 'pr' as const, roundKey: key };
+  const claim = { severity: 'BUG' as const, title: 'Contested crash', file: 'a.ts', line: 1, body: '', confidence: 'high' as const };
+
+  const r1 = logReview({ ...base, reviewedAt: '2026-09-10T12:00:00.000Z', harshness: 'medium', diffSha: 'a' });
+  logFindings(r1.id, repo, key, 1, [claim]);
+
+  // Round 2 raises the same complaint; the verifier refutes it. Nothing was FIXED — the
+  // code moved but the claim was answered, so round 1's row must not read as a fix.
+  const r2 = logReview({ ...base, reviewedAt: '2026-09-10T12:10:00.000Z', harshness: 'medium', diffSha: 'b' });
+  const again = { ...claim, verdict: 'refuted' as const, verifier_dropped: true, verifier_note: 'the guard is on line 8' };
+  logFindings(r2.id, repo, key, 2, [again]);
+  assert.deepEqual(disposePreviousRound(repo, key, 2, [again], { harshness: 'medium', diffSha: 'b' }),
+    { fixed: 0, dismissed: 0, carried: 1, suppressed: 0 });
+
+  const s = getLoopSummary(repo, key);
+  assert.equal(s.openBugs, 0, 'the claim is settled: carried on round 1, refuted on round 2');
+  assert.equal(s.rounds[1].bySeverity.BUG, 0);
+});
+
+test('the verifier severity stored is the final one; the reviewer claim survives beside it', async () => {
+  const { logReview, logFindings, initDb } = await import('./db.js');
+  const repo = 'verify3/repo';
+  const key = 'pr:11';
+  const r = logReview({ repo, prNumber: 11, reviewedAt: '2026-09-10T13:00:00.000Z', filesReviewed: 1, contextFilesAdded: 0,
+    contextReasons: '[]', tokenCount: 1, model: 'claude', usedContextExpansion: false, falseNegative: false,
+    mode: 'pr', roundKey: key, harshness: 'medium', diffSha: 'a', verify: { costUsd: null, tokens: null, failed: 'the verifier returned no verdicts' } });
+  logFindings(r.id, repo, key, 1, [
+    { severity: 'SUGGESTION', title: 'Downgraded', file: 'a.ts', line: 1, body: '', verdict: 'confirmed', original_severity: 'BUG', verifier_evidence: ['x'] },
+  ]);
+  const db = initDb();
+  const row = db.prepare('SELECT severity, original_severity, verdict, verifier_evidence, disposition FROM findings WHERE repo = ?').get(repo) as any;
+  const review = db.prepare('SELECT verify_failed, verify_cost_usd FROM reviews WHERE id = ?').get(r.id) as any;
+  db.close();
+  assert.equal(row.severity, 'SUGGESTION', 'the stopping rule reads the final severity');
+  assert.equal(row.original_severity, 'BUG', 'and the reviewer claim is still auditable');
+  assert.equal(row.disposition, null, 'a confirmed finding is open, like any other');
+  assert.deepEqual(JSON.parse(row.verifier_evidence), ['x']);
+  assert.equal(review.verify_failed, 'the verifier returned no verdicts', 'a pass that ran and could not answer is not the same round as one that did not run');
+  assert.equal(review.verify_cost_usd, null);
+});

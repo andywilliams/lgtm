@@ -106,6 +106,32 @@ export function takeUsage(): AIUsage {
 }
 
 /**
+ * Add two drained windows together. Needed because a round now spends in two parts that
+ * must be both separable and summable: the review, then the verifier pass on a different
+ * model. The row records the total; the verify columns record its second half, so the
+ * ratio the ticket is judged on is arithmetic rather than an assertion. `lastPromptTokens`
+ * takes the later window's, since it is what the SESSION now holds — the verifier runs
+ * outside the loop's session and must not be read as having grown it.
+ */
+export function mergeUsage(first: AIUsage, second: AIUsage): AIUsage {
+  if (second.calls === 0) return first;
+  if (first.calls === 0) return second;
+  return {
+    inputTokens: first.inputTokens + second.inputTokens,
+    cacheCreationTokens: first.cacheCreationTokens + second.cacheCreationTokens,
+    cacheReadTokens: first.cacheReadTokens + second.cacheReadTokens,
+    outputTokens: first.outputTokens + second.outputTokens,
+    costUsd: first.costUsd + second.costUsd,
+    durationMs: first.durationMs + second.durationMs,
+    models: [...first.models, ...second.models.filter((m) => !first.models.includes(m))],
+    calls: first.calls + second.calls,
+    lastPromptTokens: first.lastPromptTokens,
+    sentTokens: first.sentTokens + second.sentTokens,
+    measured: first.measured && second.measured,
+  };
+}
+
+/**
  * How long one model call may take before lgtm gives up and SAYS so. A review that
  * cannot finish used to hang with no output at all — four attempts on DWLF-136 produced
  * nothing, not even a "too large" message, which is what made a slow tool look broken.
@@ -168,6 +194,11 @@ export function isModelId(s: string): boolean {
 export function setModelOverride(model: string | undefined): void {
   if (model !== undefined && !MODEL_ID.test(model)) throw new Error(`not a model id: ${JSON.stringify(model)}`);
   modelOverride = model;
+}
+
+/** The override currently in force, so a nested call (the verifier) can put it back. */
+export function getModelOverride(): string | undefined {
+  return modelOverride;
 }
 
 /** The model late chill rounds run on; `off` disables the policy. Default is the current Sonnet. */

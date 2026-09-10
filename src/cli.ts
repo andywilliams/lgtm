@@ -22,13 +22,14 @@ import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } fr
 import { expandContext } from './contextExpander.js';
 import { logReview, logFindings, disposePreviousRound, getLoopSummary, loopContext, dismissFindings, stopAdvice, ROUND_BUDGET, type DispositionSummary, type StopAdvice, type LoopSession } from './db.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
+import { takeUsage, promptTokens, setModelOverride, pickRoundModel, isModelId, mergeUsage, emptyUsage, DEFAULT_LATE_MODEL, LATE_ROUND, type AIUsage, type RoundModelChoice } from './ai.js';
 import { reviewWithRecovery } from './recovery.js';
+import { verifyFindings, verifyModel, kept, dropped, type VerifyOutcome } from './verify.js';
 import { planSession, modelRoleOf } from './session.js';
 import { extractWriteIdentifiers, failedSearchRoots, fieldsFromHelpers, findReaders, formatReadersContext, mergeIdentifiers, readersSearchRan, searchRoots } from './readers.js';
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
-import type { Harshness, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
+import type { Harshness, Severity, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -128,6 +129,11 @@ program
   .option('--fresh', 'Start a new loop session instead of continuing the existing one (LGTM_SESSIONS=off disables sessions entirely)', false)
   .option('--add-dir <path>', 'Also search this directory for readers of what the diff writes (repeatable; LGTM_SIBLING_DIRS does the same)', (v: string, acc: string[]) => [...acc, v], [])
   .option('--no-readers', 'Skip the readers-of-what-this-writes search (on by default)')
+  .option('--verify', 'Prove or drop each finding with a second model call before showing it (default: on in --agent mode)')
+  .option('--no-verify', 'Skip the verifier pass')
+  .option('--verify-model <id>', `Model for the verifier pass (default: LGTM_VERIFY_MODEL, else ${DEFAULT_LATE_MODEL})`)
+  .option('--verify-ai <provider>', 'AI provider for the verifier pass: claude, codex (default: the review provider)')
+  .option('--show-dropped', 'Show the findings the verifier dropped instead of hiding them', false)
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -190,6 +196,7 @@ program
 
     const batch = auto || options.batch;
     if (options.model && !isModelId(options.model)) exitWithError(`--model ${JSON.stringify(options.model)} is not a model id`);
+    if (options.verifyModel && !isModelId(options.verifyModel)) exitWithError(`--verify-model ${JSON.stringify(options.verifyModel)} is not a model id`);
 
     // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
     // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
@@ -265,6 +272,13 @@ program
         fresh: options.fresh,
         addDirs: options.addDir ?? [],
         readersEnabled: options.readers !== false,
+        // The verifier is on by default only where its output is read by a machine that
+        // would otherwise pay a read-verify-dismiss cycle per false positive; an
+        // interactive run already has a human doing exactly that job.
+        verifyEnabled: options.verify ?? agent,
+        verifyModel: options.verifyModel,
+        verifyAi: options.verifyAi ? resolveProvider(options.verifyAi, exitWithError) : undefined,
+        showDropped: Boolean(options.showDropped),
         policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
@@ -321,6 +335,12 @@ interface RunOptions {
   /** Extra roots to search for readers of what the diff writes. */
   addDirs?: string[];
   readersEnabled?: boolean;
+  /** Run the verifier pass (DWLF-209) before showing findings. */
+  verifyEnabled?: boolean;
+  verifyModel?: string;
+  verifyAi?: AIProvider;
+  /** Show the verifier's drops rather than hiding them — for auditing the pass itself. */
+  showDropped?: boolean;
   /**
    * What the round policy needs from the log; absent when the log was unavailable.
    * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
@@ -457,6 +477,13 @@ function formatAgentResult(options: {
   usage?: AIUsage;
   loop?: LoopState | null;
   recovered?: boolean;
+  /** The verifier pass and what it dropped — present so a bad drop is auditable, never silent. */
+  verify?: {
+    model: string | null;
+    failed: string | null;
+    checked: number;
+    dropped: { file: string; line: number; severity: Severity; title: string; verdict: string; reason: string | null }[];
+  } | null;
   error?: string;
 }): string {
   const duplicates = options.comments.filter(c => c.duplicate).length;
@@ -471,6 +498,9 @@ function formatAgentResult(options: {
     recovered: options.recovered ?? false,
     commentsFound: options.comments.length,
     duplicates,
+    // Findings the verifier refuted, or could not prove and were only opinions. They are
+    // NOT in `comments`; they are here so that a wrong drop can be seen and argued with.
+    verify: options.verify ?? null,
     comments: options.comments.map(c => ({
       id: c.id ?? null,
       // Triage fields first: what kind of problem, how sure the reviewer is, and the one
@@ -487,6 +517,13 @@ function formatAgentResult(options: {
       suggestion: c.suggestion,
       fingerprint: c.fingerprint ?? null,
       duplicate: c.duplicate,
+      // What the verifier made of it. 'unverified' means the pass did not run or said
+      // nothing — deliberately NOT the same as 'unproven', which is a judgement.
+      verdict: c.verdict ?? 'unverified',
+      verifier_note: c.verifier_note ?? null,
+      verifier_evidence: c.verifier_evidence ?? [],
+      original_severity: c.original_severity ?? null,
+      dropped: Boolean(c.verifier_dropped),
     })),
     context: {
       maxContext: true,
@@ -555,13 +592,17 @@ function recordReviewMetrics(opts: {
   sessionId?: string;
   fileShas?: Record<string, string>;
   modelRole?: string;
+  /** Already-drained usage for this round; omitted, the ledger is drained here. */
+  usage?: AIUsage;
+  /** The verifier pass, when it ran — its own half of the spend, recorded beside the total. */
+  verify?: { model?: string; usage: AIUsage; failed?: string };
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole, verify } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
   }
-  const usage = takeUsage();
+  const usage = opts.usage ?? takeUsage();
   // A failure before any model call (a session the CLI could not find) spent nothing:
   // there is no round to record and no budget slot to charge.
   if (failed && (usage.calls === 0 || (usage.measured && promptTokens(usage) === 0 && usage.costUsd === 0))) {
@@ -599,6 +640,12 @@ function recordReviewMetrics(opts: {
       sessionId,
       fileShas,
       modelRole,
+      verify: verify && {
+        model: verify.model,
+        costUsd: verify.usage.measured && verify.usage.calls > 0 ? verify.usage.costUsd : null,
+        tokens: verify.usage.measured && verify.usage.calls > 0 ? promptTokens(verify.usage) + verify.usage.outputTokens : null,
+        failed: verify.failed,
+      },
     });
     const round = allocated ?? 1;
     if (failed) return { tokenEstimate, usage, loop: null };
@@ -627,7 +674,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, addDirs, readersEnabled, policy, charterEnabled, standardsEnabled } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, addDirs, readersEnabled, policy, charterEnabled, standardsEnabled, verifyEnabled, showDropped } = options;
   let harshness = options.harshness;
   // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
   // asking "is it safe now?", which is chill's question — unless -H said otherwise.
@@ -890,6 +937,45 @@ async function runReview(options: RunOptions): Promise<void> {
   ({ result, choice, freshReason } = await reviewWithRecovery({ review, ai, choice, initialChoice, resuming: Boolean(sessionPlan?.resume), logFailedRound, say: (line) => (auto ? console.error(chalk.yellow(line)) : log(chalk.yellow(line))) }));
   if (freshReason) choice = { ...choice, reason: `${freshReason} (${choice.reason})` };
 
+  // The verifier pass runs BEFORE the round is logged, because its verdicts are part of
+  // what the round found: a refuted BUG must not set the stopping rule's lastBugRound.
+  // The two spends are drained separately so the row can carry the total AND the
+  // verifier's half of it — the cost ratio the pass is judged on is then a subtraction.
+  const reviewUsage = takeUsage();
+  let verifyOutcome: VerifyOutcome | null = null;
+  let verifyUsage = emptyUsage();
+  if (verifyEnabled && result.comments.length > 0) {
+    const vAi = options.verifyAi ?? ai;
+    const chosen = options.verifyModel ?? (vAi === 'claude' ? verifyModel().model : undefined);
+    const line = `⚖  verifying ${result.comments.length} finding(s) on ${chosen ?? `${vAi}'s default model`}`;
+    if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
+    verifyOutcome = verifyFindings({
+      diff: truncatedDiff, prTitle: pr.title, findings: result.comments, contents: contentsSeen,
+      readersContext: readersContextStr || undefined,
+      docs: [charterContextStr, standardsContextStr].filter(Boolean).join('\n') || undefined,
+      ai: vAi, model: chosen,
+    });
+    verifyUsage = takeUsage();
+    result = { ...result, comments: verifyOutcome.comments };
+    if (verifyOutcome.failed) {
+      const warn = `⚠  verifier pass could not answer (${verifyOutcome.failed}) — every finding is shown unverified`;
+      if (auto) console.error(chalk.yellow(warn)); else log(chalk.yellow(warn));
+    }
+  }
+  const droppedComments = dropped(result.comments);
+  const shownComments = showDropped ? result.comments : kept(result.comments);
+  // A refuted BUG/SECURITY is the one drop that can cost something, so it is always said
+  // out loud even though it is not shown as a finding — a bad drop must be visible.
+  for (const d of droppedComments) {
+    if (d.severity !== 'BUG' && d.severity !== 'SECURITY' && d.original_severity !== 'BUG' && d.original_severity !== 'SECURITY') continue;
+    const line = `   dropped: ${d.original_severity ?? d.severity} "${d.title}" (${d.file}:${d.line}) — ${d.verifier_note ?? d.verdict}`;
+    if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
+  }
+  if (verifyOutcome && !verifyOutcome.failed) {
+    const line = `⚖  ${droppedComments.length} of ${result.comments.length} finding(s) dropped, ${result.comments.filter((c) => c.verdict === 'confirmed').length} confirmed`;
+    if (auto) console.error(chalk.gray(line)); else log(chalk.gray(line));
+  }
+
   log(chalk.gray(`\n${result.summary}\n`));
 
   // Log the round NOW, before any output or posting branch: every path below (agent,
@@ -897,9 +983,15 @@ async function runReview(options: RunOptions): Promise<void> {
   // the same to have run. Non-critical, never throws.
   const metrics = recordReviewMetrics({
     repo, prNumber, diff, expanded, relatedFiles, ai, local,
+    // Every finding is logged, drops included — the share of a round that was dropped is
+    // the false-positive rate, and it exists only if the drops are on the row. Drops also
+    // have to be visible to the disposition pass, or an earlier round's finding that was
+    // re-raised and then refuted would read as FIXED.
     filesReviewed: () => changedFilesOf().length, harshness, comments: result.comments, decided, recovered: result.recovered,
     branch: local ? undefined : pr.headRef, scope, overrideReason, diffLines, modelChoice: choice,
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(choice),
+    usage: mergeUsage(reviewUsage, verifyUsage),
+    verify: verifyOutcome ? { model: verifyOutcome.model, usage: verifyUsage, failed: verifyOutcome.failed } : undefined,
   });
   // The stopping rule, said out loud every round — on stderr in agent mode so the
   // stdout JSON contract is untouched, but a driving agent still sees it.
@@ -923,11 +1015,12 @@ async function runReview(options: RunOptions): Promise<void> {
         // If we can't fetch existing comments, return findings without duplicate flags.
       }
     }
-    const annotated: AnnotatedComment[] = result.comments.map((comment, i) => ({
-      ...comment,
-      duplicate: isDuplicateComment(comment, existingComments),
-      id: metrics.loop?.findingIds[i],
-    }));
+    // Ids are allocated over EVERY finding of the round, drops included, so the index
+    // must be taken before anything is filtered — otherwise `lgtm dismiss <id>` would
+    // settle a different finding than the one printed.
+    const annotated: AnnotatedComment[] = result.comments
+      .map((comment, i) => ({ ...comment, duplicate: isDuplicateComment(comment, existingComments), id: metrics.loop?.findingIds[i] }))
+      .filter((c) => showDropped || !c.verifier_dropped);
 
     console.log(formatAgentResult({
       success: true,
@@ -938,6 +1031,17 @@ async function runReview(options: RunOptions): Promise<void> {
       usage: metrics.usage,
       loop: metrics.loop,
       recovered: result.recovered,
+      verify: verifyOutcome
+        ? {
+            model: verifyOutcome.model ?? null,
+            failed: verifyOutcome.failed ?? null,
+            checked: result.comments.length,
+            dropped: droppedComments.map((d) => ({
+              file: d.file, line: d.line, severity: d.original_severity ?? d.severity, title: d.title,
+              verdict: d.verdict ?? 'unproven', reason: d.verifier_note ?? null,
+            })),
+          }
+        : null,
     }));
     return;
   }
@@ -946,21 +1050,21 @@ async function runReview(options: RunOptions): Promise<void> {
   // a rendered list otherwise) and stop before any dedup/posting logic.
   if (local) {
     if (auto) {
-      console.log(formatAutoResult({ success: true, dryRun: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: result.comments }));
+      console.log(formatAutoResult({ success: true, dryRun: true, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: shownComments }));
       return;
     }
-    if (result.comments.length === 0) {
+    if (shownComments.length === 0) {
       log(chalk.green('✓ LGTM — no issues found in local changes'));
       return;
     }
-    log(chalk.white(`Found ${result.comments.length} finding(s) — local, read-only:\n`));
-    for (let i = 0; i < result.comments.length; i++) {
-      const comment = result.comments[i];
+    log(chalk.white(`Found ${shownComments.length} finding(s) — local, read-only:\n`));
+    for (let i = 0; i < shownComments.length; i++) {
+      const comment = shownComments[i];
       const severityColor = SEVERITY_COLORS[comment.severity] || chalk.white;
       const severityIcon = SEVERITY_ICONS[comment.severity] || '•';
       log(chalk.white('─'.repeat(60)));
       log(
-        chalk.white(`[${i + 1}/${result.comments.length}] `) +
+        chalk.white(`[${i + 1}/${shownComments.length}] `) +
         severityIcon + ' ' +
         severityColor(comment.severity) +
         chalk.gray(` | ${comment.file}:${comment.line}`)
@@ -977,7 +1081,7 @@ async function runReview(options: RunOptions): Promise<void> {
     return;
   }
 
-  if (result.comments.length === 0) {
+  if (shownComments.length === 0) {
     if (auto) {
       console.log(formatAutoResult({ success: true, dryRun, summary: result.summary, commentsPosted: 0, duplicatesSkipped: 0, comments: [] }));
     } else {
@@ -988,8 +1092,8 @@ async function runReview(options: RunOptions): Promise<void> {
 
   log(chalk.blue(`\n💬 Checking existing comments for duplicates...`));
   const existingComments = getExistingReviewComments(prNumber, repo);
-  const commentsToReview = result.comments.filter((comment) => !isDuplicateComment(comment, existingComments));
-  const duplicateCount = result.comments.length - commentsToReview.length;
+  const commentsToReview = shownComments.filter((comment) => !isDuplicateComment(comment, existingComments));
+  const duplicateCount = shownComments.length - commentsToReview.length;
 
   if (duplicateCount > 0) {
     log(chalk.yellow(`   Skipped ${duplicateCount} duplicate comment(s)`));
@@ -1678,7 +1782,7 @@ program
     }
     const mixed = summary.rounds.some((r) => r.key !== key);
     console.log(chalk.bold(`\nReview rounds — ${key}${mixed ? ' (with the branch\'s local rounds first)' : ''}\n`));
-    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  abs high  fixed dism carr supp    cost  model`);
+    console.log(`${mixed ? 'loop   ' : ''}round  when              harsh    BUG SEC SUG NIT  abs high  conf drop  fixed dism carr supp    cost  model`);
     for (const r of summary.rounds) {
       const when = r.reviewedAt.slice(0, 16).replace('T', ' ');
       const s = r.bySeverity;
@@ -1689,6 +1793,7 @@ program
         `${loopCol}${String(r.round).padStart(5)}  ${when}  ${(r.harshness ?? '—').padEnd(8)} ` +
           `${String(s.BUG).padStart(3)} ${String(s.SECURITY).padStart(3)} ${String(s.SUGGESTION).padStart(3)} ${String(s.NITPICK).padStart(3)}  ` +
           `${String(r.absences).padStart(3)} ${String(r.highConfidence).padStart(4)}  ` +
+          `${String(r.confirmed).padStart(4)} ${String(r.dropped).padStart(4)}  ` +
           `${String(r.fixed).padStart(5)} ${String(r.dismissed).padStart(4)} ${String(r.carried).padStart(4)} ${String(r.suppressed).padStart(4)} ${cost}  ${modelCol}`
       );
     }
@@ -1696,6 +1801,17 @@ program
     const last = own.length > 0 ? own[own.length - 1].round : 0;
     console.log('');
     console.log(`API-equivalent cost so far: $${summary.totalCostUsd.toFixed(2)}  (the CLI's total_cost_usd — a metric, not a bill, on a subscription plan)`);
+    // The point of storing drops: the false-positive share is a number, per loop, from
+    // the tool's own log rather than from anyone's recollection of a bad review.
+    const checked = summary.rounds.reduce((n, r) => n + r.findings + r.dropped, 0);
+    const drops = summary.rounds.reduce((n, r) => n + r.dropped, 0);
+    const verifySpend = summary.rounds.reduce((n, r) => n + (r.verifyCostUsd ?? 0), 0);
+    if (checked > 0 && summary.rounds.some((r) => r.verifyModel !== null)) {
+      console.log(
+        `Verifier: dropped ${drops} of ${checked} finding(s) — ${((drops / checked) * 100).toFixed(0)}% — for $${verifySpend.toFixed(2)} ` +
+        `(${(verifySpend / Math.max(summary.totalCostUsd - verifySpend, 1e-9) * 100).toFixed(0)}% on top of the reviews)`
+      );
+    }
     if (last > 0) {
       const advice = stopAdvice(last, summary.lastBugRound, summary.cleanRounds, summary.lastRoundEmpty);
       console.log(advice.stop ? chalk.yellow(`🛑 ${advice.reason}`) : `↻ ${advice.reason}`);

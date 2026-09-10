@@ -12,6 +12,17 @@ export function formatReviewCommentBody(comment: ReviewComment): string {
     body += `\n\n**Evidence:**\n${comment.evidence.map((e) => `> ${e.replace(/\n/g, '\n> ')}`).join('\n>\n')}`;
   }
   if (comment.how_to_verify) body += `\n\n**How to check:** ${comment.how_to_verify}`;
+  // What the verifier pass made of it. A posted finding was never refuted (those are
+  // dropped before posting), so this says either "a second model proved this" or "a
+  // second model could not, and it survived because it is a defect claim, not an
+  // opinion" — which is exactly what a reader needs to know before acting on it.
+  if (comment.verdict === 'confirmed' || comment.verdict === 'unproven') {
+    const verdict = comment.verdict === 'confirmed'
+      ? 'Confirmed by a second review pass'
+      : 'A second review pass could not prove this from the code it was shown';
+    body += `\n\n_${verdict}${comment.verifier_note ? `: ${comment.verifier_note}` : '.'}_`;
+    if (comment.original_severity) body += `\n\n_Severity lowered from ${comment.original_severity} by that pass._`;
+  }
   if (comment.suggestion) {
     body += `\n\n**Suggested fix:**\n\`\`\`suggestion\n${comment.suggestion}\n\`\`\``;
   }

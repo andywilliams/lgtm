@@ -48,6 +48,8 @@ export interface ReviewLog {
   /** path → sha1 of the full contents sent this round. */
   fileShas?: Record<string, string>;
   modelRole?: string;
+  /** The verifier pass, when it ran: its model, its own spend, and why it could not answer. */
+  verify?: { model?: string; costUsd: number | null; tokens: number | null; failed?: string };
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -98,6 +100,15 @@ const REVIEW_COLUMNS: [string, string][] = [
   ['context_tokens', 'INTEGER'],
   // What lgtm sent this round (prompt chars/4) — the honest input to a session's growth.
   ['sent_tokens', 'INTEGER'],
+  // The verifier pass (DWLF-209): which model proved-or-dropped this round's findings,
+  // and what that second call cost on its own — so "review + verify vs review alone" is
+  // a subtraction, not an estimate. NULL when the pass did not run; `verify_failed` holds
+  // why when it ran and could not answer, since "nothing dropped" and "nothing checked"
+  // are different rounds.
+  ['verify_model', 'TEXT'],
+  ['verify_cost_usd', 'REAL'],
+  ['verify_tokens', 'INTEGER'],
+  ['verify_failed', 'TEXT'],
 ];
 
 /** Rounds a loop may run before the tool asks for a reason to continue. */
@@ -118,7 +129,16 @@ export const CLEAN_ROUNDS_TO_STOP = 2;
  * because the later round ran at a lower harshness that would not raise that severity
  * ⇒ suppressed (not evidence of a fix); absent otherwise ⇒ fixed.
  */
-export type Disposition = 'fixed' | 'dismissed' | 'carried' | 'suppressed';
+export type LoopDisposition = 'fixed' | 'dismissed' | 'carried' | 'suppressed';
+/**
+ * Every value the column can hold. `verifier-dropped` is written at INSERT, not by a
+ * later round: the verifier pass (DWLF-209) refuted the finding, or could not prove an
+ * opinion, so it was never shown to the agent. It is stored rather than discarded
+ * because the share of a round's findings that were dropped IS the false-positive rate,
+ * and a rate nobody records is a rate nobody can argue with.
+ */
+export type Disposition = LoopDisposition | 'verifier-dropped';
+export const VERIFIER_DROPPED: Disposition = 'verifier-dropped';
 
 const HARSHNESS_RANK: Record<string, number> = { chill: 0, medium: 1, pedantic: 2 };
 
@@ -156,7 +176,12 @@ function migrate(db: Database.Database): void {
   const findingCols = new Set(
     (db.prepare('PRAGMA table_info(findings)').all() as { name: string }[]).map((c) => c.name)
   );
-  for (const [name, type] of [['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT'], ['evidence', 'TEXT'], ['how_to_verify', 'TEXT']] as [string, string][]) {
+  for (const [name, type] of [
+    ['kind', 'TEXT'], ['confidence', 'TEXT'], ['fingerprint_raw', 'TEXT'], ['evidence', 'TEXT'], ['how_to_verify', 'TEXT'],
+    // The verifier's verdict on this finding, what it quoted, and the severity the
+    // REVIEWER gave when the verifier lowered it (DWLF-209).
+    ['verdict', 'TEXT'], ['verifier_note', 'TEXT'], ['verifier_evidence', 'TEXT'], ['original_severity', 'TEXT'],
+  ] as [string, string][]) {
     if (!findingCols.has(name)) db.exec(`ALTER TABLE findings ADD COLUMN ${name} ${type}`);
   }
 }
@@ -315,13 +340,15 @@ interface RunRow {
   file_shas: string | null;
   model_role: string | null;
   context_tokens: number | null;
+  verify_model: string | null;
+  verify_cost_usd: number | null;
 }
 
 /** Every round under the keys, oldest first. */
 function roundsFor(db: Database.Database, repo: string, keys: string[]): RunRow[] {
   const marks = keys.map(() => '?').join(', ');
   return db.prepare(
-    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
+    `SELECT id, round_key, round, reviewed_at, harshness, cost_usd, prompt_tokens, diff_sha, recovered, scope, diff_lines, model_id, failed, session_id, file_shas, model_role, context_tokens, sent_tokens, output_tokens, verify_model, verify_cost_usd FROM reviews WHERE repo = ? AND round_key IN (${marks}) AND round IS NOT NULL ORDER BY reviewed_at, id`
   ).all(repo, ...keys) as RunRow[];
 }
 
@@ -361,9 +388,10 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       repo, pr_number, reviewed_at, files_reviewed, context_files_added, context_reasons,
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
-      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens
+      mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens,
+      verify_model, verify_cost_usd, verify_tokens, verify_failed
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -403,7 +431,11 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.fileShas ? JSON.stringify(data.fileShas) : null,
     data.modelRole ?? null,
     m ? m.lastPromptTokens : null,
-    u ? u.sentTokens : null
+    u ? u.sentTokens : null,
+    data.verify?.model ?? null,
+    data.verify?.costUsd ?? null,
+    data.verify?.tokens ?? null,
+    data.verify?.failed ?? null
     );
     return { id: Number(result.lastInsertRowid), round };
   });
@@ -448,16 +480,27 @@ export function logFindings(reviewId: number, repo: string, roundKey: string, ro
   if (comments.length === 0) return [];
   const db = initDb();
   const ins = db.prepare(`
-    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO findings (review_id, repo, round_key, round, severity, title, file, line, fingerprint, fingerprint_raw, kind, confidence, evidence, how_to_verify,
+      verdict, verifier_note, verifier_evidence, original_severity, disposition, disposed_at_round)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   // The evidence is stored with the finding, not just shown: `confidence` is a verdict
   // derived from it, and a later round marking the finding fixed or suppressed is only
   // checkable if what the reviewer actually quoted survives.
+  // A dropped finding is disposed the moment it is written: it never reached the agent,
+  // so no later round can settle it, and leaving it open would count a refuted claim
+  // among the loop's unfixed bugs. `severity` stores the FINAL severity (the verifier may
+  // have lowered it) because that is what the stopping rule reads; the reviewer's own
+  // claim survives in `original_severity`.
   const tx = db.transaction((rows: ReviewComment[]) =>
     rows.map((c) => Number(ins.run(
       reviewId, repo, roundKey, round, c.severity, c.title, c.file, c.line, fingerprintOf(c), c.fingerprint ?? null,
       c.kind ?? null, c.confidence ?? null, c.evidence && c.evidence.length > 0 ? JSON.stringify(c.evidence) : null, c.how_to_verify ?? null,
+      c.verdict ?? null, c.verifier_note ?? null,
+      c.verifier_evidence && c.verifier_evidence.length > 0 ? JSON.stringify(c.verifier_evidence) : null,
+      c.original_severity ?? null,
+      c.verifier_dropped ? VERIFIER_DROPPED : null,
+      c.verifier_dropped ? round : null,
     ).lastInsertRowid))
   );
   const ids = tx(comments);
@@ -500,12 +543,7 @@ export function stopAdvice(round: number, lastBugRound: number | null, clean: nu
   };
 }
 
-export interface DispositionSummary {
-  fixed: number;
-  dismissed: number;
-  carried: number;
-  suppressed: number;
-}
+export type DispositionSummary = Record<LoopDisposition, number>;
 
 export interface DisposeOptions {
   decided?: DecidedFinding[];
@@ -597,7 +635,7 @@ export function disposePreviousRound(
   const upd = db.prepare('UPDATE findings SET disposition = ?, disposed_at_round = ?, dismissed_reason = ? WHERE id = ?');
   const tx = db.transaction(() => {
     for (const f of prev) {
-      let disposition: Disposition;
+      let disposition: LoopDisposition;
       let reason: string | null = null;
       const dismissed = reasonFor(f);
       // Both sides are widened: the stored row's own spellings against this round's.
@@ -633,16 +671,24 @@ export interface RoundRow {
   promptTokens: number | null;
   model: string | null;
   failed: boolean;
+  /** Counts EXCLUDING findings the verifier dropped — the round as the agent saw it. */
   bySeverity: Record<Severity, number>;
   findings: number;
   /** Findings about what the diff removes or omits — the class a diff review skips. */
   absences: number;
   /** Findings the reviewer could quote evidence for. */
   highConfidence: number;
+  /** Findings the verifier refuted or could not prove: this round's false-positive count. */
+  dropped: number;
+  /** Findings the verifier was asked about and confirmed. */
+  confirmed: number;
   fixed: number;
   dismissed: number;
   carried: number;
   suppressed: number;
+  /** The verifier pass's own spend, when it ran. */
+  verifyCostUsd: number | null;
+  verifyModel: string | null;
 }
 
 export interface LoopSummary {
@@ -688,8 +734,8 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
   const marks = keys.map(() => '?').join(', ');
   const reviews = roundsFor(db, repo, keys);
   const findings = db.prepare(
-    `SELECT round_key, round, severity, disposition, kind, confidence FROM findings WHERE repo = ? AND round_key IN (${marks})`
-  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null; kind: string | null; confidence: string | null }[];
+    `SELECT round_key, round, severity, disposition, kind, confidence, verdict FROM findings WHERE repo = ? AND round_key IN (${marks})`
+  ).all(repo, ...keys) as { round_key: string; round: number; severity: Severity; disposition: Disposition | null; kind: string | null; confidence: string | null; verdict: string | null }[];
   const inRun = new Set<string>();
   db.close();
 
@@ -706,22 +752,32 @@ export function getLoopSummary(repo: string, roundKey: string, branch?: string):
     findings: 0,
     absences: 0,
     highConfidence: 0,
+    dropped: 0,
+    confirmed: 0,
     fixed: 0,
     dismissed: 0,
     carried: 0,
     suppressed: 0,
+    verifyCostUsd: r.verify_cost_usd,
+    verifyModel: r.verify_model,
   }));
   const byRound = new Map(rounds.map((r) => [`${r.key}#${r.round}`, r]));
   // lastBugRound is an ordinal within the requested key — the stopping rule's own loop.
   let lastBugRound: number | null = null;
+  // A finding the verifier dropped never reached the agent, so it is not part of what
+  // the round FOUND: it is counted only as a drop, and it must not set lastBugRound or
+  // break the clean-round count — otherwise refuting a false BUG would buy the loop
+  // nothing and the stopping rule would still be driven by the noise.
   for (const f of findings) {
     const row = byRound.get(`${f.round_key}#${f.round}`);
     if (!row) continue;
+    if (f.disposition === VERIFIER_DROPPED) { row.dropped += 1; continue; }
     row.findings += 1;
+    if (f.verdict === 'confirmed') row.confirmed += 1;
     if (f.kind === 'removed' || f.kind === 'missing') row.absences += 1;
     if (f.confidence === 'high') row.highConfidence += 1;
     if (SEVERITIES.includes(f.severity)) row.bySeverity[f.severity] += 1;
-    if (f.disposition) row[f.disposition] += 1;
+    if (f.disposition) row[f.disposition as LoopDisposition] += 1;
     if (f.round_key === roundKey && (f.severity === 'BUG' || f.severity === 'SECURITY') && (lastBugRound === null || f.round > lastBugRound)) lastBugRound = f.round;
   }
   // The loop as it stands: the current run across both keys. Clean rounds walk it

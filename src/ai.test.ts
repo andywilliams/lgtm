@@ -1,6 +1,6 @@
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, pickRoundModel, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS } from './ai.js';
+import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -312,4 +312,46 @@ test('isTimeout: a killed child is ours only if the wait actually elapsed', asyn
   } finally {
     if (saved === undefined) delete process.env.LGTM_TIMEOUT_MS; else process.env.LGTM_TIMEOUT_MS = saved;
   }
+});
+
+describe('mergeUsage', () => {
+  const u = (over: Partial<AIUsage> = {}): AIUsage => ({ ...emptyUsage(), calls: 1, ...over });
+
+  test('sums the spend of the review and the verifier pass', () => {
+    const merged = mergeUsage(
+      u({ inputTokens: 100, cacheReadTokens: 900, outputTokens: 50, costUsd: 1.5, durationMs: 1000, models: ['claude-opus-5'], sentTokens: 250, lastPromptTokens: 1000 }),
+      u({ inputTokens: 20, outputTokens: 5, costUsd: 0.04, durationMs: 300, models: ['claude-sonnet-5'], sentTokens: 30, lastPromptTokens: 20 }),
+    );
+    assert.equal(merged.costUsd, 1.54);
+    assert.equal(merged.calls, 2);
+    assert.equal(merged.sentTokens, 280);
+    assert.deepEqual(merged.models, ['claude-opus-5', 'claude-sonnet-5']);
+    // The session holds the REVIEW's context; the verifier runs outside it and must not
+    // be read as having grown it, or the next round's session budget is wrong.
+    assert.equal(merged.lastPromptTokens, 1000);
+  });
+
+  test('an unmeasured half taints the total rather than reading as a low bill', () => {
+    assert.equal(mergeUsage(u({ costUsd: 1 }), u({ measured: false })).measured, false);
+    assert.equal(mergeUsage(u({ measured: false }), u({ costUsd: 1 })).measured, false);
+  });
+
+  test('a window with no calls is ignored, not averaged in', () => {
+    const review = u({ costUsd: 2, lastPromptTokens: 500 });
+    assert.deepEqual(mergeUsage(review, emptyUsage()), review);
+    assert.deepEqual(mergeUsage(emptyUsage(), review), review);
+  });
+});
+
+test('the model override is readable, so a nested call can put back what it found', () => {
+  // The verifier pass runs on a cheaper model mid-command; without this the review's own
+  // choice would be lost and everything after it would run on the verifier's model.
+  setModelOverride('claude-opus-5');
+  const before = getModelOverride();
+  setModelOverride('claude-sonnet-5');
+  assert.equal(getModelOverride(), 'claude-sonnet-5');
+  setModelOverride(before);
+  assert.equal(getModelOverride(), 'claude-opus-5');
+  setModelOverride(undefined);
+  assert.equal(getModelOverride(), undefined);
 });
