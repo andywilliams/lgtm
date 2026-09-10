@@ -178,4 +178,30 @@ describe('skipped checks are ground truth', () => {
     const cut = enforceSkippedChecks({ ...result, skipped_checks: [] }, { charter: true, system: true, map: 'truncated' });
     assert.ok(cut.skipped_checks.some((s) => /TRUNCATED/.test(s)));
   });
+
+  it('names an unreadable ticket, says nothing when none was referenced, and overrules a paraphrase', () => {
+    const base = { verdict: 'no-decisions' as const, summary: '', decisions: [], skipped_checks: [] as string[] };
+    const ctx = { charter: true, system: true, map: true as const };
+
+    // No ticket REFERENCED is not a skipped check: most repos do not use the board, and a
+    // permanent line in all of their output would be noise, not honesty.
+    assert.deepEqual(enforceSkippedChecks({ ...base }, { ...ctx, ticket: false }).skipped_checks, []);
+    assert.deepEqual(enforceSkippedChecks({ ...base }, { ...ctx, ticket: true }).skipped_checks, []);
+
+    // A ticket that WAS named and could not be read is recorded, with the reason.
+    const unreadable = enforceSkippedChecks({ ...base }, { ...ctx, ticket: { configured: true, reason: 'the board answered 500' } });
+    assert.ok(unreadable.skipped_checks.some((s) => /ticket could not be read \(the board answered 500\)/.test(s)));
+
+    // An unconfigured board is its own shape, and the string DWLF-210 quotes verbatim. The
+    // kind is passed through rather than sniffed out of the reason, so rewording the
+    // human-readable message cannot silently change what the honesty record claims.
+    const unconfigured = enforceSkippedChecks({ ...base }, { ...ctx, ticket: { configured: false, reason: 'anything at all' } });
+    assert.deepEqual(unconfigured.skipped_checks, ['ticket check — no board access']);
+
+    // And the model's OWN phrasing is overruled when the ticket was in fact provided —
+    // matched on a fragment, like the other three, or a paraphrase survives and claims a
+    // check was skipped that was not.
+    const paraphrase = enforceSkippedChecks({ ...base, skipped_checks: ['ticket completeness — no board access'] }, { ...ctx, ticket: true });
+    assert.deepEqual(paraphrase.skipped_checks, []);
+  });
 });

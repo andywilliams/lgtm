@@ -1,4 +1,5 @@
 import { jsonrepair } from 'jsonrepair';
+import { fenced } from './ticket.js';
 import { runAIPrompt, type AIProvider } from './ai.js';
 import type { Harshness, ReviewResult, ReviewComment, Severity, FindingKind, Confidence, ExistingComment, RecheckResponse, RecheckResult, CommentStatus, QuizResult, QuizQuestion, DecidedFinding } from './types.js';
 
@@ -146,6 +147,8 @@ export interface ReviewPromptInput {
   readersContext?: string;
   extra?: {
     scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean;
+    /** The ticket this change is meant to deliver, as a prompt block (see ticket.ts). */
+    ticket?: string;
     /** Continue the loop's session instead of starting fresh; only what moved is sent. */
     session?: { id: string; resume: boolean; round: number; changedSinceLast: Record<string, string>; unchangedFiles: string[] };
   };
@@ -169,6 +172,11 @@ export function buildReviewPrompt(input: ReviewPromptInput): string {
 /** The part of the prompt that is the same within a loop (see buildReviewPrompt). */
 export function buildStablePrefix(input: ReviewPromptInput): string {
   const { fileContents, usageContext, expandedContext, handbookContext, readersContext, extra } = input;
+  // Stable within a loop — the ticket is what the change was asked to deliver, and it does
+  // not move while the change does — so it sits with the charter and standards, in the part
+  // of the prompt a resumed round reads from cache. It is fingerprinted like them, so an
+  // edited ticket reaches a resumed session as updated context.
+  const ticketSection = extra?.ticket ?? '';
 
   // ---- stable within a loop, most stable first -------------------------------------
   const handbookContextSection = handbookContext || '';
@@ -204,7 +212,7 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
   const usageContextSection = usageContext || '';
 
   return `${SYSTEM_PROMPT}
-${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}${readersContext ?? ''}`;
+${handbookContextSection}${charterSection}${standardsSection}${ticketSection}${expandedContextSection}${fileContextSection}${usageContextSection}${readersContext ?? ''}`;
 }
 
 /**
@@ -261,7 +269,7 @@ ${items}
 ${prTitle}
 
 ## PR Description
-${prBody || '(no description)'}
+${prBody ? fenced('PULL REQUEST DESCRIPTION', prBody) : '(no description)'}
 
 ## Diff
 \`\`\`diff

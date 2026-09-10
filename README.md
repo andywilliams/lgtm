@@ -200,6 +200,10 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_LATE_MODEL` | `claude-sonnet-5` | model for late chill review rounds (see below); `off` = always the full model |
 | `LGTM_VERIFY_MODEL` | `claude-sonnet-5` | model for the verifier pass that proves or drops each finding (see below); `off` = no verifier pass |
 | `LGTM_VERIFY_MAX_BYTES` | `60000` | cap on the file windows the verifier is shown around each finding |
+| `LGTM_TICKETS_CMD` | — | command that prints a ticket given its number — any tracker; tried before the API |
+| `LGTM_TICKETS_API` | — | ticket board API base; with the token below, turns on the check against the ticket |
+| `LGTM_TICKETS_TOKEN` | — | bearer token for that board (`DWLF_TICKETS_API` / `DWLF_TICKETS_TOKEN` also work) |
+| `LGTM_TICKET_PREFIX` | `DWLF` | ref prefix to look for in a PR title or branch, e.g. `PROJ-14` |
 | `LGTM_CLAUDE_SETTING_SOURCES` | *(empty)* | set to `user` if your settings carry `apiKeyHelper`/`env` routing that must apply |
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 | `LGTM_TIMEOUT_MS` | 15 minutes | how long one model call may take before lgtm gives up and says why |
@@ -245,18 +249,43 @@ Each finding comes back with a verdict:
 | `confirmed` | the verifier quoted lines showing the problem is real | shown, confidence raised to `high` |
 | `refuted` | it quoted lines that contradict the finding | dropped |
 | `unshown` | the code that would settle it was not in front of it | **shown unchanged** |
-| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped |
+| `unproven` | it read the relevant code and that code still does not establish the claim | a **BUG/SECURITY is kept** at `low` confidence; a SUGGESTION/NITPICK is dropped, unless it cites a document (see below) |
 | `unverified` | the pass did not run, failed, or said nothing about this finding | shown unchanged |
 
 Three rules keep it safe rather than merely cheaper. It can **never add a finding** — a second generator is a second source of churn. It may **lower a severity, never raise one**, and the drop decision is taken on the severity the *reviewer* gave, so "downgrade to a suggestion, then drop it as an opinion" is not a route by which a BUG can disappear. And **absence of proof is not refutation**: a refutation with nothing quoted is recorded as `unproven`, and a finding whose proof was never in front of the verifier is `unshown`, which drops nothing.
 
 That last distinction was bought with data. On this feature's own third review round, before `unshown` existed, the verifier dropped three findings — and all three were true, dropped only because their proof sat in a file it had not been given. So it is now also **shown the whole of any other file a finding names**, and told exactly which files it has. And the rule is enforced where the truth is known: lgtm records which files it actually sent, and rewrites any verdict about a file it never sent to `unshown` — the model is asked, but not trusted, because the configurations this feature recommends for decorrelation are the ones least likely to honour a fine prose distinction.
 
+A finding tagged `(ticket)`, `(charter)` or `(standard …)` is never dropped merely as `unproven` — it can still be refuted. The completeness check asserts an *absence*, which has no lines to quote, so without the exemption the filter could silently delete a whole capped feature. The exemption itself is capped in code, not in a prompt: one `(charter)`, one `(ticket)` and three `(standard …)` findings per round, matching what each check's prompt asks for. Anything past that is an ordinary opinion and droppable.
+
 `comments` in agent mode now carries the findings that **survived**. Everything dropped is in `verify.dropped` with its own `id`, so a wrong drop can be quoted back, dismissed, or joined to its row in the log.
 
 Drops are never silent. They are stored in `reviews.db` (so the false-positive share per round is a number, not a memory), listed under `verify.dropped` in agent output, and any dropped BUG/SECURITY prints a line on stderr. `lgtm rounds` divides the drops only by the findings a pass actually adjudicated, and names any round whose verifier ran and could not answer — those findings are *unchecked*, which is not the same as clean. A dropped finding is **not** fed back as a dismissal — the next round is free to raise it again, so one bad drop cannot silence a real bug for the rest of a loop.
 
 The verifier is deliberately given the diff and a window around each finding rather than the whole context: its question is per-finding, so its cost scales with the number of findings. Measured, it runs on `LGTM_VERIFY_MODEL` (default `claude-sonnet-5`) and `lgtm rounds` prints what it cost as a percentage on top of the reviews.
+
+### Did it do what the ticket asked?
+
+`lgtm review` asks whether the code is correct and `lgtm arch` asks whether it was the right thing to build. "Did it actually do what was asked?" was left to the same agent that wrote it. When a PR title, branch or body names a ticket, lgtm fetches it and asks for **one** capped, question-shaped finding naming acceptance criteria the diff does not visibly address.
+
+```bash
+export LGTM_TICKETS_CMD='my-tracker show'       # any tracker: prints the ticket, given its number
+export LGTM_TICKETS_API=https://your-board/v1   # or a board API, with a token
+export LGTM_TICKETS_TOKEN=…
+export LGTM_TICKET_PREFIX=PROJ                  # the ref shape to look for (default DWLF)
+lgtm review 86                  # ref parsed from "feat: thing (PROJ-210)" or the branch name
+lgtm review 86 --ticket 210     # say it explicitly
+lgtm review 86 --no-ticket      # skip the check
+lgtm arch review --local        # the arch altitude gets the same block
+```
+
+The finding is prefixed `(ticket)`, always `SUGGESTION`, never more than one, and phrased as a question — a criterion may be met by another PR or by work already merged, so it asks the author to confirm rather than asserting a defect. It is never a reason to withhold approval.
+
+**Ticket text is untrusted input** — and so is a pull request description, which is written by whoever opened the PR and, in Action mode, could be a fork. Both are fenced in markers their content cannot close, labelled with who wrote them, and preceded by an explicit refusal instruction; lgtm's own instruction is stated *after* the data, so the last thing the reviewer reads is not the author's.
+
+The verifier gets the same treatment, because it is the model whose answers *delete* findings. Two code-side checks back the prose there: a verdict about a file that was never sent becomes `unshown`, and a **refutation must quote text that actually appears in the code the verifier was shown** — the haystack deliberately excludes the ticket, so a planted "quote" cannot stand up a refutation. `refuted` is the only verdict that drops a BUG outright.
+
+Everything about it is best-effort, like the brain integration: no configuration, no ref, an unreachable board, a timeout or a 404 all mean the check is simply not made. `lgtm arch` records an unreadable ticket in `skipped_checks`; a change with no ticket ref says nothing at all, because not every repo uses a board.
 
 ### Who reads what this diff writes
 

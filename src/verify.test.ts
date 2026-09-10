@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
+import { applyVerdicts, parseVerdicts, buildWindows, buildVerifyPrompt, citesDocs, citesDoc, DOC_TAG_EXEMPT, quotesShownText, referencedPaths, extraFilesFor, diffFiles, wasShown, verifyModel, verifyMaxContextBytes, verifyFindings, kept, dropped } from './verify.js';
 import { setModelOverride, getModelOverride } from './ai.js';
 import type { ReviewComment, Severity } from './types.js';
 
@@ -43,6 +43,42 @@ describe('applyVerdicts — what may drop a finding', () => {
     const v = parseVerdicts(JSON.stringify({ verdicts: [{ id: 1, verdict: 'probably fine', verifier_note: 'a' }] }), 1);
     assert.equal(v[1].verdict, 'unshown');
     assert.deepEqual(dropped(applyVerdicts([finding({ severity: 'NITPICK' })], v)), []);
+  });
+
+  test('a finding whose evidence is a DOCUMENT is not dropped merely as unproven', () => {
+    // Each document check is capped at ONE finding and is always a SUGGESTION, so the
+    // opinion-drop could otherwise delete a whole capped feature silently. The completeness
+    // check is the sharp case: one SUGGESTION asserting an ABSENCE, which has no lines to
+    // quote. They can still be REFUTED; what is refused is deletion by inability to prove.
+    const docs = [
+      finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' }),
+      finding({ severity: 'SUGGESTION', title: '(charter) this contradicts an invariant' }),
+      finding({ severity: 'NITPICK', title: '(standard FUN-1) the function is too long' }),
+    ];
+    const unproven = Object.fromEntries(docs.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    assert.deepEqual(dropped(applyVerdicts(docs, unproven)), []);
+
+    const refuted = Object.fromEntries(docs.map((_, i) => [i + 1, { verdict: 'refuted' as const, verifier_evidence: ['x'], verifier_note: 'n' }]));
+    assert.equal(dropped(applyVerdicts(docs, refuted)).length, 3, 'a refuted document claim is still dropped');
+
+    assert.equal(citesDoc(finding({ title: '(out of scope) x' })), false);
+    assert.equal(citesDoc(finding({ title: 'plain finding' })), false);
+  });
+
+  test('the exemption is CAPPED per tag, so it cannot switch the filter off', () => {
+    // The caps each check states are instructions to a model, and the exemption is keyed on
+    // a title prefix the reviewer chooses. Unbounded, a pedantic round could put any number
+    // of undroppable opinions through with no signal that it had happened.
+    const many = [
+      ...Array.from({ length: 3 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(ticket) criterion ${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => finding({ severity: 'SUGGESTION', title: `(standard FUN-${i}) too long` })),
+    ];
+    const unproven = Object.fromEntries(many.map((_, i) => [i + 1, { verdict: 'unproven' as const, verifier_note: 'n' }]));
+    const out = applyVerdicts(many, unproven);
+    const kept = out.filter((c) => !c.verifier_dropped);
+    assert.equal(kept.length, DOC_TAG_EXEMPT.ticket + DOC_TAG_EXEMPT.standard, 'one ticket finding and three standards findings survive');
+    assert.equal(dropped(out).length, 4, 'the rest are ordinary opinions');
+    assert.deepEqual(kept.map((c) => c.title), ['(ticket) criterion 0', '(standard FUN-0) too long', '(standard FUN-1) too long', '(standard FUN-2) too long']);
   });
 
   test('an unproven BUG is kept at low confidence; an unproven SUGGESTION is dropped', () => {
@@ -205,10 +241,18 @@ describe('buildVerifyPrompt', () => {
     assert.match(p, /Findings to verify \(2\)/);
   });
 
-  test('citesDocs recognises both tag spellings and nothing else', () => {
+  test('citesDocs recognises every document tag and nothing else', () => {
+    // Each of these is a finding whose ONLY evidence is a document. Miss one and the drop
+    // rule deletes that whole class as unprovable opinion, since they are all SUGGESTIONs.
     assert.equal(citesDocs([finding({ title: '(charter) x' })]), true);
     assert.equal(citesDocs([finding({ title: '(standard NAM-2) x' })]), true);
+    assert.equal(citesDocs([finding({ title: '(ticket) x' })]), true);
     assert.equal(citesDocs([finding({ title: '(out of scope) x' })]), false);
+  });
+
+  test('a (ticket) finding is verified WITH the ticket in front of the verifier', () => {
+    const p = buildVerifyPrompt({ diff: 'd', prTitle: 'T', docs: 'TICKET-TEXT-MARKER', findings: [finding({ severity: 'SUGGESTION', title: '(ticket) criterion 2 is not addressed' })] });
+    assert.match(p, /TICKET-TEXT-MARKER/);
   });
 });
 
@@ -318,6 +362,39 @@ describe('the shown-context rule — the caller decides, not the prose', () => {
     const guarded = applyVerdicts([f], verdicts, ctx([], ['src/cli.ts']), contents);
     assert.equal(guarded[0].verdict, 'unshown');
     assert.equal(guarded[0].verifier_dropped, undefined);
+  });
+
+  test('a refutation must quote text that was actually sent', () => {
+    // The route this closes: ticket text is attacker-writable and reaches this pass, so an
+    // instruction planted there could produce a `refuted` verdict with invented quoted
+    // lines about a file that WAS sent — which wasShown cannot catch, and `refuted` is the
+    // one verdict that deletes a BUG outright.
+    const f = finding({ severity: 'BUG', file: 'src/a.ts' });
+    const shownCode = ctx(['src/a.ts']);
+    const real = { ...shownCode, text: 'function parse(row) {\n  if (!row) return null;\n}' };
+
+    const invented = applyVerdicts([f], { 1: { verdict: 'refuted', verifier_evidence: ['if (row === undefined) throw new Error("never written");'], verifier_note: 'n' } }, real, {});
+    assert.equal(invented[0].verdict, 'unproven');
+    assert.equal(invented[0].verifier_dropped, undefined, 'the BUG survives');
+
+    const genuine = applyVerdicts([f], { 1: { verdict: 'refuted', verifier_evidence: ['if (!row) return null;'], verifier_note: 'the guard is there' } }, real, {});
+    assert.equal(genuine[0].verdict, 'refuted');
+    assert.equal(genuine[0].verifier_dropped, true, 'a real refutation still drops');
+  });
+
+  test('quotesShownText ignores whitespace and refuses a quote too short to mean anything', () => {
+    const hay = 'const x = 1;\n    if (!row)   return null;';
+    assert.equal(quotesShownText(['if (!row) return null;'], hay), true, 're-indentation must not fail an honest quote');
+    assert.equal(quotesShownText(['not in there at all, definitely'], hay), false);
+    assert.equal(quotesShownText([';'], hay), false, 'a fragment that matches anything proves nothing');
+    assert.equal(quotesShownText([], hay), false);
+  });
+
+  test('the quote check haystack is the CODE, never the ticket text', () => {
+    const out: { shown?: Set<string>; code?: string } = {};
+    buildVerifyPrompt({ diff: 'DIFF-MARKER', prTitle: 'T', docs: 'PLANTED-TICKET-MARKER', findings: [finding({ title: '(ticket) x' })] }, out);
+    assert.match(out.code!, /DIFF-MARKER/);
+    assert.doesNotMatch(out.code!, /PLANTED-TICKET-MARKER/, 'a haystack containing attacker text would accept the attacker\'s own quotes');
   });
 
   test('a refutation of code that was never sent is corrected too', () => {

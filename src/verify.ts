@@ -118,6 +118,11 @@ section or document that is not listed above is ALWAYS "unshown", never "unprove
 ABSENCE OF PROOF IS NOT REFUTATION. Do not reason from what is missing from your context: a thing you
 were not given is not a thing that does not exist.
 
+A finding of kind "missing" claims something is ABSENT, so there are no lines showing a defect to quote.
+"confirmed" for one of those means: you looked where the thing would be, in code you were given, and it
+is not there — quote the place it would have been, or the requirement it fails. Do not answer "unproven"
+merely because an absence has nothing to point at.
+
 WHAT YOU MAY NOT DO:
 - You may NOT add findings. If you notice a different problem, ignore it — that is not this job.
 - You may NOT change a finding's file, line, title or body.
@@ -247,15 +252,48 @@ export function diffFiles(diff: string): Set<string> {
   return out;
 }
 
-/** Does any finding cite a document (charter / STANDARDS.md) rather than the code? */
-export function citesDocs(findings: ReviewComment[]): boolean {
-  return findings.some((f) => /^\((charter|standard\b[^)]*)\)/i.test(f.title));
+/**
+ * Is this finding a conformance claim against a DOCUMENT — the charter, STANDARDS.md, or
+ * the ticket — rather than a claim about the code? Two things follow. The document travels
+ * with it, because it is the only evidence such a finding can have. And it is never dropped
+ * merely as `unproven`: each of those checks is already capped at ONE finding by its own
+ * prompt, and every one is a SUGGESTION, so without this the opinion-drop could silently
+ * delete a whole capped feature — the completeness check (DWLF-210) is one finding, always
+ * a SUGGESTION, and asserts an ABSENCE, which is the hardest shape to quote lines for.
+ * They can still be REFUTED and dropped; what is refused is deletion by inability to prove.
+ */
+export function citesDoc(f: ReviewComment): boolean {
+  return docTagOf(f) !== null;
 }
 
-export function buildVerifyPrompt(input: VerifyInput, shownOut?: Set<string>): string {
+/** The document a finding's tag cites, or null. */
+export function docTagOf(f: ReviewComment): 'charter' | 'ticket' | 'standard' | null {
+  const m = f.title.match(/^\((charter|ticket|standard)\b/i);
+  return m ? (m[1].toLowerCase() as 'charter' | 'ticket' | 'standard') : null;
+}
+
+/**
+ * How many findings of each tag the drop exemption covers — the caps each check's own
+ * prompt states. Enforced HERE rather than trusted, because those caps are instructions to
+ * a model and the exemption is the one place the filter can be switched off: keyed on a
+ * title prefix the reviewer chooses, an uncapped exemption would let a pedantic round put
+ * any number of undroppable opinions through, with no signal that it had happened. Beyond
+ * the cap a doc-tagged finding is an ordinary opinion and droppable like any other.
+ */
+export const DOC_TAG_EXEMPT: Record<'charter' | 'ticket' | 'standard', number> = { charter: 1, ticket: 1, standard: 3 };
+
+export function citesDocs(findings: ReviewComment[]): boolean {
+  return findings.some(citesDoc);
+}
+
+export function buildVerifyPrompt(input: VerifyInput, out?: { shown?: Set<string>; code?: string }): string {
   const { diff, prTitle, findings, contents = {}, readersContext, docs } = input;
   const maxBytes = input.maxContextBytes ?? verifyMaxContextBytes();
-  const windows = buildWindows(findings, contents, maxBytes, shownOut);
+  const windows = buildWindows(findings, contents, maxBytes, out?.shown);
+  // The CODE the verifier was shown, and nothing else. Deliberately excludes the ticket
+  // data and the findings list: a quote check whose haystack contained attacker-writable
+  // text would accept a refutation quoting the attacker's own planted lines.
+  if (out) out.code = `${diff}\n${windows}\n${readersContext ?? ''}`;
   // The charter and standards are the ONLY evidence a "(charter)" / "(standard …)"
   // finding can have, so they travel with such a finding and are otherwise left out —
   // without them the drop rule would delete that whole class as unprovable opinion.
@@ -306,6 +344,31 @@ export function isOpinion(severity: Severity): boolean {
 }
 
 /**
+ * Collapse whitespace so a quote can be compared against the text it claims to come from
+ * without failing on re-indentation.
+ */
+const flat = (s: string) => s.replace(/\s+/g, ' ').trim();
+
+/**
+ * Does a refutation actually quote something the verifier was shown? `refuted` is the only
+ * verdict that deletes a BUG outright, and it is the one an INJECTED instruction would aim
+ * for: ticket text is attacker-writable, reaches this pass, and could supply invented
+ * "quoted lines" refuting a finding about a file that WAS sent — so `wasShown` cannot catch
+ * it. A quote that appears nowhere in what was sent is not evidence, so the refutation
+ * falls back to `unproven`, which keeps a BUG and keeps a doc-tagged finding.
+ *
+ * One quote is enough to stand it up: models re-wrap and elide, and requiring every line to
+ * match exactly would reject honest refutations far more often than dishonest ones.
+ */
+export function quotesShownText(evidence: string[], haystack: string): boolean {
+  const hay = flat(haystack);
+  return evidence.some((e) => {
+    const q = flat(e);
+    return q.length >= 12 && hay.includes(q);
+  });
+}
+
+/**
  * What the verifier was actually given, so a verdict about its own context can be checked
  * rather than trusted. `buildWindows` computes this exactly; leaving it in the prompt as a
  * sentence and nowhere else would make the safety property model-dependent — weakest in
@@ -317,6 +380,8 @@ export interface ShownContext {
   shown: Set<string>;
   /** Files the diff touches — in front of the verifier whether or not a window fitted. */
   inDiff: Set<string>;
+  /** Everything the verifier was sent, for checking that a refutation quotes real text. */
+  text?: string;
 }
 
 /**
@@ -371,6 +436,7 @@ export function parseVerdicts(output: string, count: number): Verdicts {
  * the false-positive rate becomes a number) and only then hide them from its output.
  */
 export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx?: ShownContext, contents?: Record<string, string>): ReviewComment[] {
+  const usedExemption: Record<string, number> = {};
   return findings.map((f, i) => {
     const v = verdicts[i + 1];
     // No verdict at all is NOT "unproven": a verifier that skipped a finding has said
@@ -382,13 +448,24 @@ export function applyVerdicts(findings: ReviewComment[], verdicts: Verdicts, ctx
     // A refutation is a claim about the code and must be quotable; without quoted lines
     // it is exactly the "I could not find it" case, which is unproven.
     let verdict: Verdict = v.verdict === 'refuted' && evidence.length === 0 ? 'unproven' : v.verdict;
+    // A refutation must quote text that actually exists in what was sent. Otherwise the
+    // one verdict that deletes a BUG outright can be produced from invented lines — which
+    // is what an instruction planted in a ticket body would aim to do.
+    if (verdict === 'refuted' && ctx?.text && !quotesShownText(evidence, ctx.text)) verdict = 'unproven';
     // The caller knows what it sent, so it decides — not the prose. A judgement about code
     // the verifier never held is recorded as what it is, whatever the model called it.
     if (ctx && verdict !== 'unverified' && verdict !== 'unshown' && !wasShown(f, ctx, contents)) verdict = 'unshown';
     // The DROP decision uses the severity the REVIEWER gave, so that lowering a BUG to a
     // SUGGESTION can never be the step that makes it droppable. 'unshown' never drops:
     // the verifier is saying it had nothing to look at, which is a fact about the prompt.
-    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed));
+    // The exemption is spent per tag, in the order the reviewer listed the findings.
+    const tag = docTagOf(f);
+    let exempt = false;
+    if (tag) {
+      const used = usedExemption[tag] ?? 0;
+      if (used < DOC_TAG_EXEMPT[tag]) { usedExemption[tag] = used + 1; exempt = true; }
+    }
+    const dropped = verdict === 'refuted' || (verdict === 'unproven' && isOpinion(claimed) && !exempt);
     const confidence = verdict === 'confirmed'
       ? (evidence.length > 0 ? 'high' as const : f.confidence)
       : verdict === 'unproven' ? 'low' as const : f.confidence;
@@ -434,7 +511,9 @@ export function verifyFindings(input: VerifyInput & {
     // Inside the guard, not above it: this is the statement that consumes untrusted model
     // output (a finding's `file` and `line`), and the function's contract is that a review
     // already paid for is never lost to something that happens after it.
-    const prompt = buildVerifyPrompt(input, shown);
+    const out: { shown?: Set<string>; code?: string } = { shown };
+    const prompt = buildVerifyPrompt(input, out);
+    ctx.text = out.code;
     if (ai === 'claude') setModelOverride(model);
     let output: string;
     try {

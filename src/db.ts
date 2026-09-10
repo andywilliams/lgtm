@@ -50,6 +50,8 @@ export interface ReviewLog {
   modelRole?: string;
   /** The verifier pass, when it ran: its model, its own spend, and why it could not answer. */
   verify?: { model?: string; measured: boolean; costUsd: number | null; tokens: number | null; failed?: string };
+  /** The ticket the round was judged against, and whether its text reached the reviewer. */
+  ticket?: { ref: number | null; present: boolean };
 }
 
 // Columns added after the table was first created. Each is applied once, by name,
@@ -120,6 +122,13 @@ const REVIEW_COLUMNS: [string, string][] = [
   ['verify_cost_usd', 'REAL'],
   ['verify_tokens', 'INTEGER'],
   ['verify_failed', 'TEXT'],
+  // The completeness check (DWLF-210): which ticket the round was judged against, and
+  // whether its text actually reached the reviewer. Without these, "the check never fired
+  // because the diff covered the ticket", "the board 404'd every round" and "no board was
+  // ever configured" are the same row — and the question the check exists to answer, do
+  // half-shipped tickets get caught before merge, has no query behind it.
+  ['ticket_ref', 'INTEGER'],
+  ['ticket_present', 'INTEGER'],
 ];
 
 /**
@@ -412,9 +421,10 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
       token_count, model, used_context_expansion, false_negative,
       prompt_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, cost_usd, duration_ms, model_id, usage_source,
       mode, round_key, round, harshness, diff_sha, branch, scope, override_reason, recovered, diff_lines, model_reason, failed, session_id, file_shas, model_role, context_tokens, sent_tokens,
-      verify_ran, verify_rules, verify_model, verify_cost_usd, verify_tokens, verify_failed
+      verify_ran, verify_rules, verify_model, verify_cost_usd, verify_tokens, verify_failed,
+      ticket_ref, ticket_present
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const write = db.transaction((): { id: number; round: number | null } => {
     const round = data.round ?? (data.roundKey ? nextRoundIn(db, data.repo, data.roundKey) : null);
@@ -460,7 +470,9 @@ export function logReview(data: ReviewLog): { id: number; round: number | null }
     data.verify?.model ?? null,
     data.verify?.costUsd ?? null,
     data.verify?.tokens ?? null,
-    data.verify?.failed ?? null
+    data.verify?.failed ?? null,
+    data.ticket?.ref ?? null,
+    data.ticket ? (data.ticket.present ? 1 : 0) : null
     );
     return { id: Number(result.lastInsertRowid), round };
   });

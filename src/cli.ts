@@ -16,6 +16,7 @@ import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
 import { buildRepoMap } from './repoMap.js';
+import { ticketContext, ticketPrefix } from './ticket.js';
 import { buildStandardsBlock } from './standards.js';
 import { fetchBrainContext } from './brain.js';
 import { extractChangedSymbols, findUsages, formatUsageContext, getRepoRoot } from './usage.js';
@@ -114,6 +115,10 @@ program.addHelpText(
     '  LGTM_TIMEOUT_MS               how long one model call may take before lgtm gives up and says so (default 15 minutes)\n' +
     '  LGTM_VERIFY_MODEL             model for the verifier pass that proves or drops each finding (default claude-sonnet-5; "off" = no verifier pass)\n' +
     '  LGTM_VERIFY_MAX_BYTES         cap on the file windows the verifier is shown around each finding (default 60000)\n' +
+    '  LGTM_TICKETS_CMD              command that prints a ticket given its number (any tracker); the escape hatch\n' +
+    '  LGTM_TICKETS_API              ticket board API base — with the token below, reviews check the diff against the ticket they name\n' +
+    '  LGTM_TICKETS_TOKEN            bearer token for that board (DWLF_TICKETS_API / DWLF_TICKETS_TOKEN are also read)\n' +
+    '  LGTM_TICKET_PREFIX            ref prefix to look for in a PR title or branch (default DWLF, e.g. PROJ-14)\n' +
     '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
     '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
 );
@@ -136,6 +141,8 @@ program
   .option('--verify-model <id>', `Model for the verifier pass (default: LGTM_VERIFY_MODEL, else ${DEFAULT_LATE_MODEL})`)
   .option('--verify-ai <provider>', 'AI provider for the verifier pass: claude, codex (default: the review provider)')
   .option('--show-dropped', 'Show the findings the verifier dropped instead of hiding them', false)
+  .option('--ticket <n>', 'Ticket number this change delivers (default: parsed from the PR title, branch or body)')
+  .option('--no-ticket', 'Skip the check against the ticket (on by default when the board is configured)')
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('-H, --harshness <level>', 'Review harshness: chill, medium, pedantic', 'medium')
   .option('--dry-run', 'Show comments without posting', false)
@@ -199,6 +206,8 @@ program
     const batch = auto || options.batch;
     if (options.model && !isModelId(options.model)) exitWithError(`--model ${JSON.stringify(options.model)} is not a model id`);
     if (options.verifyModel && !isModelId(options.verifyModel)) exitWithError(`--verify-model ${JSON.stringify(options.verifyModel)} is not a model id`);
+    if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of ${ticketPrefix()}-<n>)`);
+
 
     // A plain interactive `review` drives an arrow-key selector via prompts(). If stdin isn't
     // a real terminal (piped, CI, or run from inside another tool/agent), that selector prints
@@ -281,6 +290,8 @@ program
         verifyModel: options.verifyModel,
         verifyAi: options.verifyAi ? resolveProvider(options.verifyAi, exitWithError) : undefined,
         showDropped: Boolean(options.showDropped),
+        ticketEnabled: options.ticket !== false,
+        ticketRef: typeof options.ticket === 'string' && /^\d+$/.test(options.ticket) ? Number(options.ticket) : undefined,
         policy: memory.policy,
         charterEnabled: options.charter !== false,
         standardsEnabled: options.standards !== false,
@@ -343,6 +354,10 @@ interface RunOptions {
   verifyAi?: AIProvider;
   /** Show the verifier's drops rather than hiding them — for auditing the pass itself. */
   showDropped?: boolean;
+  /** Check the diff against the ticket it names (DWLF-210). */
+  ticketEnabled?: boolean;
+  /** `--ticket <n>`, which wins over anything parsed from the title or branch. */
+  ticketRef?: number;
   /**
    * What the round policy needs from the log; absent when the log was unavailable.
    * `loopRound` counts the whole current run (local + PR), which is what the policy keys on.
@@ -496,6 +511,8 @@ function formatAgentResult(options: {
   usage?: AIUsage;
   loop?: LoopState | null;
   recovered?: boolean;
+  /** The ticket the change names, and whether its text reached the reviewer. */
+  ticket?: { ref: number | null; present: boolean; reason: string | null } | null;
   /** The verifier pass and what it dropped — present so a bad drop is auditable, never silent. */
   verify?: VerifySummary | null;
   error?: string;
@@ -541,6 +558,10 @@ function formatAgentResult(options: {
     })),
     context: {
       maxContext: true,
+      // Whether the completeness check ran at all. Without this, "no (ticket) finding
+      // because the diff covers the ticket" and "no (ticket) finding because the board
+      // 404'd" are the same payload — a clean bill and total silence look identical.
+      ticket: options.ticket ?? null,
       relatedFiles: (options.relatedFiles ?? []).map(f => ({ path: f.path, reason: f.reason })),
       tokenEstimate: options.tokenEstimate ?? 0,
       // What the provider billed for this run — tokenEstimate above is only the diff+context size.
@@ -610,8 +631,10 @@ function recordReviewMetrics(opts: {
   usage?: AIUsage;
   /** The verifier pass, when it ran — its own half of the spend, recorded beside the total. */
   verify?: { model?: string; usage: AIUsage; failed?: string };
+  /** The ticket this round was judged against, when one was named. */
+  ticket?: { ref: number | null; present: boolean };
 }): { tokenEstimate: number; usage: AIUsage; loop: LoopState | null } {
-  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole, verify } = opts;
+  const { repo, prNumber, diff, expanded, relatedFiles, ai, local, filesReviewed, harshness, comments, decided, recovered, branch, scope, overrideReason, diffLines, modelChoice, failed, sessionId, fileShas, modelRole, verify, ticket } = opts;
   let tokenEstimate = Math.ceil(diff.length / 4);
   for (const file of expanded) {
     tokenEstimate += Math.ceil(file.content.length / 4);
@@ -663,6 +686,7 @@ function recordReviewMetrics(opts: {
         tokens: verify.usage.measured && verify.usage.calls > 0 ? promptTokens(verify.usage) + verify.usage.outputTokens : null,
         failed: verify.failed,
       },
+      ticket: ticket && ticket.ref !== null ? ticket : undefined,
     });
     const round = allocated ?? 1;
     if (failed) return { tokenEstimate, usage, loop: null };
@@ -691,7 +715,7 @@ function recordReviewMetrics(opts: {
 }
 
 async function runReview(options: RunOptions): Promise<void> {
-  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, addDirs, readersEnabled, policy, charterEnabled, standardsEnabled, verifyEnabled, showDropped } = options;
+  const { prNumber, repo, local, base, dryRun, batch, auto, agent, fullContext, usageContext, relatedFiles, ai, scope, decided, overrideReason, explicitModel, harshnessExplicit, fresh, addDirs, readersEnabled, policy, charterEnabled, standardsEnabled, verifyEnabled, showDropped, ticketEnabled, ticketRef } = options;
   let harshness = options.harshness;
   // The loop chooses harshness too: a late round with no unverified BUG/SECURITY is
   // asking "is it safe now?", which is chill's question — unless -H said otherwise.
@@ -872,6 +896,22 @@ async function runReview(options: RunOptions): Promise<void> {
     log(chalk.blue(`\n📏 Loaded engineering standards (STANDARDS.md check enabled)`));
   }
 
+  // What the change was ASKED to deliver. Best-effort in every direction: no ticket ref, no
+  // board configured, an unreachable board or a 404 all mean the check is simply not made.
+  const ticket = await ticketContext({
+    explicit: ticketRef, enabled: ticketEnabled,
+    prTitle: pr.title, prBody: pr.body,
+    branch: local ? getCurrentBranch() : pr.headRef,
+  });
+  if (ticket.block) log(chalk.blue(`\n🎫 Ticket ${ticketPrefix()}-${ticket.ref} — checking the diff against what it asked for`));
+  else if (ticket.reason && ticket.skipped !== 'not-configured') {
+    // Only a CONFIGURED board that failed is worth a line. Having no board is the default
+    // state and an opt-out, not a failure — warning about it would put a yellow line on
+    // every review in every repo whose branches happen to carry a DWLF ref.
+    const line = `🎫 ${ticketPrefix()}-${ticket.ref}: ${ticket.reason} — the completeness check is skipped`;
+    if (auto) console.error(chalk.yellow(line)); else log(chalk.yellow(line));
+  }
+
   // Which model this round runs on: --model, else the round policy (full model for
   // every first look; the cheaper model only on a late chill round of a settled diff).
   const diffLines = countDiffLines(diff);
@@ -897,6 +937,7 @@ async function runReview(options: RunOptions): Promise<void> {
   // (lgtm upgraded) restarts the session, since the reviewer's rules themselves moved.
   contentsSeen[SYSTEM_PROMPT_KEY] = REVIEW_SYSTEM_PROMPT;
   if (charterContextStr) contentsSeen['@charter'] = charterContextStr;
+  if (ticket.block) contentsSeen['@ticket'] = ticket.block;
   if (standardsContextStr) contentsSeen['@standards'] = standardsContextStr;
   if (handbookContextStr) contentsSeen['@handbook'] = handbookContextStr;
   const plan = planSession({ prior: policy?.session ?? null, contents: contentsSeen, ai, fresh, choice: initialChoice });
@@ -930,7 +971,7 @@ async function runReview(options: RunOptions): Promise<void> {
     sessionUsed.current = session ? { id: session.id, resume: session.resume } : null;
     if (session) started.add(session.id);
     return reviewPR(truncatedDiff, pr.title, pr.body, harshness, ai, fileContents, usageContextStr, expandedContextStr, handbookContextStr, {
-      scope, decided, charter: charterContextStr, standards: standardsContextStr, enforceSchema: attempt.enforceSchema,
+      scope, decided, charter: charterContextStr, standards: standardsContextStr, ticket: ticket.block, enforceSchema: attempt.enforceSchema,
       readersContext: readersContextStr,
       session: session ? { ...session, round: policy?.loopRound ?? 1 } : undefined,
     });
@@ -976,7 +1017,9 @@ async function runReview(options: RunOptions): Promise<void> {
     verifyOutcome = verifyFindings({
       diff: truncatedDiff, prTitle: pr.title, findings: result.comments, contents: contentsSeen,
       readersContext: readersContextStr || undefined,
-      docs: [charterContextStr, standardsContextStr].filter(Boolean).join('\n') || undefined,
+      // The ticket's DATA, never its instruction half: the reviewer is told to add one
+      // (ticket) finding, and the verifier's own first rule is that it may not add any.
+      docs: [charterContextStr, standardsContextStr, ticket.data].filter(Boolean).join('\n') || undefined,
       ai: vAi, model: chosen,
     });
     verifyUsage = takeUsage();
@@ -1020,6 +1063,7 @@ async function runReview(options: RunOptions): Promise<void> {
     sessionId: sessionUsed.current?.id, fileShas, modelRole: modelRoleOf(choice),
     usage: mergeRoundUsage(reviewUsage, verifyUsage),
     verify: verifyOutcome ? { model: verifyOutcome.model, usage: verifyUsage, failed: verifyOutcome.failed } : undefined,
+    ticket: { ref: ticket.ref, present: Boolean(ticket.block) },
   });
   // Built after the round is logged so each drop carries its finding id: a wrong drop has
   // to be quotable and joinable to its row, not just readable.
@@ -1075,6 +1119,7 @@ async function runReview(options: RunOptions): Promise<void> {
       usage: metrics.usage,
       loop: metrics.loop,
       recovered: result.recovered,
+      ticket: { ref: ticket.ref, present: Boolean(ticket.block), reason: ticket.reason },
       verify: verifySummary,
     }));
     return;
@@ -2022,6 +2067,8 @@ function formatArchAgentResult(opts: {
   systemPath?: string;
   /** Whether the review was grounded by a repository map — structured, not only prose in skipped_checks. */
   repoMap?: { present: boolean; truncated: boolean };
+  /** The ticket the change names, and whether its text reached the reviewer. */
+  ticket?: { ref: number | null; present: boolean; reason: string | null };
   error?: string;
 }): string {
   const r = opts.result;
@@ -2039,6 +2086,7 @@ function formatArchAgentResult(opts: {
       charterSource: opts.charterSource ?? null,
       system: opts.systemPath ?? null,
       repoMap: opts.repoMap ?? { present: false, truncated: false },
+      ticket: opts.ticket ?? null,
     },
     ...(opts.error ? { error: opts.error } : {}),
   });
@@ -2083,6 +2131,9 @@ interface ArchRunOptions {
   ai: AIProvider;
   /** Cap on the repository-map block; undefined uses the module default. */
   maxMapBytes?: number;
+  /** Give the review the ticket this change delivers (DWLF-210). */
+  ticketEnabled?: boolean;
+  ticketRef?: number;
 }
 
 async function runArchReview(options: ArchRunOptions): Promise<void> {
@@ -2130,6 +2181,18 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
   if (repoMap.block) log(chalk.blue(`🧭 Repository map${repoMap.truncated ? ' (truncated)' : ''}`));
   else log(chalk.yellow(`🧭 No repository map${repoRoot ? '' : ' (--repo names a repository this checkout is not)'} — placement and pattern counts will be skipped`));
 
+  // The ticket is exactly the `rationale_found` input the arch prompt asks for: what the
+  // change was asked to deliver, in the words of whoever asked for it.
+  const archTicket = await ticketContext({
+    explicit: options.ticketRef, enabled: options.ticketEnabled,
+    prTitle: pr.title, prBody: pr.body, branch: local ? getCurrentBranch() : pr.headRef,
+  });
+  if (archTicket.block) log(chalk.blue(`🎫 Ticket ${ticketPrefix()}-${archTicket.ref}`));
+  // Silent for an unconfigured board, exactly as the review path is: it is the default
+  // state and an opt-out, not a failure. It is still recorded in `skipped_checks`, which is
+  // arch's structured record of what it could not ground rather than a warning to the operator.
+  else if (archTicket.reason && archTicket.skipped !== 'not-configured') log(chalk.yellow(`🎫 ${ticketPrefix()}-${archTicket.ref}: ${archTicket.reason}`));
+
   const handbookBlock = await fetchBrainContext(repo);
   if (handbookBlock) log(chalk.blue(`📖 Handbook context loaded from second-brain`));
 
@@ -2140,6 +2203,12 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
     systemBlock: archCtx.systemBlock,
     repoMapBlock: repoMap.block,
     repoMapTruncated: repoMap.truncated,
+    // The DATA, not the reviewer's task: the block's "add EXACTLY ONE finding: severity
+    // …, kind …, title …" instruction names fields the arch schema does not have, and the
+    // arch prompt is told correctness belongs to another tool. What arch wants from a
+    // ticket is the rationale its own schema asks for.
+    ticketBlock: archTicket.data,
+    ticketSkip: archTicket.reason ? { configured: archTicket.skipped !== 'not-configured', reason: archTicket.reason } : undefined,
     handbookBlock,
     fileContents,
   });
@@ -2152,6 +2221,7 @@ async function runArchReview(options: ArchRunOptions): Promise<void> {
       charterSource: archCtx.charterSource,
       systemPath: archCtx.systemPath,
       repoMap: { present: Boolean(repoMap.block), truncated: repoMap.truncated },
+      ticket: { ref: archTicket.ref, present: Boolean(archTicket.block), reason: archTicket.reason },
     }));
     return;
   }
@@ -2198,6 +2268,8 @@ arch
   .option('-a, --ai <provider>', 'AI provider: claude, codex (default: auto-detect)')
   .option('--model <id>', 'Model to review with (default: your settings model)')
   .option('--max-map-bytes <n>', 'Cap the repository map block (default 8000 bytes)')
+  .option('--ticket <n>', 'Ticket number this change delivers (default: parsed from the PR title, branch or body)')
+  .option('--no-ticket', 'Skip the ticket context')
   .action(async (prNumberStr: string | undefined, options) => {
     const agent = options.agent;
     function exitWithError(message: string): never {
@@ -2214,6 +2286,11 @@ arch
     // Number('abc') is NaN and would silently disable the cap; reject rather than guess.
     if (options.maxMapBytes !== undefined && (!/^\d+$/.test(String(options.maxMapBytes).trim()) || Number(options.maxMapBytes) < 1)) {
       exitWithError('--max-map-bytes must be a positive integer');
+    }
+    // Same reason: a rejected value here would otherwise fall through to a ref parsed from
+    // the PR title, and the review would run against a DIFFERENT ticket than the one named.
+    if (typeof options.ticket === 'string' && !/^\d+$/.test(options.ticket)) {
+      exitWithError(`--ticket ${JSON.stringify(options.ticket)} is not a ticket number (pass the digits of ${ticketPrefix()}-<n>)`);
     }
 
     const local = options.local;
@@ -2246,6 +2323,12 @@ arch
         fullContext: options.fullContext,
         ai,
         maxMapBytes: options.maxMapBytes ? Number(options.maxMapBytes) : undefined,
+        ticketEnabled: options.ticket !== false,
+        // Rejected, not guessed: a bad value would otherwise fall through to a ref parsed
+        // from the title, and the operator would get a review against a DIFFERENT ticket
+        // than the one they named, with nothing said.
+
+        ticketRef: typeof options.ticket === 'string' && /^\d+$/.test(options.ticket) ? Number(options.ticket) : undefined,
       });
     } catch (error: any) {
       exitWithError(error?.message ?? String(error));
