@@ -142,6 +142,8 @@ export interface ReviewPromptInput {
   usageContext?: string;
   expandedContext?: string;
   handbookContext?: string;
+  /** Where the identifiers this diff writes are read — see readers.ts. */
+  readersContext?: string;
   extra?: {
     scope?: string; decided?: DecidedFinding[]; charter?: string; standards?: string; retro?: boolean; enforceSchema?: boolean;
     /** Continue the loop's session instead of starting fresh; only what moved is sent. */
@@ -166,7 +168,7 @@ export function buildReviewPrompt(input: ReviewPromptInput): string {
 
 /** The part of the prompt that is the same within a loop (see buildReviewPrompt). */
 export function buildStablePrefix(input: ReviewPromptInput): string {
-  const { fileContents, usageContext, expandedContext, handbookContext, extra } = input;
+  const { fileContents, usageContext, expandedContext, handbookContext, readersContext, extra } = input;
 
   // ---- stable within a loop, most stable first -------------------------------------
   const handbookContextSection = handbookContext || '';
@@ -202,7 +204,7 @@ IMPORTANT: Compare the PR changes against the existing patterns in the full file
   const usageContextSection = usageContext || '';
 
   return `${SYSTEM_PROMPT}
-${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}`;
+${handbookContextSection}${charterSection}${standardsSection}${expandedContextSection}${fileContextSection}${usageContextSection}${readersContext ?? ''}`;
 }
 
 /**
@@ -312,13 +314,14 @@ export function buildResumePrompt(input: ReviewPromptInput & { round: number; ch
     : '## Files changed since the last round\n\n(none — the contents you have already seen are current)\n';
   const unchanged = unchangedFiles.filter((p) => !p.startsWith('@')).length > 0
     ? `Unchanged since the last round (contents already in context): ${unchangedFiles.filter((p) => !p.startsWith('@')).join(', ')}\n` : '';
-  // Symbol usages are recomputed from the current diff and are small: always current.
+  // Symbol usages and readers are recomputed from the current diff and are small: always current.
   const usage = usageContext ? `\n${usageContext}\n` : '';
+  const readers = input.readersContext ? `\n${input.readersContext}\n` : '';
   return `# Review round ${round} of "${prTitle}" — the code has moved on since your last review
 
 This is a later round of the SAME change. Everything you were given before (repo charter, standards, related files, file contents) still applies unless replaced below. Judge the code AS IT IS NOW: a finding from an earlier round that the current code no longer exhibits must not be repeated; a finding that still applies should be raised again. Harshness for this round: ${harshness}.
 
-${contextSection}${changedSection}${unchanged}${usage}${volatile}`;
+${contextSection}${changedSection}${unchanged}${usage}${readers}${volatile}`;
 }
 
 /**
@@ -334,9 +337,9 @@ export async function reviewPR(
   usageContext?: string,
   expandedContext?: string,
   handbookContext?: string,
-  extra?: ReviewPromptInput['extra']
+  extra?: ReviewPromptInput['extra'] & { readersContext?: string }
 ): Promise<ReviewResult> {
-  const input = { diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, extra };
+  const input = { diff, prTitle, prBody, harshness, fileContents, usageContext, expandedContext, handbookContext, readersContext: extra?.readersContext, extra };
   const s = extra?.session;
   const fullPrompt = s?.resume
     ? buildResumePrompt({ ...input, round: s.round, changedSinceLast: s.changedSinceLast, unchangedFiles: s.unchangedFiles })
