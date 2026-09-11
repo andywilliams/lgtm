@@ -433,6 +433,19 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
     assert.deepEqual(describeFragmentLint({ status: 'ok' }, root, frag), []);
   });
 
+  it('the headline keeps its marker and its column, because colour dies in a pipe', () => {
+    // chalk emits nothing when the output is captured — CI, an agent, `| tee` — which is
+    // how most of this is read. Without the glyph and the column, the loudest line in the
+    // report is indistinguishable from the grey notes around it.
+    const lines = describeFragmentLint({ status: 'broken', detail: 'x', namesFragment: true }, root, frag);
+    assert.equal(lines[0].indent, false);
+    assert.match(lines[0].text, /^⚠  /);
+    assert.ok(lines.slice(1).every((l) => l.indent), 'only the headline sits at column 0');
+    assert.match(describeFragmentLint({ status: 'problems', detail: 'x', namesFragment: true }, root, frag)[0].text, /^⚠  /);
+    // A skip is a note, not a warning: no glyph, no blank line above it.
+    assert.equal(describeFragmentLint({ status: 'skipped', reason: 'r' }, root, frag)[0].indent, true);
+  });
+
   it('always names the real directory in the remedy', () => {
     const deep = describeFragmentLint({ status: 'broken', detail: 'x', namesFragment: true }, '/repo', '/repo/tools/gen/standards.eslint.js');
     assert.ok(deep.some((l) => l.text.includes("add 'tools/gen'")));
@@ -457,12 +470,19 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
       chmodSync(join(unrunnable, 'node_modules/.bin/eslint'), 0o644);
       const outside = make({ 'node_modules/.bin/eslint': '#!/bin/sh\nexit 2\n' });
       chmodSync(join(outside, 'node_modules/.bin/eslint'), 0o755);
+      // The fifth reason. `describeFragmentLint` echoes the reason verbatim, so the reason
+      // string IS the claim — a later reword of it into something reassuring would sail
+      // past every other test here.
+      const slow = make({ '.lgtm/standards.eslint.js': '', 'node_modules/.bin/eslint': '#!/bin/sh\nsleep 5\n' });
+      chmodSync(join(slow, 'node_modules/.bin/eslint'), 0o755);
+      process.env.LGTM_LINT_PROBE_TIMEOUT_MS = '300';
 
       const cases: [string, string, string][] = [
         ['no ESLint at all', noEslint, join(noEslint, '.lgtm/standards.eslint.js')],
         ['configured, no binary', configured, join(configured, '.lgtm/standards.eslint.js')],
         ['binary will not run', unrunnable, join(unrunnable, '.lgtm/standards.eslint.js')],
         ['fragment outside the repo', outside, join(tmpdir(), 'draft', '.lgtm', 'standards.eslint.js')],
+        ['ESLint timed out', slow, join(slow, '.lgtm/standards.eslint.js')],
       ];
       for (const [label, repo, fragment] of cases) {
         const lint = checkFragmentLints(repo, fragment);
@@ -472,6 +492,7 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
         assert.equal(claimsNothingToBreak, label === 'no ESLint at all', `${label}: ${text}`);
       }
     } finally {
+      delete process.env.LGTM_LINT_PROBE_TIMEOUT_MS;
       for (const d of dirs) rmSync(d, { recursive: true, force: true });
     }
   });
