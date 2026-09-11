@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
 import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
-import { checkFragmentLints, ignoreRemedy, firstUsefulLine } from './standardsInterview.js';
+import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, type FragmentLintResult } from './standardsInterview.js';
 import { askEntries } from './standardsCatalog.js';
 
 // Guards the deterministic half: that the emitted rules actually track the
@@ -395,5 +395,105 @@ describe('checkFragmentLints — does the file we just wrote break their build?'
     const dir = scratch({ '.lgtm/standards.eslint.js': '' });
     assert.match(ignoreRemedy(dir, join(dir, '.lgtm/standards.eslint.js')), /add '\.lgtm' to the `ignores` array/);
     assert.match(ignoreRemedy(dir, join(dir, 'tools/gen/standards.eslint.js')), /add 'tools\/gen'/);
+  });
+});
+
+
+describe('describeFragmentLint — what lgtm is willing to claim', () => {
+  const root = '/repo';
+  const frag = '/repo/.lgtm/standards.eslint.js';
+  const say = (lint: FragmentLintResult) => describeFragmentLint(lint, root, frag).map((l) => l.text).join('\n');
+
+  it('claims the file broke their lint only when the output names it', () => {
+    const mine = say({ status: 'broken', detail: 'parserServices', namesFragment: true });
+    assert.match(mine, /cannot lint this file/);
+    assert.match(mine, /will now FAIL/);
+    assert.match(mine, /^\s*Fix: add '\.lgtm'/m);
+
+    // The HEADLINE is where the claim lives; the remedy below it may hedge freely.
+    const theirs = describeFragmentLint({ status: 'broken', detail: 'Cannot find plugin', namesFragment: false }, root, frag);
+    assert.doesNotMatch(theirs[0].text, /cannot lint this file|will now FAIL/, 'no accusation when nothing points at our file');
+    assert.match(theirs[0].text, /may predate the file just written/);
+    assert.match(theirs[2].text, /^If it is this file: add '\.lgtm'/, 'the remedy is offered as a possibility, not the fix');
+  });
+
+  it('does not say "in this generated file" for a problem it did not trace to one', () => {
+    assert.match(say({ status: 'problems', detail: 'x', namesFragment: true }), /problems in this generated file/);
+    const other = say({ status: 'problems', detail: 'x', namesFragment: false });
+    assert.doesNotMatch(other, /in this generated file/);
+    assert.match(other, /not necessarily this file/);
+  });
+
+  it('adds nothing to a skip reason, so the reason stays the whole claim', () => {
+    const line = say({ status: 'skipped', reason: 'ESLint did not finish within 60s' });
+    assert.equal(line, 'Not lint-checked: ESLint did not finish within 60s.');
+  });
+
+  it('says nothing at all when the lint is clean', () => {
+    assert.deepEqual(describeFragmentLint({ status: 'ok' }, root, frag), []);
+  });
+
+  it('the headline keeps its marker and its column, because colour dies in a pipe', () => {
+    // chalk emits nothing when the output is captured — CI, an agent, `| tee` — which is
+    // how most of this is read. Without the glyph and the column, the loudest line in the
+    // report is indistinguishable from the grey notes around it.
+    const lines = describeFragmentLint({ status: 'broken', detail: 'x', namesFragment: true }, root, frag);
+    assert.equal(lines[0].indent, false);
+    assert.match(lines[0].text, /^⚠  /);
+    assert.ok(lines.slice(1).every((l) => l.indent), 'only the headline sits at column 0');
+    assert.match(describeFragmentLint({ status: 'problems', detail: 'x', namesFragment: true }, root, frag)[0].text, /^⚠  /);
+    // A skip is a note, not a warning: no glyph, no blank line above it.
+    assert.equal(describeFragmentLint({ status: 'skipped', reason: 'r' }, root, frag)[0].indent, true);
+  });
+
+  it('always names the real directory in the remedy', () => {
+    const deep = describeFragmentLint({ status: 'broken', detail: 'x', namesFragment: true }, '/repo', '/repo/tools/gen/standards.eslint.js');
+    assert.ok(deep.some((l) => l.text.includes("add 'tools/gen'")));
+  });
+
+  it('only the no-ESLint skip may imply there is nothing to break', () => {
+    // The fixed tail that once said this for every reason is the defect this pins. Drive
+    // checkFragmentLints into each reachable skip state and read what the operator is told.
+    const dirs: string[] = [];
+    const make = (files: Record<string, string>) => {
+      const d = mkdtempSync(join(tmpdir(), 'lgtm-skip-')); dirs.push(d);
+      for (const [rel, body] of Object.entries(files)) {
+        mkdirSync(dirname(join(d, rel)), { recursive: true });
+        writeFileSync(join(d, rel), body);
+      }
+      return d;
+    };
+    try {
+      const noEslint = make({ '.lgtm/standards.eslint.js': '' });
+      const configured = make({ '.lgtm/standards.eslint.js': '', 'eslint.config.js': 'export default [];\n' });
+      const unrunnable = make({ '.lgtm/standards.eslint.js': '', 'node_modules/.bin/eslint': 'not executable\n' });
+      chmodSync(join(unrunnable, 'node_modules/.bin/eslint'), 0o644);
+      const outside = make({ 'node_modules/.bin/eslint': '#!/bin/sh\nexit 2\n' });
+      chmodSync(join(outside, 'node_modules/.bin/eslint'), 0o755);
+      // The fifth reason. `describeFragmentLint` echoes the reason verbatim, so the reason
+      // string IS the claim — a later reword of it into something reassuring would sail
+      // past every other test here.
+      const slow = make({ '.lgtm/standards.eslint.js': '', 'node_modules/.bin/eslint': '#!/bin/sh\nsleep 5\n' });
+      chmodSync(join(slow, 'node_modules/.bin/eslint'), 0o755);
+      process.env.LGTM_LINT_PROBE_TIMEOUT_MS = '300';
+
+      const cases: [string, string, string][] = [
+        ['no ESLint at all', noEslint, join(noEslint, '.lgtm/standards.eslint.js')],
+        ['configured, no binary', configured, join(configured, '.lgtm/standards.eslint.js')],
+        ['binary will not run', unrunnable, join(unrunnable, '.lgtm/standards.eslint.js')],
+        ['fragment outside the repo', outside, join(tmpdir(), 'draft', '.lgtm', 'standards.eslint.js')],
+        ['ESLint timed out', slow, join(slow, '.lgtm/standards.eslint.js')],
+      ];
+      for (const [label, repo, fragment] of cases) {
+        const lint = checkFragmentLints(repo, fragment);
+        assert.equal(lint.status, 'skipped', label);
+        const text = describeFragmentLint(lint, repo, fragment).map((l) => l.text).join(' ');
+        const claimsNothingToBreak = /nothing to run in|nothing to break/.test(text);
+        assert.equal(claimsNothingToBreak, label === 'no ESLint at all', `${label}: ${text}`);
+      }
+    } finally {
+      delete process.env.LGTM_LINT_PROBE_TIMEOUT_MS;
+      for (const d of dirs) rmSync(d, { recursive: true, force: true });
+    }
   });
 });

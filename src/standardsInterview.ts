@@ -72,6 +72,11 @@ function stats(values: number[]): Stats {
 
 /** How long the target repo's own ESLint may take over one file before we stop waiting. */
 const LINT_PROBE_TIMEOUT_MS = 60_000;
+/** Overridable so the timeout branch is reachable in a test without waiting a minute for it. */
+function lintProbeTimeoutMs(): number {
+  const raw = Number(process.env.LGTM_LINT_PROBE_TIMEOUT_MS?.trim());
+  return Number.isFinite(raw) && raw > 0 ? raw : LINT_PROBE_TIMEOUT_MS;
+}
 
 /**
  * What the target repo's ESLint made of the directory we just wrote the fragment into.
@@ -131,12 +136,12 @@ export function checkFragmentLints(repoRoot: string, fragmentPath: string): Frag
   try {
     execFileSync(bin, [dir, '--no-error-on-unmatched-pattern'], {
       cwd: repoRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: LINT_PROBE_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
+      timeout: lintProbeTimeoutMs(), maxBuffer: 10 * 1024 * 1024,
     });
     return { status: 'ok' };
   } catch (e: any) {
     // A timeout is not a verdict on the file: say we could not tell rather than accuse it.
-    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', reason: `ESLint did not finish within ${LINT_PROBE_TIMEOUT_MS / 1000}s` };
+    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', reason: `ESLint did not finish within ${lintProbeTimeoutMs() / 1000}s` };
     // Nor is a failure to START one. A binary that exists but cannot be executed leaves
     // `status` null and no output, which would otherwise be reported as "your lint will now
     // FAIL" followed by the words "no output" — an accusation with no evidence behind it.
@@ -165,6 +170,61 @@ export function firstUsefulLine(output: string): string {
   const noise = /^(Oops!|ESLint: |at |\.\.\.)/;
   const meaty = lines.find((l) => /error/i.test(l) && !noise.test(l));
   return (meaty ?? lines.find((l) => !noise.test(l)) ?? 'no output').slice(0, 300);
+}
+
+/**
+ * One line of the lint report. `tone` is colour, which vanishes the moment the output is
+ * piped — to CI, to an agent, to `| tee` — so the headline carries its own ⚠ and sits at
+ * column 0. A warning that reads like a note the moment it is captured is a warning that
+ * gets skimmed past, and captured is how most of this output is read.
+ */
+export interface ReportLine { tone: 'red' | 'yellow' | 'gray'; text: string; indent: boolean }
+
+/**
+ * Turn a lint result into the lines the operator reads. Pure, and separate from the
+ * printing, because this is where the claims live: whether lgtm asserts that the file it
+ * wrote broke their lint or merely that their lint is failing, and whether the remedy is
+ * offered as the fix or as a possibility. Both defects DWLF-221's review rounds found were
+ * here rather than in the function that computes the result — a fixed tail that contradicted
+ * three of its four reasons, and an accusation against the wrong file — and neither could
+ * fail a test while this was inline in the printing.
+ */
+export function describeFragmentLint(lint: FragmentLintResult, repoRoot: string, fragmentPath: string): ReportLine[] {
+  const dir = relative(repoRoot, dirname(fragmentPath)) || '.';
+  const remedy = ignoreRemedy(repoRoot, fragmentPath);
+  // An exhaustive switch with a never guard (G23), not a fallthrough: a future verdict that
+  // happened to carry `detail` and `namesFragment` — the likely shape of any new one —
+  // would otherwise compile and be described as "reports problems in this generated file",
+  // a claim its result does not support. That is the class this whole function pins.
+  switch (lint.status) {
+    case 'ok':
+      return [];
+    case 'skipped':
+      // The reason carries its own consequence; nothing is appended. A fixed tail here once
+      // claimed "the mechanical rules have nothing to run in yet" for reasons where the
+      // repo's ESLint had never been consulted at all.
+      return [{ tone: 'gray', text: `Not lint-checked: ${lint.reason}.`, indent: true }];
+    case 'broken':
+      return [
+        { tone: 'red', indent: false, text: lint.namesFragment
+          ? '⚠  Your ESLint cannot lint this file — `eslint .` will now FAIL, not warn:'
+          : `⚠  Your ESLint exits with an error over ${dir} — this may predate the file just written:` },
+        { tone: 'red', text: lint.detail, indent: true },
+        { tone: 'yellow', text: `${lint.namesFragment ? 'Fix' : 'If it is this file'}: ${remedy}.`, indent: true },
+        { tone: 'gray', text: "(Not done for you: editing a config lgtm did not generate is your call, not the tool's.)", indent: true },
+      ];
+    case 'problems':
+      return [
+        { tone: 'yellow', indent: false, text: lint.namesFragment
+          ? `⚠  Your ESLint reports problems in this generated file: ${lint.detail}`
+          : `⚠  Your ESLint reports problems under ${dir} — not necessarily this file: ${lint.detail}` },
+        { tone: 'yellow', text: `Either fix the rule that fires, or ${remedy}.`, indent: true },
+      ];
+    default: {
+      const unreachable: never = lint;
+      return unreachable;
+    }
+  }
 }
 
 /** The one-line fix for a config that cannot lint the fragment, naming the actual directory. */
@@ -614,24 +674,12 @@ function writeMechanicalHalf(opts: {
   // Does the file we just wrote pass THIS repo's lint? Asked out loud, because the
   // alternative is the operator meeting the answer as a stack trace from a pre-commit hook.
   const lint = checkFragmentLints(repoRoot, fragmentPath);
-  if (lint.status === 'broken') {
-    console.log(chalk.red(lint.namesFragment
-      ? `\n⚠  Your ESLint cannot lint this file — \`eslint .\` will now FAIL, not warn:`
-      : `\n⚠  Your ESLint exits with an error over ${relative(repoRoot, dirname(fragmentPath)) || '.'} — this may predate the file just written:`));
-    console.log(chalk.red(`   ${lint.detail}`));
-    console.log(chalk.yellow(`   ${lint.namesFragment ? 'Fix' : 'If it is this file'}: ${ignoreRemedy(repoRoot, fragmentPath)}.`));
-    console.log(chalk.gray('   (Not done for you: editing a config lgtm did not generate is your call, not the tool\'s.)'));
-  } else if (lint.status === 'problems') {
-    console.log(chalk.yellow(lint.namesFragment
-      ? `\n⚠  Your ESLint reports problems in this generated file: ${lint.detail}`
-      : `\n⚠  Your ESLint reports problems under ${relative(repoRoot, dirname(fragmentPath)) || '.'} — not necessarily this file: ${lint.detail}`));
-    console.log(chalk.yellow(`   Either fix the rule that fires, or ${ignoreRemedy(repoRoot, fragmentPath)}.`));
-  } else if (lint.status === 'skipped') {
-    // The reason carries its own consequence. A fixed tail here once said "the mechanical
-    // rules have nothing to run in yet", false for three of the four reasons — including
-    // the one added precisely to stop giving that reassurance.
-    console.log(chalk.gray(`   Not lint-checked: ${lint.reason}.`));
-  }
+  const tones = { red: chalk.red, yellow: chalk.yellow, gray: chalk.gray };
+  const lines = describeFragmentLint(lint, repoRoot, fragmentPath);
+  // A leading blank line only when there is something to warn about, so an `ok` or a bare
+  // skip note does not punch a hole in the summary that follows.
+  if (lines.some((l) => !l.indent)) console.log('');
+  for (const l of lines) console.log(tones[l.tone](l.indent ? `   ${l.text}` : l.text));
 }
 
 /** `lgtm standards init` — scan, ask the contested toggles, write STANDARDS.md. */
