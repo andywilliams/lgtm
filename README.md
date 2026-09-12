@@ -208,6 +208,8 @@ Because settings are not loaded, lgtm pins the model and effort itself:
 | `LGTM_DB_PATH` | `~/.lgtm/reviews.db` | where the review log lives |
 | `LGTM_TIMEOUT_MS` | 15 minutes | how long one model call may take before lgtm gives up and says why |
 | `LGTM_SESSIONS` | *(on)* | `off` = every round is a one-off call instead of resuming the loop's session |
+| `LGTM_SYSTEM_DIR` | — | where to look for `SYSTEM.md` when no charter points at one |
+| `LGTM_LINT_PROBE_TIMEOUT_MS` | 60s | how long `standards init` waits for the target repo's ESLint over the fragment it wrote |
 
 Codex has no usage envelope, so its rows are stored as `usage_source = 'estimate'`.
 

@@ -32,6 +32,7 @@ import { extractWriteIdentifiers, failedSearchRoots, fieldsFromHelpers, findRead
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, Severity, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
+import { renderEnvSurface } from './envTiers.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -99,30 +100,7 @@ program
   .version('0.1.0');
 
 // Discoverable breadcrumb for the optional second-brain integration (off by default).
-program.addHelpText(
-  'after',
-  '\nOptional context (a "second brain") — enrich reviews with the repo\'s engineering\n' +
-    'handbook + related systems. Off unless one of these is set:\n' +
-    '  LGTM_BRAIN_CMD   command that prints context for a repo (any brain)\n' +
-    '  LGTM_BRAIN_URL   a second-brain HTTP API\n' +
-    '  LGTM_BRAIN_DIR   a second-brain vault on disk\n' +
-    '\nModel calls run `claude --print` as a stripped session (no MCP servers, no settings or\n' +
-    'CLAUDE.md from the cwd, no saved transcript) and record the billed usage per review:\n' +
-    '  LGTM_MODEL                    model id to review with (default: your ~/.claude/settings.json model)\n' +
-    '  LGTM_EFFORT                   low|medium|high|xhigh|max (default: your settings effort for that model)\n' +
-    '  LGTM_LATE_MODEL               model for late (round 4+) chill review rounds (default claude-sonnet-5; "off" = always the full model)\n' +
-    '  LGTM_SESSIONS                 "off" = every round is a one-off call (default: one Claude session per loop, resumed each round for the prompt cache)\n' +
-    '  LGTM_SIBLING_DIRS             colon-separated repos to also search for readers of what a diff writes (same as repeating --add-dir)\n' +
-    '  LGTM_TIMEOUT_MS               how long one model call may take before lgtm gives up and says so (default 15 minutes)\n' +
-    '  LGTM_VERIFY_MODEL             model for the verifier pass that proves or drops each finding (default claude-sonnet-5; "off" = no verifier pass)\n' +
-    '  LGTM_VERIFY_MAX_BYTES         cap on the file windows the verifier is shown around each finding (default 60000)\n' +
-    '  LGTM_TICKETS_CMD              command that prints a ticket given its number (any tracker); the escape hatch\n' +
-    '  LGTM_TICKETS_API              ticket board API base — with the token below, reviews check the diff against the ticket they name\n' +
-    '  LGTM_TICKETS_TOKEN            bearer token for that board (DWLF_TICKETS_API / DWLF_TICKETS_TOKEN are also read)\n' +
-    '  LGTM_TICKET_PREFIX            ref prefix to look for in a PR title or branch (default DWLF, e.g. PROJ-14)\n' +
-    '  LGTM_CLAUDE_SETTING_SOURCES   set to "user" if your settings.json carries auth/env routing lgtm must keep\n' +
-    '  LGTM_DB_PATH                  where the review log lives (default ~/.lgtm/reviews.db)\n'
-);
+program.addHelpText('after', renderEnvSurface());
 
 program
   .command('review [pr-number]')

@@ -6,7 +6,7 @@ import { join, dirname } from 'node:path';
 import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
 import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
-import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, exitCodeForStandardsInit, type FragmentLintResult } from './standardsInterview.js';
+import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, exitCodeForStandardsInit, type FragmentLintResult, type FragmentSkipKind } from './standardsInterview.js';
 import { askEntries } from './standardsCatalog.js';
 import { STANDARDS_INIT_LINT_FAILS, FAILED } from './exitCodes.js';
 
@@ -386,10 +386,10 @@ describe('checkFragmentLints — does the file we just wrote break their build?'
     // Yarn PnP has no node_modules at all, and in a workspace ESLint may live below the git
     // root. Reporting "nothing to break" there is the exact wrong reassurance.
     const bare = scratch({ '.lgtm/standards.eslint.js': '' });
-    assert.match((checkFragmentLints(bare, join(bare, '.lgtm/standards.eslint.js')) as { reason: string }).reason, /no ESLint configured/);
+    assert.equal((checkFragmentLints(bare, join(bare, '.lgtm/standards.eslint.js')) as { kind: string }).kind, 'no-eslint');
 
     const pnp = scratch({ '.lgtm/standards.eslint.js': '', 'eslint.config.js': 'export default [];\n' });
-    assert.match((checkFragmentLints(pnp, join(pnp, '.lgtm/standards.eslint.js')) as { reason: string }).reason, /no local binary/);
+    assert.equal((checkFragmentLints(pnp, join(pnp, '.lgtm/standards.eslint.js')) as { kind: string }).kind, 'no-binary');
   });
 
   it('names the real directory in the remedy, not a guessed one', () => {
@@ -426,8 +426,27 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
   });
 
   it('adds nothing to a skip reason, so the reason stays the whole claim', () => {
-    const line = say({ status: 'skipped', reason: 'ESLint did not finish within 60s' });
+    const line = say({ status: 'skipped', kind: 'timeout', reason: 'ESLint did not finish within 60s' });
     assert.equal(line, 'Not lint-checked: ESLint did not finish within 60s.');
+  });
+
+  it('keys the reassurance on the kind, so rewording a reason cannot change the claim', () => {
+    // The reason is prose and gets reworded; the kind is the decision. Anchoring the
+    // "nothing to break" clause to the sentence instead would let a reword hand out
+    // reassurance a repo has not earned — the failure this pair exists to catch.
+    const reassures = (lint: FragmentLintResult) =>
+      /nothing to run in|nothing to break/.test(describeFragmentLint(lint, root, frag).map((l) => l.text).join(' '));
+
+    assert.equal(reassures({ status: 'skipped', kind: 'no-eslint', reason: 'the moon is in the wrong phase' }), true);
+    assert.equal(reassures({ status: 'skipped', kind: 'no-binary', reason: 'no ESLint I can reach from here' }), false);
+
+    // Two kinds earn it and four do not, so the set is pinned from both sides: a kind that
+    // means "there is nothing here yet" against every kind that means "I could not look".
+    const reassuring: FragmentSkipKind[] = ['no-eslint', 'no-fragment'];
+    const kinds: FragmentSkipKind[] = [...reassuring, 'no-binary', 'outside-repo', 'timeout', 'spawn-failed'];
+    for (const kind of kinds) {
+      assert.equal(reassures({ status: 'skipped', kind, reason: 'r' }), reassuring.includes(kind), kind);
+    }
   });
 
   it('says nothing at all when the lint is clean', () => {
@@ -444,7 +463,7 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
     assert.ok(lines.slice(1).every((l) => l.indent), 'only the headline sits at column 0');
     assert.match(describeFragmentLint({ status: 'problems', detail: 'x', namesFragment: true }, root, frag)[0].text, /^⚠  /);
     // A skip is a note, not a warning: no glyph, no blank line above it.
-    assert.equal(describeFragmentLint({ status: 'skipped', reason: 'r' }, root, frag)[0].indent, true);
+    assert.equal(describeFragmentLint({ status: 'skipped', kind: 'timeout', reason: 'r' }, root, frag)[0].indent, true);
   });
 
   it('always names the real directory in the remedy', () => {
@@ -476,24 +495,25 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
       // past every other test here.
       const slow = make({ '.lgtm/standards.eslint.js': '', 'node_modules/.bin/eslint': '#!/bin/sh\nsleep 5\n' });
       chmodSync(join(slow, 'node_modules/.bin/eslint'), 0o755);
-      process.env.LGTM_LINT_PROBE_TIMEOUT_MS = '300';
 
-      const cases: [string, string, string][] = [
-        ['no ESLint at all', noEslint, join(noEslint, '.lgtm/standards.eslint.js')],
-        ['configured, no binary', configured, join(configured, '.lgtm/standards.eslint.js')],
-        ['binary will not run', unrunnable, join(unrunnable, '.lgtm/standards.eslint.js')],
-        ['fragment outside the repo', outside, join(tmpdir(), 'draft', '.lgtm', 'standards.eslint.js')],
-        ['ESLint timed out', slow, join(slow, '.lgtm/standards.eslint.js')],
+      const cases: [string, FragmentSkipKind, string, string][] = [
+        ['no ESLint at all', 'no-eslint', noEslint, join(noEslint, '.lgtm/standards.eslint.js')],
+        ['configured, no binary', 'no-binary', configured, join(configured, '.lgtm/standards.eslint.js')],
+        ['binary will not run', 'spawn-failed', unrunnable, join(unrunnable, '.lgtm/standards.eslint.js')],
+        ['fragment outside the repo', 'outside-repo', outside, join(tmpdir(), 'draft', '.lgtm', 'standards.eslint.js')],
+        ['ESLint timed out', 'timeout', slow, join(slow, '.lgtm/standards.eslint.js')],
       ];
-      for (const [label, repo, fragment] of cases) {
-        const lint = checkFragmentLints(repo, fragment);
+      for (const [label, kind, repo, fragment] of cases) {
+        // 300ms as an argument, not an exported variable: the seam is a parameter, so this
+        // test cannot leak a timeout into whatever runs after it.
+        const lint = checkFragmentLints(repo, fragment, 300);
         assert.equal(lint.status, 'skipped', label);
+        assert.equal((lint as { kind: FragmentSkipKind }).kind, kind, label);
         const text = describeFragmentLint(lint, repo, fragment).map((l) => l.text).join(' ');
         const claimsNothingToBreak = /nothing to run in|nothing to break/.test(text);
-        assert.equal(claimsNothingToBreak, label === 'no ESLint at all', `${label}: ${text}`);
+        assert.equal(claimsNothingToBreak, kind === 'no-eslint', `${label}: ${text}`);
       }
     } finally {
-      delete process.env.LGTM_LINT_PROBE_TIMEOUT_MS;
       for (const d of dirs) rmSync(d, { recursive: true, force: true });
     }
   });
@@ -520,7 +540,7 @@ describe("standards init's exit contract", () => {
   });
 
   it('succeeds when no verdict was reached, because "I could not tell" is not "bad"', () => {
-    assert.equal(exitCodeForStandardsInit({ status: 'skipped', reason: 'no ESLint configured' }), 0);
+    assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'no-eslint', reason: 'no ESLint configured' }), 0);
   });
 
   it('reports the repo\'s state, not blame: a failure that predates the run still exits 3', () => {

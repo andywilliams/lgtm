@@ -73,11 +73,37 @@ function stats(values: number[]): Stats {
 
 /** How long the target repo's own ESLint may take over one file before we stop waiting. */
 const LINT_PROBE_TIMEOUT_MS = 60_000;
-/** Overridable so the timeout branch is reachable in a test without waiting a minute for it. */
-function lintProbeTimeoutMs(): number {
-  const raw = Number(process.env.LGTM_LINT_PROBE_TIMEOUT_MS?.trim());
-  return Number.isFinite(raw) && raw > 0 ? raw : LINT_PROBE_TIMEOUT_MS;
+/**
+ * How long the probe may wait for the target repo's ESLint.
+ *
+ * A parameter with an env default — the shape `verifyMaxContextBytes` uses next door — so a
+ * test reaches the timeout branch by passing 300 rather than by mutating process.env and
+ * remembering to put it back.
+ */
+function lintProbeTimeoutMs(raw = process.env.LGTM_LINT_PROBE_TIMEOUT_MS): number {
+  const n = Number(raw?.trim());
+  return Number.isFinite(n) && n > 0 ? n : LINT_PROBE_TIMEOUT_MS;
 }
+
+/**
+ * Why the probe reached no verdict. A field rather than a sentence because TWO of these —
+ * `no-eslint` and `no-fragment` — mean there is nothing here to break, and the other four
+ * mean we could not find out. The report may say the reassuring thing only for the first
+ * two, and keying that on prose put a rewordable sentence between the reader and the truth.
+ */
+export type FragmentSkipKind =
+  /** This repo configures no ESLint, so the fragment has nothing to run in yet. */
+  | 'no-eslint'
+  /** ESLint is configured but there is no local binary to run (Yarn PnP, workspace package). */
+  | 'no-binary'
+  /** A preview run wrote the fragment outside the repo, so its ESLint was never the subject. */
+  | 'outside-repo'
+  /** ESLint did not finish in time. */
+  | 'timeout'
+  /** ESLint could not be spawned at all. */
+  | 'spawn-failed'
+  /** No fragment was written, so there is nothing to have broken (`--no-eslint`). */
+  | 'no-fragment';
 
 /**
  * What the target repo's ESLint made of the directory we just wrote the fragment into.
@@ -89,16 +115,13 @@ function lintProbeTimeoutMs(): number {
  *                  a typed config applies typed rules to a `.js` file in no tsconfig project,
  *                  every rule throws, and `eslint .` takes the whole lint down. `namesFragment`
  *                  false means their lint fails for a reason that may predate this file.
- *  - `skipped`   — no verdict was reached, for one of five reasons, and the reason says
- *                  what follows from it. Only ONE of them ("no ESLint configured in this
- *                  repo") means there is nothing here to break; the others — a preview-run
- *                  fragment written outside the repo, ESLint configured with no local binary
- *                  to run it, a timeout, a binary that would not start — leave the question
- *                  open, and saying otherwise is the reassurance this check exists to stop.
+ *  - `skipped`   — no verdict was reached; `kind` says why and what follows from it. Most
+ *                  kinds leave the question open, and saying otherwise is the reassurance
+ *                  this check exists to stop.
  */
 export type FragmentLintResult =
   | { status: 'ok' }
-  | { status: 'skipped'; reason: string }
+  | { status: 'skipped'; kind: FragmentSkipKind; reason: string }
   /** `namesFragment` false ⇒ the output points at something else in the directory, or nowhere. */
   | { status: 'problems' | 'broken'; detail: string; namesFragment: boolean };
 
@@ -142,21 +165,21 @@ export const exitCodeForStandardsInit = (lint: FragmentLintResult): number => {
  * generator that writes a file into someone else's repo owns whether that file passes their
  * build — and finding out costs one bounded subprocess.
  */
-export function checkFragmentLints(repoRoot: string, fragmentPath: string): FragmentLintResult {
+export function checkFragmentLints(repoRoot: string, fragmentPath: string, timeoutMs = lintProbeTimeoutMs()): FragmentLintResult {
   // A preview run (`--out /tmp/draft/STANDARDS.md`) puts the fragment outside the repo
   // entirely. Linting it with the repo's cwd would answer a question about a file that is
   // not in the repo — most likely "ok", because it sits outside the config's base directory,
   // which is a clean bill of health for a file nothing looked at.
   const rel = relative(repoRoot, dirname(fragmentPath));
-  if (rel.startsWith('..') || isAbsolute(rel)) return { status: 'skipped', reason: 'the fragment was written outside this repo (preview run)' };
+  if (rel.startsWith('..') || isAbsolute(rel)) return { status: 'skipped', kind: 'outside-repo', reason: 'the fragment was written outside this repo (preview run)' };
   const bin = join(repoRoot, 'node_modules', '.bin', 'eslint');
   if (!existsSync(bin)) {
     // "I could not find a local binary" is not "this repo has no ESLint": Yarn PnP has no
     // node_modules at all, and in a workspace ESLint may live in a package below the git
     // root. Saying "nothing to break" there would be the exact wrong reassurance.
     return hasEslintConfig(repoRoot)
-      ? { status: 'skipped', reason: 'ESLint is configured here but there is no local binary to run it with (Yarn PnP, or a workspace package) — check it yourself' }
-      : { status: 'skipped', reason: 'no ESLint configured in this repo, so the mechanical rules have nothing to run in yet' };
+      ? { status: 'skipped', kind: 'no-binary', reason: 'ESLint is configured here but there is no local binary to run it with (Yarn PnP, or a workspace package) — check it yourself' }
+      : { status: 'skipped', kind: 'no-eslint', reason: 'no ESLint configured in this repo' };
   }
   // Lint the fragment's DIRECTORY, not the file. Naming a file explicitly makes ESLint lint
   // it even when the config ignores it — which would report `broken` forever in a repo that
@@ -167,16 +190,16 @@ export function checkFragmentLints(repoRoot: string, fragmentPath: string): Frag
   try {
     execFileSync(bin, [dir, '--no-error-on-unmatched-pattern'], {
       cwd: repoRoot, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: lintProbeTimeoutMs(), maxBuffer: 10 * 1024 * 1024,
+      timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024,
     });
     return { status: 'ok' };
   } catch (e: any) {
     // A timeout is not a verdict on the file: say we could not tell rather than accuse it.
-    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', reason: `ESLint did not finish within ${lintProbeTimeoutMs() / 1000}s` };
+    if (e?.signal === 'SIGTERM' || e?.killed) return { status: 'skipped', kind: 'timeout', reason: `ESLint did not finish within ${timeoutMs / 1000}s` };
     // Nor is a failure to START one. A binary that exists but cannot be executed leaves
     // `status` null and no output, which would otherwise be reported as "your lint will now
     // FAIL" followed by the words "no output" — an accusation with no evidence behind it.
-    if (typeof e?.status !== 'number') return { status: 'skipped', reason: `ESLint could not be run (${e?.code ?? e?.message ?? 'spawn failed'})` };
+    if (typeof e?.status !== 'number') return { status: 'skipped', kind: 'spawn-failed', reason: `ESLint could not be run (${e?.code ?? e?.message ?? 'spawn failed'})` };
     const out = `${e?.stdout ?? ''}${e?.stderr ?? ''}`;
     // Whether the output names our file decides whether lgtm may claim responsibility, and
     // it applies to BOTH exits. `.lgtm/` is not a one-file directory — the answers JSON is
@@ -230,11 +253,14 @@ export function describeFragmentLint(lint: FragmentLintResult, repoRoot: string,
   switch (lint.status) {
     case 'ok':
       return [];
-    case 'skipped':
-      // The reason carries its own consequence; nothing is appended. A fixed tail here once
-      // claimed "the mechanical rules have nothing to run in yet" for reasons where the
-      // repo's ESLint had never been consulted at all.
-      return [{ tone: 'gray', text: `Not lint-checked: ${lint.reason}.`, indent: true }];
+    case 'skipped': {
+      // Two skip kinds mean there is nothing here to break; the other four mean we could
+      // not find out, and saying otherwise is the reassurance this whole check exists to
+      // stop. Keyed on the kind, so rewording a reason cannot change what is implied.
+      const nothingToBreak = lint.kind === 'no-eslint' || lint.kind === 'no-fragment';
+      const tail = nothingToBreak ? ' — the mechanical rules have nothing to run in yet' : '';
+      return [{ tone: 'gray', text: `Not lint-checked: ${lint.reason}${tail}.`, indent: true }];
+    }
     case 'broken':
       return [
         { tone: 'red', indent: false, text: lint.namesFragment
@@ -802,7 +828,7 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<F
 
   // The mechanical half, derived from the same selections so the two can't drift.
   // --no-eslint emits no fragment, so there is nothing to have broken: `skipped`, not `ok`.
-  let lintVerdict: FragmentLintResult = { status: 'skipped', reason: 'no ESLint fragment was written (--no-eslint)' };
+  let lintVerdict: FragmentLintResult = { status: 'skipped', kind: 'no-fragment', reason: 'no ESLint fragment was written (--no-eslint)' };
   if (!options.noEslint) {
     lintVerdict = writeMechanicalHalf({ repoRoot, repoName, outPath, profile, selections, severity: options.severity ?? 'warn' });
   }
