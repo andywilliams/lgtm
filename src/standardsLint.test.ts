@@ -6,8 +6,9 @@ import { join, dirname } from 'node:path';
 import { deriveRules, generateEslintFragment, usesEsm, parseEslintJson, partitionStructural, STRUCTURAL_RULES, hasEslintConfig, jsLiteral } from './standardsLint.js';
 import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, runEslint, repoRootOf } from './standardsReview.js';
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
-import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, type FragmentLintResult } from './standardsInterview.js';
+import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, exitCodeForStandardsInit, type FragmentLintResult } from './standardsInterview.js';
 import { askEntries } from './standardsCatalog.js';
+import { STANDARDS_INIT_LINT_FAILS, FAILED } from './exitCodes.js';
 
 // Guards the deterministic half: that the emitted rules actually track the
 // STANDARDS.md selections (the whole point — one source, two mechanisms, no
@@ -495,5 +496,47 @@ describe('describeFragmentLint — what lgtm is willing to claim', () => {
       delete process.env.LGTM_LINT_PROBE_TIMEOUT_MS;
       for (const d of dirs) rmSync(d, { recursive: true, force: true });
     }
+  });
+});
+
+describe("standards init's exit contract", () => {
+  // DWLF-221 was a scripted `standards init --yes` that wrote a fragment which broke the
+  // repo's pre-commit hook. The probe added for it detected exactly that and then exited 0,
+  // so the incident it was built for still passed silently through automation.
+  it('fails with its own code when the repo\'s lint is now broken', () => {
+    const broken: FragmentLintResult = { status: 'broken', detail: 'Parsing error', namesFragment: true };
+    assert.equal(exitCodeForStandardsInit(broken), STANDARDS_INIT_LINT_FAILS);
+    assert.equal(STANDARDS_INIT_LINT_FAILS, 3);
+  });
+
+  it('succeeds when the fragment lints clean', () => {
+    assert.equal(exitCodeForStandardsInit({ status: 'ok' }), 0);
+  });
+
+  // The two that deliberately do NOT fail, because neither says the repo is broken.
+  it('succeeds on findings inside the fragment, which are not a broken repo', () => {
+    const problems: FragmentLintResult = { status: 'problems', detail: '3 problems', namesFragment: true };
+    assert.equal(exitCodeForStandardsInit(problems), 0);
+  });
+
+  it('succeeds when no verdict was reached, because "I could not tell" is not "bad"', () => {
+    assert.equal(exitCodeForStandardsInit({ status: 'skipped', reason: 'no ESLint configured' }), 0);
+  });
+
+  it('reports the repo\'s state, not blame: a failure that predates the run still exits 3', () => {
+    // namesFragment false = "their lint fails for a reason that may predate this file".
+    // The printed report hedges; the code does not, because a caller asking "can I commit
+    // this?" gets the same answer either way.
+    const predates: FragmentLintResult = { status: 'broken', detail: 'missing plugin', namesFragment: false };
+    assert.equal(exitCodeForStandardsInit(predates), STANDARDS_INIT_LINT_FAILS);
+  });
+
+  it('distinguishes all three outcomes, which is the whole point', () => {
+    const codes = new Set([
+      exitCodeForStandardsInit({ status: 'ok' }),
+      exitCodeForStandardsInit({ status: 'broken', detail: 'x', namesFragment: true }),
+      FAILED, // what the CLI exits when init itself throws
+    ]);
+    assert.equal(codes.size, 3, 'written-and-fine, written-and-broken, and failed must be tellable apart');
   });
 });

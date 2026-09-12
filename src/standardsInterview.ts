@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, readdirSy
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
+import { STANDARDS_INIT_LINT_FAILS } from './exitCodes.js';
 import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
 import { generateEslintFragment, usesEsm, deriveRules, hasEslintConfig } from './standardsLint.js';
@@ -100,6 +101,36 @@ export type FragmentLintResult =
   | { status: 'skipped'; reason: string }
   /** `namesFragment` false ⇒ the output points at something else in the directory, or nowhere. */
   | { status: 'problems' | 'broken'; detail: string; namesFragment: boolean };
+
+/**
+ * The exit code for a completed `standards init`, given what the lint probe concluded.
+ *
+ * `broken` is the only non-zero case, and it reports the repo's STATE — this lint does not
+ * pass — rather than claiming lgtm caused it. `namesFragment` distinguishes those two in the
+ * printed report and deliberately does not change the code: someone asking "can I commit
+ * this?" needs the same answer either way, and a code meaning only "we broke it" would
+ * return 0 to a caller whose pre-commit hook is about to fail.
+ *
+ * `problems` and `skipped` stay 0. `problems` means the fragment lints with findings, which
+ * is a repo with findings rather than a failing lint. `skipped` means no verdict was reached
+ * — ESLint absent, a preview run, a timeout — and "I could not tell" is not grounds for
+ * failing a caller who asked for a file to be written.
+ */
+export const exitCodeForStandardsInit = (lint: FragmentLintResult): number => {
+  // Exhaustive on purpose, the same way describeFragmentLint is. `broken ? 3 : 0` would
+  // compile for a verdict added to FragmentLintResult later and report it as success —
+  // a result the caller has to act on, delivered as exit 0, which is this whole ticket.
+  switch (lint.status) {
+    case 'broken': return STANDARDS_INIT_LINT_FAILS;
+    case 'ok':
+    case 'problems':
+    case 'skipped': return 0;
+    default: {
+      const unhandled: never = lint;
+      throw new Error(`unhandled lint verdict: ${JSON.stringify(unhandled)}`);
+    }
+  }
+};
 
 /**
  * Lint the generated fragment with the TARGET repo's own ESLint, because that is the only
@@ -636,7 +667,7 @@ function parseProfile(raw: string | undefined): RepoProfile | undefined {
 function writeMechanicalHalf(opts: {
   repoRoot: string; repoName: string; outPath: string; profile: RepoProfile;
   selections: StandardsSelections; severity: 'warn' | 'error';
-}): void {
+}): FragmentLintResult {
   const { repoRoot, repoName, outPath, profile, selections, severity } = opts;
 
   // The fragment follows the DOCUMENT. With `--out /tmp/draft/STANDARDS.md`
@@ -680,10 +711,13 @@ function writeMechanicalHalf(opts: {
   // skip note does not punch a hole in the summary that follows.
   if (lines.some((l) => !l.indent)) console.log('');
   for (const l of lines) console.log(tones[l.tone](l.indent ? `   ${l.text}` : l.text));
+  // Returned, not just printed. A `broken` verdict says this repo's `eslint .` will now
+  // fail, and the caller that needs to act on that is a script, which cannot read a ⚠.
+  return lint;
 }
 
 /** `lgtm standards init` — scan, ask the contested toggles, write STANDARDS.md. */
-export async function runStandardsInit(options: StandardsInitOptions): Promise<void> {
+export async function runStandardsInit(options: StandardsInitOptions): Promise<FragmentLintResult> {
   const repoRoot = tryExec('git', ['rev-parse', '--show-toplevel']).trim() || process.cwd();
   const repoName = basename(repoRoot);
   const outPath = options.out || join(repoRoot, 'STANDARDS.md');
@@ -767,8 +801,10 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
   console.log(chalk.green(`\n✓ Wrote ${outPath}`));
 
   // The mechanical half, derived from the same selections so the two can't drift.
+  // --no-eslint emits no fragment, so there is nothing to have broken: `skipped`, not `ok`.
+  let lintVerdict: FragmentLintResult = { status: 'skipped', reason: 'no ESLint fragment was written (--no-eslint)' };
   if (!options.noEslint) {
-    writeMechanicalHalf({ repoRoot, repoName, outPath, profile, selections, severity: options.severity ?? 'warn' });
+    lintVerdict = writeMechanicalHalf({ repoRoot, repoName, outPath, profile, selections, severity: options.severity ?? 'warn' });
   }
   const summaryParts = [`Profile ${profile}`];
   if (consumedOut.fn) summaryParts.push(`function >${thresholds.fnWarn}/${thresholds.fnMax} lines`);
@@ -779,4 +815,5 @@ export async function runStandardsInit(options: StandardsInitOptions): Promise<v
     console.log(chalk.yellow(`   Existing-violation cost: ~${legacyViolations.functions} function(s) and ~${legacyViolations.files} file(s) already exceed the finding thresholds — standards apply to NEW code, so these become findings only when touched.`));
   }
   console.log(chalk.gray('\nReview the file, edit freely, commit it. `lgtm review` will now cite `(standard <id>)` findings against it (opt out per run with --no-standards).'));
+  return lintVerdict;
 }

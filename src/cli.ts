@@ -11,7 +11,8 @@ import { reviewPR, recheckComments, generateQuiz, checkClaudeCli, checkCodexCli,
 import { SYSTEM_PROMPT_KEY } from './session.js';
 import { archReview, formatArchComment } from './arch.js';
 import { runArchNew, runArchInit } from './archInterview.js';
-import { runStandardsInit } from './standardsInterview.js';
+import { runStandardsInit, exitCodeForStandardsInit } from './standardsInterview.js';
+import { FAILED } from './exitCodes.js';
 import { runQualityBaseline, runQualityHotspots } from './quality.js';
 import { runStandardsReview } from './standardsReview.js';
 import { buildArchitectureContext } from './charter.js';
@@ -2401,6 +2402,7 @@ const standards = program
 standards
   .command('init')
   .description('Scan the repo, ask the contested toggles, write STANDARDS.md (no AI call)')
+  .addHelpText('after', "\nExit codes: 3 = written, but this repo's ESLint cannot lint it at all (which may predate this run) \u00b7 1 = the command failed and nothing was written \u00b7 0 = written, and ESLint either passed, reported findings, or was not run (no ESLint, --no-eslint, a preview --out, a timeout). 0 is not a promise the lint ran, nor that it is clean.")
   .option('--out <file>', 'Output path (default: <repo-root>/STANDARDS.md)')
   .option('--force', 'Overwrite an existing file', false)
   .option('--answers <file>', 'Scripted answers: JSON object keyed by question id (profile, FUN-1…, fnWarn…, houseRules) — or a positional array')
@@ -2420,10 +2422,13 @@ standards
       console.error(chalk.yellow('⚠  --severity has no effect with --no-eslint (no fragment is emitted).'));
     }
     try {
-      await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile, noEslint: options.eslint === false, severity: options.severity });
+      const lint = await runStandardsInit({ out: options.out, force: options.force, answers: options.answers, yes: options.yes, profile: options.profile, noEslint: options.eslint === false, severity: options.severity });
+        // The policy lives beside the verdict type, not here, so it can be asserted without
+        // spawning a CLI. process.exitCode rather than process.exit: buffered output flushes.
+        process.exitCode = exitCodeForStandardsInit(lint);
     } catch (error: any) {
       console.error(chalk.red(`Error: ${error?.message ?? String(error)}`));
-      process.exit(1);
+      process.exit(FAILED);
     }
   });
 
