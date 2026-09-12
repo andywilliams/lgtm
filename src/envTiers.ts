@@ -69,7 +69,7 @@ export const DEBUG_HOOKS: readonly string[] = [
 ];
 
 /** One group's `--help` block: its heading, then its entries padded to a common column. */
-export function renderEnvHelp(group: EnvGroup): string {
+function renderEnvHelp(group: EnvGroup): string {
   const entries = ENV_SURFACE.filter((e) => e.group === group);
   const width = Math.max(...entries.map((e) => e.name.length)) + 3;
   return GROUP_HEADINGS[group] + entries.map((e) => `  ${e.name.padEnd(width)}${e.help}\n`).join('');

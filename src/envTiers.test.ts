@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ENV_SURFACE, DEBUG_HOOKS, GROUP_HEADINGS, renderEnvSurface, type EnvGroup } from './envTiers.js';
+import { ENV_SURFACE, DEBUG_HOOKS, GROUP_HEADINGS, renderEnvSurface } from './envTiers.js';
 
 const SRC = new URL('.', import.meta.url).pathname;
 
