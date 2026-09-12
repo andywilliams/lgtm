@@ -80,7 +80,7 @@ const LINT_PROBE_TIMEOUT_MS = 60_000;
  * test reaches the timeout branch by passing 300 rather than by mutating process.env and
  * remembering to put it back.
  */
-export function lintProbeTimeoutMs(raw = process.env.LGTM_LINT_PROBE_TIMEOUT_MS): number {
+function lintProbeTimeoutMs(raw = process.env.LGTM_LINT_PROBE_TIMEOUT_MS): number {
   const n = Number(raw?.trim());
   return Number.isFinite(n) && n > 0 ? n : LINT_PROBE_TIMEOUT_MS;
 }

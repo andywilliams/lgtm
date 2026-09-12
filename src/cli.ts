@@ -32,7 +32,7 @@ import { extractWriteIdentifiers, failedSearchRoots, fieldsFromHelpers, findRead
 import { formatReviewCommentBody, isDuplicateComment } from './comments.js';
 import { savePendingReview, loadPendingReview, deletePendingReview, listPendingReviews } from './cache.js';
 import type { Harshness, Severity, ReviewComment, ReviewResult, ExistingComment, ExistingReviewComment, DecidedFinding, ArchResult, ArchAuthority, ArchReversibility, PRDetails } from './types.js';
-import { renderEnvHelp } from './envTiers.js';
+import { renderEnvSurface } from './envTiers.js';
 
 /**
  * Resolve which AI CLI to use: validate an explicit --ai choice, otherwise auto-detect
@@ -100,17 +100,7 @@ program
   .version('0.1.0');
 
 // Discoverable breadcrumb for the optional second-brain integration (off by default).
-program.addHelpText(
-  'after',
-  // Rendered from ENV_SURFACE, not written out here: the tier a variable belongs to is a
-  // value in src/envTiers.ts, and this block is its display.
-  '\nOptional context (a "second brain") — enrich reviews with the repo\'s engineering\n' +
-    'handbook + related systems. Off unless one of these is set:\n' +
-    renderEnvHelp('brain') +
-    '\nModel calls run `claude --print` as a stripped session (no MCP servers, no settings or\n' +
-    'CLAUDE.md from the cwd, no saved transcript) and record the billed usage per review:\n' +
-    renderEnvHelp('call')
-);
+program.addHelpText('after', renderEnvSurface());
 
 program
   .command('review [pr-number]')
