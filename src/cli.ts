@@ -2380,7 +2380,7 @@ const standards = program
 standards
   .command('init')
   .description('Scan the repo, ask the contested toggles, write STANDARDS.md (no AI call)')
-  .addHelpText('after', "\nExit codes: 3 = written, but this repo's ESLint cannot lint it at all (which may predate this run) \u00b7 1 = the command failed and nothing was written \u00b7 0 = written, and ESLint either passed, reported findings, or was not run (no ESLint, --no-eslint, a preview --out, a timeout). 0 is not a promise the lint ran, nor that it is clean.")
+  .addHelpText('after', "\nExit codes: 4 = written into the repo, but its ESLint could NOT be run over it (no local binary, a timeout, could not spawn) \u2014 run the lint yourself before committing \u00b7 3 = written, but this repo's ESLint cannot lint it at all (which may predate this run) \u00b7 1 = the command failed and nothing was written \u00b7 0 = written, and either ESLint passed it or reported findings, or there was nothing for it to check (no ESLint configured, --no-eslint, a preview --out outside the repo). 0 is not a promise the lint is clean.")
   .option('--out <file>', 'Output path (default: <repo-root>/STANDARDS.md)')
   .option('--force', 'Overwrite an existing file', false)
   .option('--answers <file>', 'Scripted answers: JSON object keyed by question id (profile, FUN-1…, fnWarn…, houseRules) — or a positional array')
