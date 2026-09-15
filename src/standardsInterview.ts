@@ -140,17 +140,24 @@ export type FragmentLintResult =
  * failing a caller who asked for a file to be written.
  */
 /**
- * A skip is two different things to the caller. Two kinds mean there is nothing here to
- * break, and the agent is done: exit 0. The other four mean lgtm could not find out, and the
- * agent has to run the lint itself before committing: exit 4. Exhaustive on the kind, so a
- * seventh kind cannot be added without deciding which of the two it is.
+ * A skip is two different things to the caller. Exit 4 means lgtm TRIED to run this repo's
+ * ESLint over the fragment and could not — no local binary, a timeout, a spawn failure — so
+ * the agent has to run it itself before committing. Exit 0 covers everything else: nothing
+ * here to break (no ESLint configured, `--no-eslint`), or the operator's own choice not to
+ * put the fragment in the repo (a preview `--out`), where "lint it before you commit" has
+ * nothing to attach to. Exhaustive on the kind, so a seventh kind cannot be added without
+ * deciding which it is.
+ *
+ * This is NOT the same partition as the report's reassuring clause: a preview run exits 0
+ * but is not told "the mechanical rules have nothing to run in yet", because they do — they
+ * were not consulted. The test that keeps the two honest is in standardsLint.test.ts.
  */
 const exitCodeForSkip = (kind: FragmentSkipKind): number => {
   switch (kind) {
     case 'no-eslint':
-    case 'no-fragment': return 0;
+    case 'no-fragment':
+    case 'outside-repo': return 0;
     case 'no-binary':
-    case 'outside-repo':
     case 'timeout':
     case 'spawn-failed': return STANDARDS_INIT_LINT_UNCHECKED;
     default: {

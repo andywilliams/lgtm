@@ -545,8 +545,8 @@ describe("standards init's exit contract", () => {
     assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'no-fragment', reason: 'r' }), 0);
   });
 
-  it('exits 4 when the fragment was written but nothing checked it — the agent has to', () => {
-    for (const kind of ['no-binary', 'outside-repo', 'timeout', 'spawn-failed'] as const) {
+  it('exits 4 when lgtm tried to run the lint and could not — the agent has to', () => {
+    for (const kind of ['no-binary', 'timeout', 'spawn-failed'] as const) {
       assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind, reason: 'r' }), STANDARDS_INIT_LINT_UNCHECKED, kind);
     }
     assert.equal(STANDARDS_INIT_LINT_UNCHECKED, 4);
@@ -556,12 +556,36 @@ describe("standards init's exit contract", () => {
     // Pinned from both sides, like the reassuring clause in describeFragmentLint: a kind
     // that means "could not find out" must not drift to 0, and a kind that means "nothing
     // to break" must not start telling the agent to go and lint an empty repo.
-    const done: FragmentSkipKind[] = ['no-eslint', 'no-fragment'];
-    const unchecked: FragmentSkipKind[] = ['no-binary', 'outside-repo', 'timeout', 'spawn-failed'];
+    const done: FragmentSkipKind[] = ['no-eslint', 'no-fragment', 'outside-repo'];
+    const unchecked: FragmentSkipKind[] = ['no-binary', 'timeout', 'spawn-failed'];
     for (const kind of [...done, ...unchecked]) {
       const code = exitCodeForStandardsInit({ status: 'skipped', kind, reason: 'r' });
       assert.equal(code, done.includes(kind) ? 0 : STANDARDS_INIT_LINT_UNCHECKED, kind);
     }
+  });
+
+  it('a preview run is the operator\'s choice, not a failed probe: exit 0, with nothing to commit', () => {
+    assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'outside-repo', reason: 'preview' }), 0);
+  });
+
+  it('holds the exit partition and the report\'s reassurance to their one relation', () => {
+    // Two partitions of the same six kinds live in this module — which skips exit 0, and
+    // which skips the report reassures about ("nothing to run in yet"). They are NOT the same
+    // set: a preview run exits 0 but is not reassured, because there IS an ESLint here and it
+    // was not consulted. The relation that must hold is one-directional: anything the report
+    // reassures about must also exit 0. A seventh kind classified as reassuring-but-exit-4
+    // is the prose-vs-claim split DWLF-229 exists to prevent, and this is what catches it.
+    const kinds: FragmentSkipKind[] = ['no-eslint', 'no-fragment', 'outside-repo', 'no-binary', 'timeout', 'spawn-failed'];
+    const root = '/repo'; const frag = '/repo/.lgtm/standards.eslint.js';
+    for (const kind of kinds) {
+      const lint: FragmentLintResult = { status: 'skipped', kind, reason: 'r' };
+      const reassured = /nothing to run in/.test(describeFragmentLint(lint, root, frag).map((l) => l.text).join(' '));
+      if (reassured) assert.equal(exitCodeForStandardsInit(lint), 0, `${kind} is reassured about, so it must exit 0`);
+    }
+    // ...and the asymmetry is deliberate and named, so it cannot be "fixed" into sameness.
+    const preview: FragmentLintResult = { status: 'skipped', kind: 'outside-repo', reason: 'r' };
+    assert.equal(exitCodeForStandardsInit(preview), 0);
+    assert.doesNotMatch(describeFragmentLint(preview, root, frag).map((l) => l.text).join(' '), /nothing to run in/, 'a preview run is not told there is nothing to lint');
   });
 
   it('reports the repo\'s state, not blame: a failure that predates the run still exits 3', () => {
