@@ -68,8 +68,8 @@ export function planSession(input: {
   fresh?: boolean;
   choice: RoundModelChoice;
   newId?: () => string;
-  /** The operator's default model; defaults to the resolved one. */
-  fullModel?: string;
+  /** The operator's default model; defaults to the resolved one. `null` = explicitly none (see modelRoleOf). */
+  fullModel?: string | null;
 }): SessionPlan {
   const { prior, contents, ai, fresh, choice, newId = randomUUID } = input;
   const fileShas: Record<string, string> = {};

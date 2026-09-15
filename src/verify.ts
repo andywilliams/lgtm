@@ -54,8 +54,13 @@ export interface VerifyModelChoice {
  * turns off the policy it names), and a value that is not a model id warns and falls back
  * rather than being passed through — unvalidated, it reaches `setModelOverride`, throws
  * inside the pass's own guard, and every round then silently verifies nothing.
+ *
+ * `fullModel` has three states — see `modelRoleOf` in session.ts for why: `undefined` means
+ * "the operator's configured model" (the default fires; an explicit `undefined` argument
+ * does too), `null` means "explicitly none". A test reaches the no-model branch with `null`;
+ * with `undefined` it reaches whatever THIS machine has configured (DWLF-243).
  */
-export function verifyModel(fullModel: string | undefined = resolveModel()): VerifyModelChoice {
+export function verifyModel(fullModel: string | null | undefined = resolveModel()): VerifyModelChoice {
   let explicit = process.env.LGTM_VERIFY_MODEL?.trim();
   if (explicit && explicit.toLowerCase() === 'off') return { enabled: false, model: undefined, reason: 'LGTM_VERIFY_MODEL=off' };
   let note = '';
@@ -67,7 +72,7 @@ export function verifyModel(fullModel: string | undefined = resolveModel()): Ver
   if (explicit) return { enabled: true, model: explicit, reason: 'LGTM_VERIFY_MODEL' };
   // Same first-party guard as the late-round policy: a Bedrock ARN or Vertex id operator
   // opts in by naming a verifier model rather than having a claude-* id assumed for them.
-  if (fullModel !== undefined && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
+  if (fullModel != null && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
     return { enabled: true, model: undefined, reason: `full model is not a first-party id — verifying on it (set LGTM_VERIFY_MODEL to use a cheaper one)${note}` };
   }
   return { enabled: true, model: DEFAULT_LATE_MODEL, reason: `default verifier model${note}` };

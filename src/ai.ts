@@ -223,7 +223,13 @@ export const DEFAULT_LATE_MODEL = 'claude-sonnet-5';
  * full model is one too (`claude-…`); an operator pinned to a Bedrock ARN or Vertex id
  * gets the policy only by naming a late model of their own in LGTM_LATE_MODEL.
  */
-export function lateModel(fullModel: string | undefined = resolveModel()): { model: string | undefined; reason: string } {
+/**
+ * `fullModel` has three states — see `modelRoleOf` in session.ts for why: `undefined` means
+ * "the operator's configured model" (the default fires; an explicit `undefined` argument
+ * does too), `null` means "explicitly none". A test reaches the no-model branch with `null`;
+ * with `undefined` it reaches whatever THIS machine has configured (DWLF-243).
+ */
+export function lateModel(fullModel: string | null | undefined = resolveModel()): { model: string | undefined; reason: string } {
   let explicit = process.env.LGTM_LATE_MODEL;
   let note = '';
   if (explicit !== undefined && explicit.trim().toLowerCase() !== 'off' && !MODEL_ID.test(explicit.trim())) {
@@ -234,7 +240,7 @@ export function lateModel(fullModel: string | undefined = resolveModel()): { mod
   }
   // First-party ids are `claude-<family>[-<n>]` with an optional `[1m]` suffix; a Vertex
   // `claude-…@date`, a Bedrock ARN or a gateway path is not, however it starts.
-  if (explicit === undefined && fullModel !== undefined && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
+  if (explicit === undefined && fullModel != null && !/^claude-[a-z0-9-]+(\[\w+\])?$/.test(fullModel)) {
     return { model: undefined, reason: `full model is not a first-party id; set LGTM_LATE_MODEL to opt in${note}` };
   }
   const v = (explicit ?? DEFAULT_LATE_MODEL).trim();

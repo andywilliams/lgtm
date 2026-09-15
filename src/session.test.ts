@@ -109,3 +109,15 @@ test('a session that would pass the context budget is not continued — a fresh 
   const unknown = plan({ prior: prior({ lastPromptTokens: null }), contents: big, ai: 'claude', choice: full });
   assert.ok(unknown.session?.resume, 'no usage recorded ⇒ budget cannot be judged, continue');
 });
+
+test('planSession can be told there is no configured model, by parameter (DWLF-243)', () => {
+  // The role is not returned, so it is observed through what depends on it: a session opened
+  // on a machine with no model (role full:cli-default) is CONTINUED when this round is told,
+  // by parameter, that there is still none — and not continued when told there is one now.
+  const noModelPrior = prior({ model: undefined as unknown as string, role: 'full:cli-default' });
+  const same = planSession({ prior: noModelPrior, contents, ai: 'claude', choice: full, fullModel: null });
+  assert.equal(same.session?.resume, true, 'told "none" by parameter, the cli-default session is continued');
+  const changed = planSession({ prior: noModelPrior, contents, ai: 'claude', choice: full, fullModel: FULL, newId: () => 'new-9' });
+  assert.equal(changed.session?.resume, false);
+  assert.match(changed.note ?? '', /full:cli-default, this round needs full:claude-fable-5-1/);
+});
