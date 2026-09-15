@@ -202,6 +202,10 @@ test('pickRoundModel: cheaper model only on a late, chill, settled round with no
     assert.equal(pickRoundModel({ ...base, harshness: 'medium' }).model, undefined, 'only chill rounds');
     assert.equal(pickRoundModel({ ...base, openBugs: 1 }).model, undefined, 'an unverified BUG/SECURITY fix keeps the full model, however many rounds ago it was found');
     assert.equal(pickRoundModel({ ...base, provider: 'codex' }).model, undefined, 'codex picks its own model');
+    // `null` = no model configured, by parameter — the entry point cli.ts calls can be told
+    // so without running on a machine that has none (DWLF-243). The policy still applies
+    // the default late model; there is no id to be non-first-party.
+    assert.equal(pickRoundModel({ ...base, fullModel: null }).model, DEFAULT_LATE_MODEL, 'no configured model: default late model, not a refusal');
     assert.match(pickRoundModel({ ...base, provider: 'codex', explicit: 'claude-opus-5' }).reason, /codex/, 'even with --model');
     assert.equal(pickRoundModel({ ...base, explicit: 'claude-opus-5' }).source, 'explicit');
     assert.equal(pickRoundModel(base).source, 'policy');

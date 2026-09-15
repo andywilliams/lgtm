@@ -276,8 +276,8 @@ export function pickRoundModel(input: {
   openBugs: number;
   diffLines: number;
   lastDiffLines: number | null;
-  /** The operator's full model, for the first-party check; defaults to the resolved one. */
-  fullModel?: string;
+  /** The operator's full model, for the first-party check; defaults to the resolved one. `null` = explicitly none (see modelRoleOf). */
+  fullModel?: string | null;
 }): RoundModelChoice {
   const { explicit, provider, round, harshness, openBugs, diffLines, lastDiffLines, fullModel } = input;
   const policy = (reason: string, model?: string): RoundModelChoice => ({ model, source: 'policy', reason });
