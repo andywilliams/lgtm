@@ -32,3 +32,17 @@ export const FAILED = 1;
  * without breaking callers that cannot be enumerated *(DWLF-228)*.
  */
 export const STANDARDS_INIT_LINT_FAILS = 3;
+
+/**
+ * `standards init` wrote the fragment, and this repo's ESLint was NOT run over it — there was
+ * no local binary, the fragment was written outside the repo (a preview `--out`), ESLint
+ * timed out, or it could not be spawned.
+ *
+ * Distinct from 0 because the caller this command has is an agent following a skill, and
+ * "written, and this repo's ESLint passed it" and "written, and nothing checked it" are
+ * different instructions to that agent: the second means run the lint yourself before you
+ * commit. Distinct from 3 because nothing is known to be broken. NOT used for the two skips
+ * that mean there is nothing here to break — no ESLint configured, or `--no-eslint` — which
+ * stay 0: a repo with no lint has nothing left for the agent to run *(DWLF-238)*.
+ */
+export const STANDARDS_INIT_LINT_UNCHECKED = 4;

@@ -3,7 +3,7 @@ import { existsSync, readFileSync, writeFileSync, statSync, mkdirSync, readdirSy
 import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import prompts from 'prompts';
 import chalk from 'chalk';
-import { STANDARDS_INIT_LINT_FAILS } from './exitCodes.js';
+import { STANDARDS_INIT_LINT_FAILS, STANDARDS_INIT_LINT_UNCHECKED } from './exitCodes.js';
 import { askEntries, F1_MAX_POSITIONAL_ARGS, type RepoProfile, type RequiredTooling } from './standardsCatalog.js';
 import { DEFAULT_THRESHOLDS, clampThresholds, generateStandardsDoc, thresholdsConsumed, type StandardsSelections, type StandardsThresholds } from './standards.js';
 import { generateEslintFragment, usesEsm, deriveRules, hasEslintConfig } from './standardsLint.js';
@@ -139,6 +139,27 @@ export type FragmentLintResult =
  * — ESLint absent, a preview run, a timeout — and "I could not tell" is not grounds for
  * failing a caller who asked for a file to be written.
  */
+/**
+ * A skip is two different things to the caller. Two kinds mean there is nothing here to
+ * break, and the agent is done: exit 0. The other four mean lgtm could not find out, and the
+ * agent has to run the lint itself before committing: exit 4. Exhaustive on the kind, so a
+ * seventh kind cannot be added without deciding which of the two it is.
+ */
+const exitCodeForSkip = (kind: FragmentSkipKind): number => {
+  switch (kind) {
+    case 'no-eslint':
+    case 'no-fragment': return 0;
+    case 'no-binary':
+    case 'outside-repo':
+    case 'timeout':
+    case 'spawn-failed': return STANDARDS_INIT_LINT_UNCHECKED;
+    default: {
+      const unhandled: never = kind;
+      throw new Error(`unhandled skip kind: ${JSON.stringify(unhandled)}`);
+    }
+  }
+};
+
 export const exitCodeForStandardsInit = (lint: FragmentLintResult): number => {
   // Exhaustive on purpose, the same way describeFragmentLint is. `broken ? 3 : 0` would
   // compile for a verdict added to FragmentLintResult later and report it as success —
@@ -146,8 +167,8 @@ export const exitCodeForStandardsInit = (lint: FragmentLintResult): number => {
   switch (lint.status) {
     case 'broken': return STANDARDS_INIT_LINT_FAILS;
     case 'ok':
-    case 'problems':
-    case 'skipped': return 0;
+    case 'problems': return 0;
+    case 'skipped': return exitCodeForSkip(lint.kind);
     default: {
       const unhandled: never = lint;
       throw new Error(`unhandled lint verdict: ${JSON.stringify(unhandled)}`);

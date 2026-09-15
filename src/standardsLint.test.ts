@@ -8,7 +8,7 @@ import { buildWholeFileDiff, collectTargets, lintAsDecided, findCoveringTests, r
 import { DEFAULT_THRESHOLDS, type StandardsSelections } from './standards.js';
 import { checkFragmentLints, ignoreRemedy, firstUsefulLine, describeFragmentLint, exitCodeForStandardsInit, type FragmentLintResult, type FragmentSkipKind } from './standardsInterview.js';
 import { askEntries } from './standardsCatalog.js';
-import { STANDARDS_INIT_LINT_FAILS, FAILED } from './exitCodes.js';
+import { STANDARDS_INIT_LINT_FAILS, STANDARDS_INIT_LINT_UNCHECKED, FAILED } from './exitCodes.js';
 
 // Guards the deterministic half: that the emitted rules actually track the
 // STANDARDS.md selections (the whole point — one source, two mechanisms, no
@@ -539,8 +539,29 @@ describe("standards init's exit contract", () => {
     assert.equal(exitCodeForStandardsInit(problems), 0);
   });
 
-  it('succeeds when no verdict was reached, because "I could not tell" is not "bad"', () => {
-    assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'no-eslint', reason: 'no ESLint configured' }), 0);
+  // A skip is two different things to the caller, and the code says which.
+  it('succeeds when there is nothing here to break: no ESLint configured, or --no-eslint', () => {
+    assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'no-eslint', reason: 'r' }), 0);
+    assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind: 'no-fragment', reason: 'r' }), 0);
+  });
+
+  it('exits 4 when the fragment was written but nothing checked it — the agent has to', () => {
+    for (const kind of ['no-binary', 'outside-repo', 'timeout', 'spawn-failed'] as const) {
+      assert.equal(exitCodeForStandardsInit({ status: 'skipped', kind, reason: 'r' }), STANDARDS_INIT_LINT_UNCHECKED, kind);
+    }
+    assert.equal(STANDARDS_INIT_LINT_UNCHECKED, 4);
+  });
+
+  it('gives every skip kind exactly one of those two answers', () => {
+    // Pinned from both sides, like the reassuring clause in describeFragmentLint: a kind
+    // that means "could not find out" must not drift to 0, and a kind that means "nothing
+    // to break" must not start telling the agent to go and lint an empty repo.
+    const done: FragmentSkipKind[] = ['no-eslint', 'no-fragment'];
+    const unchecked: FragmentSkipKind[] = ['no-binary', 'outside-repo', 'timeout', 'spawn-failed'];
+    for (const kind of [...done, ...unchecked]) {
+      const code = exitCodeForStandardsInit({ status: 'skipped', kind, reason: 'r' });
+      assert.equal(code, done.includes(kind) ? 0 : STANDARDS_INIT_LINT_UNCHECKED, kind);
+    }
   });
 
   it('reports the repo\'s state, not blame: a failure that predates the run still exits 3', () => {
@@ -551,12 +572,13 @@ describe("standards init's exit contract", () => {
     assert.equal(exitCodeForStandardsInit(predates), STANDARDS_INIT_LINT_FAILS);
   });
 
-  it('distinguishes all three outcomes, which is the whole point', () => {
+  it('distinguishes all four outcomes, which is the whole point', () => {
     const codes = new Set([
       exitCodeForStandardsInit({ status: 'ok' }),
+      exitCodeForStandardsInit({ status: 'skipped', kind: 'timeout', reason: 'r' }),
       exitCodeForStandardsInit({ status: 'broken', detail: 'x', namesFragment: true }),
       FAILED, // what the CLI exits when init itself throws
     ]);
-    assert.equal(codes.size, 3, 'written-and-fine, written-and-broken, and failed must be tellable apart');
+    assert.equal(codes.size, 4, 'written-and-fine, written-and-unchecked, written-and-broken, and failed must be tellable apart');
   });
 });
