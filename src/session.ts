@@ -11,7 +11,15 @@ import type { LoopSession } from './db.js';
  * operator's default mid-loop restarts the session: the prompt cache is model-scoped,
  * and a resumed session on another model would replay its whole context uncached.
  */
-export function modelRoleOf(choice: RoundModelChoice, fullModel: string | undefined = resolveModel()): string {
+/**
+ * `fullModel` has three states, and two of them look alike: `undefined` means "use the
+ * operator's configured model" (the default fires — in JavaScript an explicit `undefined`
+ * argument triggers a default parameter just as an absent one does); `null` means
+ * "explicitly none", the state of a machine with no model configured, which a caller can
+ * otherwise only reach by having such a machine. Tests need the second; DWLF-243 was the
+ * test that thought it was passing it and was passing the first.
+ */
+export function modelRoleOf(choice: RoundModelChoice, fullModel: string | null | undefined = resolveModel()): string {
   const bare = (id: string) => id.replace(/\[.*\]$/, '');
   if (choice.source === 'explicit' && choice.model) return `explicit:${bare(choice.model)}`;
   if (choice.model) return `late:${bare(choice.model)}`;
@@ -60,8 +68,8 @@ export function planSession(input: {
   fresh?: boolean;
   choice: RoundModelChoice;
   newId?: () => string;
-  /** The operator's default model; defaults to the resolved one. */
-  fullModel?: string;
+  /** The operator's default model; defaults to the resolved one. `null` = explicitly none (see modelRoleOf). */
+  fullModel?: string | null;
 }): SessionPlan {
   const { prior, contents, ai, fresh, choice, newId = randomUUID } = input;
   const fileShas: Record<string, string> = {};

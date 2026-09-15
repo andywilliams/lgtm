@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeRoundUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
+import { lateModel, addUsage, claudePrintArgs, parsePrintEnvelope, promptTokens, resolveEffort, resolveModel, takeUsage, setModelOverride, getModelOverride, pickRoundModel, mergeRoundUsage, emptyUsage, DEFAULT_LATE_MODEL, RE_ESCALATE_LINES, timeoutMs, DEFAULT_TIMEOUT_MS, type AIUsage } from './ai.js';
 
 const envelope = (over: Record<string, unknown> = {}) =>
   JSON.stringify({
@@ -202,6 +202,10 @@ test('pickRoundModel: cheaper model only on a late, chill, settled round with no
     assert.equal(pickRoundModel({ ...base, harshness: 'medium' }).model, undefined, 'only chill rounds');
     assert.equal(pickRoundModel({ ...base, openBugs: 1 }).model, undefined, 'an unverified BUG/SECURITY fix keeps the full model, however many rounds ago it was found');
     assert.equal(pickRoundModel({ ...base, provider: 'codex' }).model, undefined, 'codex picks its own model');
+    // `null` = no model configured, by parameter — the entry point cli.ts calls can be told
+    // so without running on a machine that has none (DWLF-243). The policy still applies
+    // the default late model; there is no id to be non-first-party.
+    assert.equal(pickRoundModel({ ...base, fullModel: null }).model, DEFAULT_LATE_MODEL, 'no configured model: default late model, not a refusal');
     assert.match(pickRoundModel({ ...base, provider: 'codex', explicit: 'claude-opus-5' }).reason, /codex/, 'even with --model');
     assert.equal(pickRoundModel({ ...base, explicit: 'claude-opus-5' }).source, 'explicit');
     assert.equal(pickRoundModel(base).source, 'policy');
@@ -374,4 +378,15 @@ test('the model override is readable, so a nested call can put back what it foun
   assert.equal(getModelOverride(), 'claude-opus-5');
   setModelOverride(undefined);
   assert.equal(getModelOverride(), undefined);
+});
+
+test('lateModel: `null` means no model configured, not a non-first-party id (DWLF-243)', () => {
+  // `undefined` would fire the default and resolve THIS machine's model; `null` is the declared
+  // way to say none. With none, the policy applies the default late model rather than refusing
+  // as it does for a Bedrock ARN — there is no id to be non-first-party.
+  const saved = process.env.LGTM_LATE_MODEL; delete process.env.LGTM_LATE_MODEL;
+  try {
+    assert.equal(lateModel(null).model, 'claude-sonnet-5');
+    assert.match(lateModel(null).reason, /default late model/);
+  } finally { if (saved !== undefined) process.env.LGTM_LATE_MODEL = saved; }
 });

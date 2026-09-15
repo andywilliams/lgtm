@@ -484,3 +484,11 @@ describe('the shown-context rule — the caller decides, not the prose', () => {
     assert.deepEqual([...diffFiles('diff --git a/x b/y\n--- a/old.ts\n+++ b/new.ts\n')].sort(), ['new.ts', 'old.ts']);
   });
 });
+
+test('verifyModel: `null` means no model configured, not a non-first-party id (DWLF-243)', () => {
+  const saved = process.env.LGTM_VERIFY_MODEL; delete process.env.LGTM_VERIFY_MODEL;
+  try {
+    assert.deepEqual({ ...verifyModel(null), reason: '' }, { enabled: true, model: 'claude-sonnet-5', reason: '' });
+    assert.match(verifyModel(null).reason, /default verifier model/);
+  } finally { if (saved !== undefined) process.env.LGTM_VERIFY_MODEL = saved; }
+});
