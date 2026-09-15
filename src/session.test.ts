@@ -16,7 +16,11 @@ const plan = (input: Parameters<typeof planSession>[0]) => planSession({ fullMod
 test('modelRoleOf names the model in every role, suffix-free', () => {
   assert.equal(modelRoleOf(full, FULL), 'full:claude-fable-5-1');
   assert.equal(modelRoleOf(full, 'claude-opus-5[1m]'), 'full:claude-opus-5', 'a changed default is a different role');
-  assert.equal(modelRoleOf(full, undefined), 'full:cli-default');
+  // `null`, not `undefined`: an explicit `undefined` argument fires the default parameter and
+  // resolves whatever model THIS machine has configured — which is how this line was green
+  // for everyone until a default was saved on one machine (DWLF-243). `null` is the declared
+  // way to say "no model configured", independent of where the test runs.
+  assert.equal(modelRoleOf(full, null), 'full:cli-default');
   assert.equal(modelRoleOf(late, FULL), 'late:claude-sonnet-5');
   assert.equal(modelRoleOf({ model: 'claude-fable-5-1[1m]', source: 'explicit', reason: '--model' }, FULL), 'explicit:claude-fable-5-1');
 });
