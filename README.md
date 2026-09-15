@@ -490,6 +490,15 @@ npx eslint $(git diff --name-only origin/main... | grep -E '\.[jt]sx?$')
 
 Plugin-dependent rules worth having (cognitive complexity, the TypeScript safety rules) are listed as commented suggestions rather than emitted active, since a fragment requiring an uninstalled plugin is a broken config.
 
+After writing the fragment, `standards init` runs the **target repo's own ESLint** over the directory it wrote into and reports what happened. The exit code carries the action; the printed report carries the reason and the one-line remedy:
+
+| exit | meaning | what to do |
+|---|---|---|
+| `0` | written, and either ESLint passed it or reported findings — or there was nothing for it to check (no ESLint configured, `--no-eslint`, a preview `--out` outside the repo) | nothing; `0` is the only code that means you are done |
+| `3` | written, and this repo's `eslint .` **does not pass** (which may predate this run — the report says whether it names the new file) | fix it before committing; the next commit there hits a failing lint |
+| `4` | written into the repo, but lgtm **could not run** its ESLint over it — no local binary (Yarn PnP, a workspace package), a timeout, or it would not spawn | run that repo's lint yourself before committing |
+| `1` | the command failed; nothing was written | — |
+
 ### Retroactive review: `lgtm standards review <file|dir>`
 
 Reviews code that **isn't changing** — for improving what's already there.
@@ -681,7 +690,7 @@ lgtm review 86 --auto --dry-run
 
 - **Implies `--batch`** — all comments are posted without prompting
 - **JSON output** — a single JSON object is printed to stdout (no decorative output)
-- **Machine-friendly exit codes** — `0` on success, `1` on error
+- **Machine-friendly exit codes** — `0` on success, `1` on error (review mode; `standards init` has its own four-code contract, above)
 
 ### JSON Output Format
 

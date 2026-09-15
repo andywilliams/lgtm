@@ -126,20 +126,6 @@ export type FragmentLintResult =
   | { status: 'problems' | 'broken'; detail: string; namesFragment: boolean };
 
 /**
- * The exit code for a completed `standards init`, given what the lint probe concluded.
- *
- * `broken` is the only non-zero case, and it reports the repo's STATE — this lint does not
- * pass — rather than claiming lgtm caused it. `namesFragment` distinguishes those two in the
- * printed report and deliberately does not change the code: someone asking "can I commit
- * this?" needs the same answer either way, and a code meaning only "we broke it" would
- * return 0 to a caller whose pre-commit hook is about to fail.
- *
- * `problems` and `skipped` stay 0. `problems` means the fragment lints with findings, which
- * is a repo with findings rather than a failing lint. `skipped` means no verdict was reached
- * — ESLint absent, a preview run, a timeout — and "I could not tell" is not grounds for
- * failing a caller who asked for a file to be written.
- */
-/**
  * A skip is two different things to the caller. Exit 4 means lgtm TRIED to run this repo's
  * ESLint over the fragment and could not — no local binary, a timeout, a spawn failure — so
  * the agent has to run it itself before committing. Exit 0 covers everything else: nothing
@@ -167,6 +153,22 @@ const exitCodeForSkip = (kind: FragmentSkipKind): number => {
   }
 };
 
+/**
+ * The exit code for a completed `standards init`, given what the lint probe concluded.
+ *
+ * `broken` → 3. It reports the repo's STATE — this lint does not pass — rather than claiming
+ * lgtm caused it. `namesFragment` distinguishes those two in the printed report and
+ * deliberately does not change the code: someone asking "can I commit this?" needs the same
+ * answer either way, and a code meaning only "we broke it" would return 0 to a caller whose
+ * pre-commit hook is about to fail.
+ *
+ * `ok` and `problems` → 0. `problems` means the fragment lints with findings, which is a repo
+ * with findings rather than a failing lint.
+ *
+ * `skipped` → 0 or 4, by kind (see `exitCodeForSkip`). "I could not tell" IS grounds for
+ * telling the caller, when lgtm tried to check and could not: the caller is an agent that
+ * must then run the lint itself. It is not, when there was nothing to check.
+ */
 export const exitCodeForStandardsInit = (lint: FragmentLintResult): number => {
   // Exhaustive on purpose, the same way describeFragmentLint is. `broken ? 3 : 0` would
   // compile for a verdict added to FragmentLintResult later and report it as success —
